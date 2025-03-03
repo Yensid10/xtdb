@@ -1,0 +1,104 @@
+= Guide to Suspending XTDB Deployment for Google Cloud [bcs-test-450214]
+
+[NOTE]
+Each command below can be copied individually.
+
+. List helm instances and uninstall them:
++
+[source,nushell]
+----
+helm uninstall xtdb-google-cloud --namespace xtdb-deployment
+
+helm uninstall kafka --namespace xtdb-deployment
+----
+
+. Delete Clusters
++
+[source,nushell]
+----
+gcloud container clusters delete xtdb-cluster --region=us-central1 --project=bcs-test-450214
+----
+
+. Delete Storage Buckets:
++
+[source,nushell]
+----
+gcloud storage rm -r gs://xtdb-storage-bucket
+----
+
+. Delete Subnets and VPCs:
++
+[source,nushell]
+----
+gcloud compute networks subnets delete xtdb-vpc-public-subnet --region=us-central1 --project=bcs-test-450214
+
+gcloud compute networks delete xtdb-vpc --project=bcs-test-450214
+----
+
+. Destroy Terraform:
++
+[source,nushell]
+----
+terraform destroy
+----
+
+== To Resume the Deployment
+Follow these instructions:
+
+. Re-plan and apply previosly used & initialsed Terraform:
++
+[source,nushell]
+----
+terraform plan
+
+terraform apply
+----
+
+. Get credentials for the cluster and create namespace:
++
+[source,nushell]
+----
+gcloud container clusters get-credentials xtdb-cluster --region us-central1
+
+kubectl create namespace xtdb-deployment
+----
+
+. Install Kafka Helm Chart:
++
+[source,nushell]
+----
+helm install kafka oci://registry-1.docker.io/bitnamicharts/kafka --version 31.3.1 --namespace xtdb-deployment --set listeners.client.protocol=PLAINTEXT --set listeners.controller.protocol=PLAINTEXT --set controller.resourcesPreset=medium --set controller.nodeSelector.node_pool=xtdb-pool
+----
+
+. Create XTDB Service Account, IAM Role and establish GKE link:
++
+[source,nushell]
+----
+kubectl create serviceaccount xtdb-service-account --namespace xtdb-deployment
+
+gcloud iam service-accounts add-iam-policy-binding xtdb-service-account@bcs-test-450214.iam.gserviceaccount.com --role roles/iam.workloadIdentityUser --member "serviceAccount:bcs-test-450214.svc.id.goog[xtdb-deployment/xtdb-service-account]"
+
+kubectl annotate serviceaccount xtdb-service-account --namespace xtdb-deployment iam.gke.io/gcp-service-account=xtdb-service-account@bcs-test-450214.iam.gserviceaccount.com
+----
+
+. Install XTDB Helm Chart:
++
+[source,nushell]
+----
+helm install xtdb-google-cloud ~/Git/xtdb/google-cloud/helm --version 2.0.0-snapshot --namespace xtdb-deployment --set xtdbConfig.serviceAccount=xtdb-service-account --set xtdbConfig.gcpProjectId=bcs-test-450214 --set xtdbConfig.gcpBucket=xtdb-storage-bucket --set xtdbService.type=LoadBalancer
+----
+
+. Check external IP & connect with psql:
++
+[source,nushell]
+----
+kubectl get svc xtdb-service --namespace xtdb-deployment
+
+psql "host=$external_ip port=5432 user=xtdb"
+----
+
+
+
+
+
+
