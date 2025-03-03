@@ -48,18 +48,20 @@
                         {:node tu/*node*}))))
 
 (t/deftest test-block-boundary
-  (with-open [node (xtn/start-node (merge tu/*node-opts* {:indexer {:rows-per-block 20}}))]
-    (->> (for [i (range 110)]
-           [:put-docs :xt_docs {:xt/id i}])
-         (partition-all 10)
-         (mapv #(xt/submit-tx node %)))
+  (util/with-open [node (xtn/start-node (merge tu/*node-opts* {:indexer {:rows-per-block 20}}))]
+    (doseq [batch (->> (range 110)
+                       (partition-all 10))]
+      (xt/execute-tx node
+                     (for [i batch]
+                       [:put-docs :xt_docs {:xt/id i}]))
+      (c/compact-all! node))
 
     (t/is (= (set (for [i (range 110)] {:xt/id i}))
              (set (tu/query-ra '[:scan {:table public/xt_docs} [_id]]
                                {:node node}))))))
 
 (t/deftest test-block-boundary-different-struct-types
-  (with-open [node (xtn/start-node (merge tu/*node-opts* {:indexer {:rows-per-block 20}}))]
+  (util/with-open [node (xtn/start-node (merge tu/*node-opts* {:indexer {:rows-per-block 20}}))]
     (xt/submit-tx node (for [i (range 20)]
                          [:put-docs :xt_docs {:xt/id i :foo {:bar 42}}]))
 
@@ -81,7 +83,8 @@
                            {:node node}))))))
 
 (t/deftest test-row-copying-different-struct-types-between-block-boundaries-3338
-  (with-open [node (xtn/start-node (merge tu/*node-opts* {:indexer {:rows-per-block 20}}))]
+  (util/with-open [node (xtn/start-node (merge tu/*node-opts* {:indexer {:rows-per-block 20}
+                                                               :compactor {:threads 0}}))]
     (xt/submit-tx node (for [i (range 20)]
                          [:put-docs :xt_docs {:xt/id i :foo {:bar 42}}]))
 
@@ -107,11 +110,14 @@
                                {:node node}))))))
 
 (t/deftest test-metadata
-  (with-open [node (xtn/start-node (merge tu/*node-opts* {:indexer {:rows-per-block 20}}))]
-    (->> (for [i (range 100)]
-           [:put-docs :xt_docs {:xt/id i}])
-         (partition-all 20)
-         (mapv #(xt/submit-tx node %)))
+  (util/with-open [node (xtn/start-node (merge tu/*node-opts* {:indexer {:rows-per-block 20}}))]
+    (doseq [batch (->> (for [i (range 100)]
+                         [:put-docs :xt_docs {:xt/id i}])
+                       (partition-all 20))]
+      (xt/execute-tx node batch))
+
+    (tu/finish-block! node)
+    (c/compact-all! node #xt/duration "PT1S")
 
     (t/is (= (set (concat (for [i (range 20)] {:xt/id i}) (for [i (range 80 100)] {:xt/id i})))
              (set (tu/query-ra '[:scan {:table public/xt_docs} [{_id (or (< _id 20)
@@ -119,9 +125,12 @@
                                {:node node})))
           "testing only getting some trie matches"))
 
-  (with-open [node (xtn/start-node (merge tu/*node-opts* {:indexer {:rows-per-block 20}}))]
-    (xt/submit-tx node (for [i (range 20)] [:put-docs :xt_docs {:xt/id i}]))
-    (xt/submit-tx node (for [i (range 20)] [:delete-docs :xt_docs i]))
+  (util/with-open [node (xtn/start-node (merge tu/*node-opts* {:indexer {:rows-per-block 20}}))]
+    (xt/execute-tx node (for [i (range 20)] [:put-docs :xt_docs {:xt/id i}]))
+    (xt/execute-tx node (for [i (range 20)] [:delete-docs :xt_docs i]))
+
+    (tu/finish-block! node)
+    (c/compact-all! node #xt/duration "PT1S")
 
     (t/is (= []
              (tu/query-ra '[:scan {:table public/xt_docs} [{_id (< _id 20)}]]
@@ -143,52 +152,52 @@
                           {:node tu/*node*})))))
 
 (t/deftest test-past-point-point-queries
-  (let [tx1 (xt/execute-tx tu/*node* [[:put-docs {:into :xt_docs, :valid-from #inst "2015"}
-                                       {:xt/id :doc1 :v 1}]
-                                      [:put-docs {:into :xt_docs, :valid-from #inst "2015"}
-                                       {:xt/id :doc2 :v 1}]
-                                      [:put-docs {:into :xt_docs, :valid-from #inst "2018"}
-                                       {:xt/id :doc3 :v 1}]])
+  (xt/execute-tx tu/*node* [[:put-docs {:into :xt_docs, :valid-from #inst "2015"}
+                             {:xt/id :doc1 :v 1}]
+                            [:put-docs {:into :xt_docs, :valid-from #inst "2015"}
+                             {:xt/id :doc2 :v 1}]
+                            [:put-docs {:into :xt_docs, :valid-from #inst "2018"}
+                             {:xt/id :doc3 :v 1}]])
 
-        tx2 (xt/execute-tx tu/*node* [[:put-docs {:into :xt_docs, :valid-from #inst "2020"}
-                                       {:xt/id :doc1 :v 2}]
-                                      [:put-docs {:into :xt_docs, :valid-from #inst "2100"}
-                                       {:xt/id :doc2 :v 2}]
-                                      [:delete-docs :xt_docs :doc3]])]
+  (xt/execute-tx tu/*node* [[:put-docs {:into :xt_docs, :valid-from #inst "2020"}
+                             {:xt/id :doc1 :v 2}]
+                            [:put-docs {:into :xt_docs, :valid-from #inst "2100"}
+                             {:xt/id :doc2 :v 2}]
+                            [:delete-docs :xt_docs :doc3]])
 
-    ;; valid-time
-    (t/is (= {{:v 1, :xt/id :doc1} 1 {:v 1, :xt/id :doc2} 1}
-             (frequencies (tu/query-ra '[:scan {:table public/xt_docs, :for-valid-time [:at #inst "2017"], :for-system-time nil}
-                                         [_id v]]
-                                       {:node tu/*node*}))))
+  ;; valid-time
+  (t/is (= {{:v 1, :xt/id :doc1} 1 {:v 1, :xt/id :doc2} 1}
+           (frequencies (tu/query-ra '[:scan {:table public/xt_docs, :for-valid-time [:at #inst "2017"], :for-system-time nil}
+                                       [_id v]]
+                                     {:node tu/*node*}))))
 
-    (t/is (= {{:v 1, :xt/id :doc2} 1 {:v 2, :xt/id :doc1} 1}
-             (frequencies (tu/query-ra '[:scan {:table public/xt_docs, :for-valid-time [:at :now], :for-system-time nil}
-                                         [_id v]]
-                                       {:node tu/*node*}))))
+  (t/is (= {{:v 1, :xt/id :doc2} 1 {:v 2, :xt/id :doc1} 1}
+           (frequencies (tu/query-ra '[:scan {:table public/xt_docs, :for-valid-time [:at :now], :for-system-time nil}
+                                       [_id v]]
+                                     {:node tu/*node*}))))
 
-    ;; system-time
-    (t/is (= {{:v 1, :xt/id :doc1} 1 {:v 1, :xt/id :doc2} 1 {:v 1, :xt/id :doc3} 1}
-             (frequencies (tu/query-ra '[:scan {:table public/xt_docs, :for-system-time [:at #inst "2020-01-01"]}
-                                         [_id v]]
-                                       {:node tu/*node*}))))
+  ;; system-time
+  (t/is (= {{:v 1, :xt/id :doc1} 1 {:v 1, :xt/id :doc2} 1 {:v 1, :xt/id :doc3} 1}
+           (frequencies (tu/query-ra '[:scan {:table public/xt_docs, :for-system-time [:at #inst "2020-01-01"]}
+                                       [_id v]]
+                                     {:node tu/*node*}))))
 
-    (t/is (= {{:v 1, :xt/id :doc1} 1 {:v 1, :xt/id :doc2} 1}
-             (frequencies (tu/query-ra '[:scan {:table public/xt_docs, :for-valid-time [:at #inst "2017"], :for-system-time [:at #inst "2020-01-01"]}
-                                         [_id v]]
-                                       {:node tu/*node*}))))
+  (t/is (= {{:v 1, :xt/id :doc1} 1 {:v 1, :xt/id :doc2} 1}
+           (frequencies (tu/query-ra '[:scan {:table public/xt_docs, :for-valid-time [:at #inst "2017"], :for-system-time [:at #inst "2020-01-01"]}
+                                       [_id v]]
+                                     {:node tu/*node*}))))
 
-    (t/is (= {{:v 2, :xt/id :doc1} 1 {:v 1, :xt/id :doc2} 1}
-             (frequencies (tu/query-ra '[:scan {:table public/xt_docs, :for-valid-time [:at :now], :for-system-time [:at #inst "2020-01-02"]}
-                                         [_id v]]
-                                       {:node tu/*node*}))))
+  (t/is (= {{:v 2, :xt/id :doc1} 1 {:v 1, :xt/id :doc2} 1}
+           (frequencies (tu/query-ra '[:scan {:table public/xt_docs, :for-valid-time [:at :now], :for-system-time [:at #inst "2020-01-02"]}
+                                       [_id v]]
+                                     {:node tu/*node*}))))
 
-    (t/is (= {{:v 2, :xt/id :doc1} 1 {:v 2, :xt/id :doc2} 1}
-             (frequencies (tu/query-ra '[:scan {:table public/xt_docs
-                                                :for-valid-time [:at #inst "2100"]
-                                                :for-system-time [:at #inst "2020-01-02"]}
-                                         [_id v]]
-                                       {:node tu/*node*}))))))
+  (t/is (= {{:v 2, :xt/id :doc1} 1 {:v 2, :xt/id :doc2} 1}
+           (frequencies (tu/query-ra '[:scan {:table public/xt_docs
+                                              :for-valid-time [:at #inst "2100"]
+                                              :for-system-time [:at #inst "2020-01-02"]}
+                                       [_id v]]
+                                     {:node tu/*node*})))))
 
 (t/deftest test-past-point-point-queries-with-valid-time
   (let [tx1 (xt/execute-tx tu/*node* [[:put-docs {:into :xt_docs, :valid-from #inst "2015"}
@@ -530,13 +539,18 @@
                      set))))))
 
 (deftest test-iid-fast-path-multiple-pages
-  (with-open [node (xtn/start-node (merge tu/*node-opts* {:indexer {:page-limit 16}}))]
+  (util/with-open [node (xtn/start-node (merge tu/*node-opts* {:indexer {:page-limit 16}}))]
     (let [uuids (tu/uuid-seq 40)
           search-uuid (rand-nth uuids)]
-      (xt/submit-tx node (for [uuid (take 20 uuids)] [:put-docs :xt_docs {:xt/id uuid}]))
+      (xt/execute-tx node (for [uuid (take 20 uuids)]
+                            [:put-docs :xt_docs {:xt/id uuid}]))
       (tu/finish-block! node)
-      (xt/submit-tx node (for [uuid (drop 20 uuids)] [:put-docs :xt_docs {:xt/id uuid}]))
+
+      (xt/execute-tx node (for [uuid (drop 20 uuids)]
+                            [:put-docs :xt_docs {:xt/id uuid}]))
       (tu/finish-block! node)
+
+      (c/compact-all! node)
 
       (t/is (= [{:xt/id search-uuid}]
                (tu/query-ra [:scan '{:table public/xt_docs} [{'_id (list '= '_id search-uuid)}]]
@@ -582,18 +596,17 @@
 
 (deftest test-live-tries-with-multiple-leaves-are-loaded-correctly-2710
   (with-open [node (xtn/start-node (merge tu/*node-opts* {:indexer {:page-limit 16}}))]
-    (-> (xt/submit-tx node (for [i (range 20)] [:put-docs :xt_docs {:xt/id i}]))
-        (tu/then-await-tx node))
+    (xt/execute-tx node (for [i (range 20)] [:put-docs :xt_docs {:xt/id i}]))
 
     (t/is (= (into #{} (map #(hash-map :xt/id %)) (range 20))
              (set (tu/query-ra '[:scan {:table public/xt_docs} [_id]]
                                {:node node}))))))
 
 (deftest test-pushdown-blooms
-  (xt/submit-tx tu/*node* [[:put-docs :xt-docs {:xt/id :foo, :col "foo"}]
+  (xt/execute-tx tu/*node* [[:put-docs :xt-docs {:xt/id :foo, :col "foo"}]
                            [:put-docs :xt-docs {:xt/id :bar, :col "bar"}]])
   (tu/finish-block! tu/*node*)
-  (xt/submit-tx tu/*node* [[:put-docs :xt-docs {:xt/id :toto, :col "toto"}]])
+  (xt/execute-tx tu/*node* [[:put-docs :xt-docs {:xt/id :toto, :col "toto"}]])
   (tu/finish-block! tu/*node*)
 
   (let [!page-idxs-cnt (atom 0)
@@ -691,7 +704,7 @@
 
         (tu/finish-block! node)
         ;; compaction happens in 2026
-        (c/compact-all! node)
+        (c/compact-all! node #xt/duration "PT1S")
 
         (let [query-opts {:node node
                           :current-time (:system-time tx-key)}]

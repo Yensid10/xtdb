@@ -144,7 +144,7 @@
     (.syncRowCount live-rel)
     (let [row-count (.getPosition (.writerPosition live-rel))]
       (when (pos? row-count)
-        (let [trie-key (trie/->l0-l1-trie-key 0 block-idx)]
+        (let [trie-key (trie/->l0-trie-key block-idx)]
           (with-open [data-rel (.openAsRelation live-rel)]
             (let [data-file-size (trie/write-live-trie! allocator buffer-pool table-name trie-key
                                                         live-trie data-rel)]
@@ -384,7 +384,7 @@
    :config config})
 
 (defmethod ig/init-key :xtdb.indexer/live-index [_ {:keys [allocator buffer-pool metadata-mgr log trie-catalog compactor ^IndexerConfig config metrics-registry]}]
-  (let [{:keys [latest-completed-tx next-block-idx], :or {next-block-idx 0}} (meta/latest-block-metadata metadata-mgr)]
+  (let [{:keys [latest-completed-tx block-idx]} (meta/latest-block-metadata metadata-mgr)]
     (util/with-close-on-catch [allocator (util/->child-allocator allocator "live-index")]
       (metrics/add-allocator-gauge metrics-registry "live-index.allocator.allocated_memory" allocator)
       (let [tables (HashMap.)]
@@ -396,7 +396,7 @@
                      (StampedLock.)
                      (RefCounter.)
 
-                     (RowCounter. next-block-idx) (.getRowsPerBlock config)
+                     (RowCounter. (or (some-> block-idx inc) 0)) (.getRowsPerBlock config)
 
                      (.getLogLimit config) (.getPageLimit config)
                      (.getSkipTxs config))))))

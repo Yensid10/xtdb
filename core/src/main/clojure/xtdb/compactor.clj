@@ -1,7 +1,6 @@
 (ns xtdb.compactor
   (:require [clojure.tools.logging :as log]
             [integrant.core :as ig]
-            [xtdb.bitemporal :as bitemp]
             [xtdb.metrics :as metrics]
             [xtdb.trie :as trie]
             [xtdb.trie-catalog :as cat]
@@ -17,7 +16,7 @@
            xtdb.api.CompactorConfig
            (xtdb.api.log Log)
            (xtdb.arrow Relation RelationReader RowCopier Vector VectorWriter)
-           xtdb.bitemporal.IPolygonReader
+           (xtdb.bitemporal IPolygonReader PolygonCalculator)
            xtdb.BufferPool
            (xtdb.compactor Compactor Compactor$Impl Compactor$Job)
            (xtdb.metadata IMetadataManager)
@@ -51,7 +50,7 @@
 
 (defn merge-segments-into [^Relation data-rel, ^VectorWriter recency-wtr, segments, ^bytes path-filter]
   (let [reader->copier (->reader->copier data-rel)
-        calculate-polygon (bitemp/polygon-calculator)
+        polygon-calculator (PolygonCalculator.)
 
         is-valid-ptr (ArrowBufPointer.)]
 
@@ -86,7 +85,7 @@
 
       (loop [seen-erase? false]
         (when-let [{:keys [^EventRowPointer ev-ptr, ^RowCopier row-copier] :as q-obj} (.poll merge-q)]
-          (let [new-previous-polygon  (if-let [polygon (calculate-polygon ev-ptr)]
+          (let [new-previous-polygon  (if-let [polygon (.calculate polygon-calculator ev-ptr)]
                                         (do
                                           (.copyRow row-copier (.getIndex ev-ptr))
                                           (.writeLong recency-wtr (.getRecency ^IPolygonReader polygon))
@@ -126,7 +125,7 @@
     (log/debugf "compacting '%s' '%s' -> '%s'..." table-name trie-keys out-trie-key)
 
     (util/with-open [table-metadatas (LinkedList.)
-                     data-rels (trie/open-data-rels buffer-pool table-name trie-keys)]
+                     data-rels (trie/open-data-rels allocator buffer-pool table-name trie-keys)]
       (doseq [trie-key trie-keys]
         (.add table-metadatas (.openTableMetadata metadata-mgr (trie/->table-meta-file-path table-name trie-key))))
 
@@ -138,13 +137,13 @@
 
             data-file-size (util/with-open [data-rel (Relation. allocator schema)
                                             recency-wtr (open-recency-wtr allocator)]
-                             (merge-segments-into data-rel recency-wtr segments part)
+                             (merge-segments-into data-rel recency-wtr segments (byte-array part))
 
                              (util/with-open [trie-wtr (TrieWriter. allocator buffer-pool
                                                                     schema table-name out-trie-key
                                                                     true)]
 
-                               (Compactor/writeRelation trie-wtr data-rel recency-wtr page-size)))]
+                               (Compactor/writeRelation trie-wtr data-rel page-size)))]
 
         (log/debugf "compacted '%s' -> '%s'." table-name out-trie-key)
 
@@ -157,15 +156,15 @@
       (log/error t "Error running compaction job.")
       (throw t))))
 
-(defrecord Job [table-name trie-keys ^bytes part out-trie-key]
+(defrecord Job [table-name trie-keys part out-trie-key]
   Compactor$Job
   (getTableName [_] table-name)
   (getOutputTrieKey [_] out-trie-key))
 
-(defn- l0->l1-compaction-job [table-name trie-state {:keys [^long l1-size-limit]}]
-  (when-let [live-l0 (seq (->> (get trie-state [0 []])
+(defn- l0->l1-compaction-job [table-name {:keys [l0-tries l1-tries]} {:keys [^long l1-size-limit]}]
+  (when-let [live-l0 (seq (->> l0-tries
                                (take-while #(= :live (:state %)))))]
-    (let [latest-l1 (->> (get trie-state [1 []])
+    (let [latest-l1 (->> l1-tries
                          (take-while #(< (:data-file-size %) l1-size-limit))
                          first)]
       (loop [size (:data-file-size latest-l1 0)
@@ -176,10 +175,11 @@
 
           (let [{:keys [block-idx]} (last res)]
             (->Job table-name (mapv :trie-key res) nil
-                   (trie/->l0-l1-trie-key 1 block-idx))))))))
+                   ;; TODO recency
+                   (trie/->l1-trie-key nil block-idx))))))))
 
-(defn- l1p-compaction-jobs [table-name trie-state {:keys [^long l1-size-limit]}]
-  (for [[[level part] files] trie-state
+(defn- l1p-compaction-jobs [table-name {:keys [l1-tries ln-tries]} {:keys [^long l1-size-limit]}]
+  (for [[[level part] files] (conj ln-tries [[1 nil] l1-tries])
         :when (> level 0)
         :let [live-files (-> files
                              (->> (remove #(= :garbage (:state %))))
@@ -190,17 +190,19 @@
         p (range cat/branch-factor)
         :let [out-level (inc level)
               out-part (conj part p)
-              {lnp1-block-idx :block-idx} (first (get trie-state [out-level out-part]))
+              {lnp1-block-idx :block-idx} (first (get ln-tries [out-level out-part]))
 
               in-files (-> live-files
                            (cond->> lnp1-block-idx (drop-while #(<= (:block-idx %) lnp1-block-idx)))
-                           (->> (take cat/branch-factor)))]
+                           (->> (take cat/branch-factor)))
+              out-part (byte-array out-part)]
 
         :when (= cat/branch-factor (count in-files))
         :let [trie-keys (mapv :trie-key in-files)
               out-block-idx (:block-idx (last in-files))]]
-    (->Job table-name trie-keys (byte-array out-part)
-           (trie/->l2+-trie-key out-level out-part out-block-idx))))
+    (->Job table-name trie-keys out-part
+           ;; TODO recency
+           (trie/->trie-key out-level nil out-part out-block-idx))))
 
 (defn compaction-jobs [table-name trie-state opts]
   (concat (when-let [job (l0->l1-compaction-job table-name trie-state opts)]
@@ -226,12 +228,14 @@
       (Compactor/open
        (reify Compactor$Impl
          (availableJobs [_]
-           (->> (cat/table-names trie-catalog)
+           (->> (.getTableNames trie-catalog)
                 (into [] (mapcat (fn [table-name]
                                    (compaction-jobs table-name (cat/trie-state trie-catalog table-name) trie-catalog))))))
 
          (executeJob [_ job]
-           (exec-compaction-job! allocator buffer-pool metadata-mgr {:page-size page-size} job)))
+           (exec-compaction-job! allocator buffer-pool metadata-mgr {:page-size page-size} job))
+
+         (close [_] (util/close allocator)))
 
        log trie-catalog *ignore-signal-block?* threads))))
 

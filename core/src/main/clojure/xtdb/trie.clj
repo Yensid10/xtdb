@@ -4,8 +4,10 @@
             [xtdb.types :as types]
             [xtdb.util :as util]
             [xtdb.vector.writer :as vw])
-  (:import (java.lang AutoCloseable)
+  (:import com.carrotsearch.hppc.ByteArrayList
+           (java.lang AutoCloseable)
            (java.nio.file Path)
+           java.time.LocalDate
            (java.util ArrayList Arrays List)
            (org.apache.arrow.memory ArrowBuf BufferAllocator)
            (org.apache.arrow.vector VectorSchemaRoot)
@@ -13,26 +15,40 @@
            org.apache.arrow.vector.types.UnionMode
            (xtdb.arrow Relation)
            xtdb.BufferPool
-           (xtdb.trie ArrowHashTrie$Leaf HashTrie$Node ISegment MemoryHashTrie MemoryHashTrie$Leaf MergePlanNode TrieWriter)
+           (xtdb.trie ArrowHashTrie$Leaf HashTrie$Node ISegment MemoryHashTrie MemoryHashTrie$Leaf MergePlanNode Trie Trie$Key TrieWriter)
            (xtdb.util TemporalBounds TemporalDimension)))
 
-(defn ->l0-l1-trie-key [^long level, ^long block-idx]
-  (assert (<= 0 level 1))
+(defn ->trie-key [^long level, ^LocalDate recency, ^bytes part, ^long block-idx]
+  (str (Trie$Key. level recency (some-> part ByteArrayList/from) block-idx)))
 
-  (format "l%s-b%s" (util/->lex-hex-string level) (util/->lex-hex-string block-idx)))
+(defn ->l0-trie-key [^long block-idx]
+  (->trie-key 0 nil nil block-idx))
 
-(defn ->l2+-trie-key [^long level, ^bytes part, ^long block-idx]
-  (assert (>= level 2))
+(defn ->l1-trie-key [^LocalDate recency, ^long block-idx]
+  (->trie-key 1 recency nil block-idx))
 
-  (format "l%s-p%s-b%s"
-          (util/->lex-hex-string level)
-          (str/join part)
-          (util/->lex-hex-string block-idx)))
+(defn parse-trie-key [trie-key]
+  (try
+    (let [k (Trie/parseKey trie-key)]
+      {:trie-key trie-key
+       :level (.getLevel k)
+       :recency (.getRecency k)
+       :part (some-> (.getPart k) (.toArray))
+       :block-idx (.getBlockIndex k)})
+    (catch IllegalArgumentException _)
+    (catch IllegalStateException _)))
+
+(defn parse-trie-file-path [^Path file-path]
+  (-> (parse-trie-key (str (.getFileName file-path)))
+      (assoc :file-path file-path)))
 
 (def ^java.nio.file.Path tables-dir (util/->path "tables"))
 
-(defn- table-name->table-path ^java.nio.file.Path [^String table-name]
+(defn table-name->table-path ^java.nio.file.Path [^String table-name]
   (.resolve tables-dir (-> table-name (str/replace #"[\.\/]" "\\$"))))
+
+(defn table-dir->table-name ^String [^String table-dir]
+  (str/replace-first table-dir #"\$" "/" ))
 
 (defn ->table-data-file-path ^java.nio.file.Path [table-name trie-key]
   (-> (table-name->table-path table-name)
@@ -97,21 +113,6 @@
       (write-live-trie-node trie-wtr (.getRootNode trie) data-rel)
 
       (.end trie-wtr))))
-
-(def ^:private trie-file-path-regex
-  ;; e.g. `l01-b00-rs20.arrow` or `l04-p0010-b12e.arrow`
-  #"(l(\p{XDigit}+)(?:-p(\p{XDigit}+))?(?:-b(\p{XDigit}+)))(\.arrow)?$")
-
-(defn parse-trie-key [trie-key]
-  (when-let [[_ trie-key level-str part-str block-idx-str] (re-find trie-file-path-regex trie-key)]
-    (cond-> {:trie-key trie-key
-             :level (util/<-lex-hex-string level-str)
-             :block-idx  (util/<-lex-hex-string block-idx-str)}
-      part-str (assoc :part (byte-array (map #(Character/digit ^char % 4) part-str))))))
-
-(defn parse-trie-file-path [^Path file-path]
-  (-> (parse-trie-key (str (.getFileName file-path)))
-      (assoc :file-path file-path)))
 
 (defrecord Segment [trie]
   ISegment
@@ -190,7 +191,8 @@
   (^org.apache.arrow.vector.types.pojo.Schema getSchema [])
   (^xtdb.arrow.RelationReader loadPage [trie-leaf]))
 
-(deftype ArrowDataRel [^BufferPool buffer-pool
+(deftype ArrowDataRel [^BufferAllocator allocator
+                       ^BufferPool buffer-pool
                        ^Path data-file
                        ^Schema schema
                        ^List rels-to-close]
@@ -199,8 +201,7 @@
 
   (loadPage [_ trie-leaf]
     (util/with-open [rb (.getRecordBatch buffer-pool data-file (.getDataPageIndex ^ArrowHashTrie$Leaf trie-leaf))]
-      (let [alloc (.getAllocator (.getReferenceManager ^ArrowBuf (first (.getBuffers rb))))
-            rel (Relation/fromRecordBatch alloc schema rb)]
+      (let [rel (Relation/fromRecordBatch allocator schema rb)]
         (.add rels-to-close rel)
         rel)))
 
@@ -208,12 +209,12 @@
   (close [_]
     (util/close rels-to-close)))
 
-(defn open-data-rels [^BufferPool buffer-pool, table-name, trie-keys]
+(defn open-data-rels [^BufferAllocator allocator, ^BufferPool buffer-pool, table-name, trie-keys]
   (util/with-close-on-catch [data-rels (ArrayList.)]
     (doseq [trie-key trie-keys]
       (let [data-file (->table-data-file-path table-name trie-key)
             footer (.getFooter buffer-pool data-file)]
-        (.add data-rels (ArrowDataRel. buffer-pool data-file (.getSchema footer) (ArrayList.)))))
+        (.add data-rels (ArrowDataRel. allocator buffer-pool data-file (.getSchema footer) (ArrayList.)))))
     (vec data-rels)))
 
 (defn load-data-page [^MergePlanNode merge-plan-node]

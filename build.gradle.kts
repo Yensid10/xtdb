@@ -7,14 +7,14 @@ evaluationDependsOnChildren()
 
 buildscript {
     dependencies {
-        classpath("org.jetbrains.dokka:dokka-base:1.9.10")
+        classpath("org.jetbrains.dokka:dokka-base:2.0.0")
     }
 }
 
 plugins {
     `java-library`
     id("dev.clojurephant.clojure") version "0.8.0-beta.7"
-    id("io.freefair.aggregate-javadoc") version "6.6"
+    id("io.freefair.aggregate-javadoc-legacy") version "8.12.2"
     kotlin("jvm")
     kotlin("plugin.serialization")
     id("org.jetbrains.dokka")

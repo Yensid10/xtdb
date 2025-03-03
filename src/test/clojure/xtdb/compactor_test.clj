@@ -5,14 +5,13 @@
             [xtdb.compactor :as c]
             [xtdb.indexer.live-index :as li]
             [xtdb.node :as xtn]
+            [xtdb.object-store :as os]
             [xtdb.test-json :as tj]
             [xtdb.test-util :as tu]
             [xtdb.time :as time]
             [xtdb.trie :as trie]
             [xtdb.trie-catalog :as cat]
-            [xtdb.trie-catalog-test :as cat-test]
-            [xtdb.util :as util]
-            [xtdb.object-store :as os])
+            [xtdb.util :as util])
   (:import java.lang.AutoCloseable
            [java.nio ByteBuffer]
            [java.time Duration]
@@ -24,120 +23,114 @@
 
 (t/use-fixtures :each tu/with-allocator tu/with-node)
 
-(t/deftest test-compaction-jobs
-  (letfn [(f [tries & {:keys [l1-size-limit]}]
-            (let [opts {:l1-size-limit (or l1-size-limit 16)}]
-              (-> tries
-                  (->> (transduce (map cat-test/->added-trie)
-                                  (partial cat/apply-trie-notification opts)))
-                  (as-> trie-state (c/compaction-jobs "foo" trie-state opts))
-                  (->> (into #{} (map (fn [{:keys [part] :as job}]
-                                        (-> job
-                                            (->> (into {} (filter val)))
-                                            (cond-> part (update :part vec))
-                                            (dissoc :table-name)))))))))]
+(defn- job
+  ([out in] (job out in []))
+  ([out in part] {:trie-keys in, :out-trie-key out, :part part}))
 
-    (t/testing "l0 -> l1"
-      (t/is (= #{} (f [])))
+(defn calc-jobs [& tries]
+  (let [opts {:l1-size-limit cat/*l1-size-limit*}]
+    (-> tries
+        (->> (transduce (map (fn [[trie-key size]]
+                               (-> (trie/parse-trie-key trie-key)
+                                   (assoc :data-file-size (or size -1)))))
+                        (completing (partial cat/apply-trie-notification opts))
+                        {}))
+        (as-> trie-state (c/compaction-jobs "foo" trie-state opts))
+        (->> (into #{} (map (fn [job]
+                              (-> job
+                                  (update :part vec)
+                                  (dissoc :table-name)))))))))
 
-      (t/is (= #{{:trie-keys ["l00-b00" "l00-b01"],
-                  :out-trie-key "l01-b01"}}
-               (f [[0 0 10] [0 1 10] [0 2 10]]))
-            "no L1s yet, merge L0s up to limit and stop")
+(t/deftest test-l0->l1-compaction-jobs
+  (binding [cat/*l1-size-limit* 16]
+    (t/is (= #{} (calc-jobs)))
 
-      (t/is (= #{{:trie-keys ["l01-b00" "l00-b01"],
-                  :out-trie-key "l01-b01"}}
-               (f [[0 0 10] [0 1 10] [0 2 10]
-                   [1 0 10]]))
-            "have a partial L1, merge into that until it's full")
+    (t/is (= #{(job "l01-rc-b01" ["l00-rc-b00" "l00-rc-b01"])}
+             (calc-jobs ["l00-rc-b00" 10] ["l00-rc-b01" 10] ["l00-rc-b02" 10]))
+          "no L1s yet, merge L0s up to limit and stop")
 
-      (t/is (empty? (f [[0 0 10] [0 1 10]
-                        [1 1 20]]))
-            "all merged, nothing to do")
+    (t/is (= #{(job "l01-rc-b01" ["l01-rc-b00" "l00-rc-b01"])}
+             (calc-jobs ["l00-rc-b00" 10] ["l00-rc-b01" 10] ["l00-rc-b02" 10]
+                        ["l01-rc-b00" 10]))
+          "have a partial L1, merge into that until it's full")
 
-      (t/is (= #{{:trie-keys ["l00-b02" "l00-b03"],
-                  :out-trie-key "l01-b03"}}
-               (f [[0 0 10] [0 1 10] [0 2 10] [0 3 10] [0 4 10]
-                   [1 1 20]]))
-            "have a full L1, start a new L1 til that's full")
+    (t/is (empty? (calc-jobs ["l00-rc-b00" 10] ["l00-rc-b01" 10]
+                             ["l01-rc-b01" 20]))
+          "all merged, nothing to do")
 
-      (t/is (= #{{:trie-keys ["l01-b02" "l00-b03"],
-                  :out-trie-key "l01-b03"}}
-               (f [[0 0 10] [0 1 10] [0 2 10] [0 3 10] [0 4 10]
-                   [1 1 20] [1 2 10]]))
-            "have a full and a partial L1, merge into that til it's full")
+    (t/is (= #{(job "l01-rc-b03" ["l00-rc-b02" "l00-rc-b03"])}
+             (calc-jobs ["l00-rc-b00" 10] ["l00-rc-b01" 10] ["l00-rc-b02" 10] ["l00-rc-b03" 10] ["l00-rc-b04" 10]
+                        ["l01-rc-b01" 20]))
+          "have a full L1, start a new L1 til that's full")
 
-      (t/is (empty? (f [[0 0 10] [0 1 10] [0 2 10] [0 3 10] [0 4 10]
-                        [1 1 20] [1 3 20] [1 4 10]]))
-            "all merged, nothing to do"))
+    (t/is (= #{(job "l01-rc-b03" ["l01-rc-b02" "l00-rc-b03"])}
+             (calc-jobs ["l00-rc-b00" 10] ["l00-rc-b01" 10] ["l00-rc-b02" 10] ["l00-rc-b03" 10] ["l00-rc-b04" 10]
+                        ["l01-rc-b01" 20] ["l01-rc-b02" 10]))
+          "have a full and a partial L1, merge into that til it's full")
 
-    (t/testing "l1 -> l2"
-      (t/is (= (let [l1-trie-keys ["l01-b01" "l01-b03" "l01-b05" "l01-b07"]]
-                 #{{:trie-keys l1-trie-keys, :part [0], :out-trie-key "l02-p0-b07"}
-                   {:trie-keys l1-trie-keys, :part [1], :out-trie-key "l02-p1-b07"}
-                   {:trie-keys l1-trie-keys, :part [2], :out-trie-key "l02-p2-b07"}
-                   {:trie-keys l1-trie-keys, :part [3], :out-trie-key "l02-p3-b07"}})
-               (f [[1 0 10] [1 1 20] [1 2 10] [1 3 20] [1 4 10] [1 5 20] [1 6 10] [1 7 20]]))
+    (t/is (empty? (calc-jobs ["l00-rc-b00" 10] ["l00-rc-b01" 10] ["l00-rc-b02" 10] ["l00-rc-b03" 10] ["l00-rc-b04" 10]
+                             ["l01-rc-b01" 20] ["l01-rc-b03" 20] ["l01-rc-b04" 10]))
+          "all merged, nothing to do")))
 
-            "empty L2 and superseded L1 files get ignored")
+(t/deftest test-l1c->l2c-compaction-jobs
+  (binding [cat/*l1-size-limit* 16]
+    (t/is (= (let [l1-trie-keys ["l01-rc-b01" "l01-rc-b03" "l01-rc-b05" "l01-rc-b07"]]
+               #{(job "l02-rc-p0-b07" l1-trie-keys [0])
+                 (job "l02-rc-p1-b07" l1-trie-keys [1])
+                 (job "l02-rc-p2-b07" l1-trie-keys [2])
+                 (job "l02-rc-p3-b07" l1-trie-keys [3])})
+             (calc-jobs ["l01-rc-b00" 10] ["l01-rc-b01" 20] ["l01-rc-b02" 10] ["l01-rc-b03" 20] ["l01-rc-b04" 10] ["l01-rc-b05" 20] ["l01-rc-b06" 10] ["l01-rc-b07" 20]))
 
-      (t/is (= #{{:trie-keys ["l01-b01" "l01-b03" "l01-b05" "l01-b07"],
-                  :part [1],
-                  :out-trie-key "l02-p1-b07"}}
-               (f [[2 [0] 7] [2 [2] 7] [2 [3] 7]
-                   [1 1 20] [1 3 20] [1 5 20] [1 7 20]
-                   [0 0 10] [0 1 10] [0 2 10] [0 3 10] [0 4 10] [0 5 10] [0 6 10] [0 7 10]]))
-            "still needs L2 [1]"))
+          "empty L2 and superseded L1 files get ignored")
 
+    (t/is (= #{(job "l02-rc-p1-b07" ["l01-rc-b01" "l01-rc-b03" "l01-rc-b05" "l01-rc-b07"] [1])}
+             (calc-jobs ["l00-rc-b00" 10] ["l00-rc-b01" 10] ["l00-rc-b02" 10] ["l00-rc-b03" 10] ["l00-rc-b04" 10] ["l00-rc-b05" 10] ["l00-rc-b06" 10] ["l00-rc-b07" 10]
+                        ["l01-rc-b01" 20] ["l01-rc-b03" 20] ["l01-rc-b05" 20] ["l01-rc-b07" 20]
+                        ["l02-rc-p0-b07"] ["l02-rc-p2-b07"] ["l02-rc-p3-b07"]))
+          "still needs L2 [1]")))
+
+(t/deftest test-l2+-compaction-jobs
+  (binding [cat/*l1-size-limit* 16]
     (t/testing "L2+"
       (t/is (= #{ ;; L2 [0] is full, compact L3 [0 0] and [0 1]
-                 {:trie-keys ["l02-p0-b03" "l02-p0-b07" "l02-p0-b0b" "l02-p0-b0f"],
-                  :part [0 0], :out-trie-key "l03-p00-b0f"}
-
-                 {:trie-keys ["l02-p0-b03" "l02-p0-b07" "l02-p0-b0b" "l02-p0-b0f"],
-                  :part [0 1], :out-trie-key "l03-p01-b0f"}
+                 (job "l03-rc-p00-b0f" ["l02-rc-p0-b03" "l02-rc-p0-b07" "l02-rc-p0-b0b" "l02-rc-p0-b0f"] [0 0])
+                 (job "l03-rc-p01-b0f" ["l02-rc-p0-b03" "l02-rc-p0-b07" "l02-rc-p0-b0b" "l02-rc-p0-b0f"] [0 1])
 
                  ;; L2 [0] has loads, merge from 0x10 onwards (but only 4)
-                 {:trie-keys ["l01-b110" "l01-b111" "l01-b112" "l01-b113"],
-                  :part [0], :out-trie-key "l02-p0-b113"}
+                 (job "l02-rc-p0-b113" ["l01-rc-b110" "l01-rc-b111" "l01-rc-b112" "l01-rc-b113"] [0])
 
                  ;; L2 [1] has nothing, choose the first four
-                 {:trie-keys ["l01-b00" "l01-b01" "l01-b02" "l01-b03"],
-                  :part [1], :out-trie-key "l02-p1-b03"}
+                 (job "l02-rc-p1-b03" ["l01-rc-b00" "l01-rc-b01" "l01-rc-b02" "l01-rc-b03"] [1])
 
                  ;; fill in the gaps in [2] and [3]
-                 {:trie-keys ["l01-b0c" "l01-b0d" "l01-b0e" "l01-b0f"],
-                  :part [2], :out-trie-key "l02-p2-b0f"}
+                 (job "l02-rc-p2-b0f" ["l01-rc-b0c" "l01-rc-b0d" "l01-rc-b0e" "l01-rc-b0f"] [2])
+                 (job "l02-rc-p3-b0b" ["l01-rc-b08" "l01-rc-b09" "l01-rc-b0a" "l01-rc-b0b"] [3])}
 
-                 {:trie-keys ["l01-b08" "l01-b09" "l01-b0a" "l01-b0b"],
-                  :part [3], :out-trie-key "l02-p3-b0b"}}
-
-               (f [[3 [0 2] 0xf]
-                   [3 [0 3] 0xf]
-                   [2 [0] 3] [2 [2] 3] [2 [3] 3] ; missing [1]
-                   [2 [0] 7] [2 [2] 7] [2 [3] 7] ; missing [1]
-                   [2 [0] 0xb] [2 [2] 0xb] ; missing [1] + [3]
-                   [2 [0] 0xf] ; missing [1], [2], and [3]
-                   [1 0 2] [1 1 2] [1 2 2] [1 3 2]
-                   [1 4 2] [1 5 2] [1 6 2] [1 7 2]
-                   [1 8 2] [1 9 2] [1 0xa 2] [1 0xb 2]
-                   [1 0xc 2] [1 0xd 2] [1 0xe 2] [1 0xf 2]
-                   [1 0x10 2] [1 0x11 2] [1 0x12 2] [1 0x13 2]
-                   ;; superseded ones
-                   [1 0 1] [1 2 1] [1 9 1] [1 0xd 1]]
-
-                  {:l1-size-limit 2}))
+               (binding [cat/*l1-size-limit* 2]
+                 (calc-jobs ["l03-rc-p02-b0f"]
+                            ["l03-rc-p03-b0f"]
+                            ["l02-rc-p0-b03"] ["l02-rc-p2-b03"] ["l02-rc-p3-b03"] ; missing [1]
+                            ["l02-rc-p0-b07"] ["l02-rc-p2-b07"] ["l02-rc-p3-b07"] ; missing [1]
+                            ["l02-rc-p0-b0b"] ["l02-rc-p2-b0b"]                ; missing [1] + [3]
+                            ["l02-rc-p0-b0f"]                               ; missing [1], [2], and [3]
+                            ["l01-rc-b00" 2] ["l01-rc-b01" 2] ["l01-rc-b02" 2] ["l01-rc-b03" 2]
+                            ["l01-rc-b04" 2] ["l01-rc-b05" 2] ["l01-rc-b06" 2] ["l01-rc-b07" 2]
+                            ["l01-rc-b08" 2] ["l01-rc-b09" 2] ["l01-rc-b0a" 2] ["l01-rc-b0b" 2]
+                            ["l01-rc-b0c" 2] ["l01-rc-b0d" 2] ["l01-rc-b0e" 2] ["l01-rc-b0f" 2]
+                            ["l01-rc-b110" 2] ["l01-rc-b111" 2] ["l01-rc-b112" 2] ["l01-rc-b113" 2]
+                            ;; superseded ones
+                            ["l01-rc-b00" 1] ["l01-rc-b02" 1] ["l01-rc-b09" 1] ["l01-rc-b0d" 1])))
             "up to L3")
 
-      (t/is (= (let [l2-keys ["l03-p03-b0f" "l03-p03-b11f" "l03-p03-b12f" "l03-p03-b13f"]]
-                 #{{:trie-keys l2-keys, :part [0 3 0], :out-trie-key "l04-p030-b13f"}
-                   {:trie-keys l2-keys, :part [0 3 1], :out-trie-key "l04-p031-b13f"}
-                   {:trie-keys l2-keys, :part [0 3 2], :out-trie-key "l04-p032-b13f"}
-                   {:trie-keys l2-keys, :part [0 3 3], :out-trie-key "l04-p033-b13f"}})
+      (let [l2-keys ["l03-rc-p03-b0f" "l03-rc-p03-b11f" "l03-rc-p03-b12f" "l03-rc-p03-b13f"]]
+        (t/is (= #{(job "l04-rc-p030-b13f" l2-keys [0 3 0])
+                   (job "l04-rc-p031-b13f" l2-keys [0 3 1])
+                   (job "l04-rc-p032-b13f" l2-keys [0 3 2])
+                   (job "l04-rc-p033-b13f" l2-keys [0 3 3])}
 
-               (f [[3 [0 2] 0x0f]
-                   [3 [0 3] 0x0f] [3 [0 3] 0x1f] [3 [0 3] 0x2f] [3 [0 3] 0x3f]]))
-            "L3 -> L4"))))
+                 (calc-jobs ["l03-rc-p02-b0f"]
+                            ["l03-rc-p03-b0f"] ["l03-rc-p03-b11f"] ["l03-rc-p03-b12f"] ["l03-rc-p03-b13f"]))
+              "L3 -> L4")))))
 
 (deftype LiveDataRel [^RelationReader live-rel]
   IDataRel
@@ -287,7 +280,7 @@
           (t/is (= (range 500) (q)))
 
           (tj/check-json (.toPath (io/as-file (io/resource "xtdb/compactor-test/test-l1-compaction")))
-                         (.resolve node-dir (tables-key "public$foo")) #"l01-(.+)\.arrow"))))))
+                         (.resolve node-dir (tables-key "public$foo")) #"l01-rc-(.+)\.arrow"))))))
 
 (t/deftest test-l2+-compaction
   (let [node-dir (util/->path "target/compactor/test-l2+-compaction")]
@@ -355,7 +348,7 @@
                                   (mapv (comp :key os/<-StoredObject)))]
               (doseq [{:keys [trie-key]} (map trie/parse-trie-file-path meta-files)]
                 (util/with-open [{:keys [^HashTrie trie] :as _table-metadata} (.openTableMetadata meta-mgr (trie/->table-meta-file-path table-name trie-key))
-                                 ^IDataRel data-rel (first (trie/open-data-rels bp table-name [trie-key]))]
+                                 ^IDataRel data-rel (first (trie/open-data-rels tu/*allocator* bp table-name [trie-key]))]
 
                   ;; checking that every page relation has a positive row count
                   (t/is (empty? (->> (mapv #(.loadPage data-rel %) (.getLeaves trie))
@@ -399,24 +392,6 @@
           (c/compact-all! node (Duration/ofSeconds 1))
 
           (t/is (= (tu/bad-uuid-seq 500) (q))))))))
-
-(t/deftest test-more-than-a-page-of-versions
-  (let [node-dir (util/->path "target/compactor/test-more-than-a-page-of-versions")]
-    (util/delete-dir node-dir)
-
-    (binding [c/*page-size* 8
-              cat/*l1-size-limit* (* 16 1024)
-              c/*ignore-signal-block?* true]
-      (util/with-open [node (tu/->local-node {:node-dir node-dir, :rows-per-block 10})]
-        (dotimes [n 100]
-          (xt/submit-tx node [[:put-docs :foo {:xt/id "foo", :v n}]]))
-        (tu/then-await-tx node)
-        (c/compact-all! node (Duration/ofSeconds 5))
-
-        (t/is (= [{:foo-count 100}] (xt/q node "SELECT COUNT(*) foo_count FROM foo FOR ALL VALID_TIME")))))
-
-    (tj/check-json (.toPath (io/as-file (io/resource "xtdb/compactor-test/test-more-than-a-page-of-versions")))
-                   (.resolve node-dir (tables-key "public$foo")) #"l01-(.+)\.arrow")))
 
 (t/deftest losing-data-when-compacting-3459
   (binding [c/*page-size* 8
@@ -475,29 +450,30 @@
                                      #uuid "40000000-0000-0000-0000-000000000000"
                                      #uuid "80000000-0000-0000-0000-000000000000"]]
 
-        (xt/submit-tx node [[:put-docs :foo {:xt/id id-before} {:xt/id id} {:xt/id id-after}]])
+        (xt/execute-tx node [[:put-docs :foo {:xt/id id-before} {:xt/id id} {:xt/id id-after}]])
         (tu/finish-block! node)
         (c/compact-all! node #xt/duration "PT0.5S")
 
-        (xt/submit-tx node [[:erase {:from :foo :bind [{:xt/id id}]}]])
+        (xt/execute-tx node [[:erase {:from :foo :bind [{:xt/id id}]}]])
         (tu/finish-block! node)
         (c/compact-all! node #xt/duration "PT0.5S")
 
         (t/is (= [{:xt/id id-before} {:xt/id id-after}]
                  (xt/q node "SELECT _id FROM foo FOR ALL VALID_TIME FOR ALL SYSTEM_TIME")))
 
-        (xt/submit-tx node [[:put-docs :foo {:xt/id id}]])
+        (xt/execute-tx node [[:put-docs :foo {:xt/id id}]])
+
+        (t/testing "an id where there is no previous data shouldn't show up in the compacted files"
+          (xt/execute-tx node [[:erase {:from :foo :bind [{:xt/id #uuid "20000000-0000-0000-0000-000000000000"}]}]]))
+
         (tu/finish-block! node)
         (c/compact-all! node #xt/duration "PT0.5S")
 
         (t/is (= [{:xt/id id-before} {:xt/id id} {:xt/id id-after}]
                  (xt/q node "SELECT _id FROM foo FOR ALL VALID_TIME FOR ALL SYSTEM_TIME"))))
 
-      (t/testing "an id where there is no previous data shouldn't show up in the compacted files"
-        (xt/submit-tx node [[:erase {:from :foo :bind [{:xt/id #uuid "20000000-0000-0000-0000-000000000000"}]}]]))
-
       (tj/check-json (.toPath (io/as-file (io/resource "xtdb/compactor-test/compaction-with-erase")))
-                     (.resolve node-dir (tables-key "public$foo")) #"l01-(.+)\.arrow"))))
+                     (.resolve node-dir (tables-key "public$foo")) #"l01-rc-(.+)\.arrow"))))
 
 (t/deftest recency-bucketing-bug
   (let [node-dir (util/->path "target/compactor/recency-bucketing-bug")]

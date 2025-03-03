@@ -345,6 +345,10 @@
             {:name "Steve", :film "Shaun of the Dead", :ord 2}]
            (xt/q tu/*node* "SELECT name, film, ord FROM actors, UNNEST(films) WITH ORDINALITY AS films(film, ord)"))))
 
+(t/deftest test-unnest-null-or-missing-4075
+  (xt/execute-tx tu/*node* ["INSERT INTO foo RECORDS {_id: 1, a: 2}"])
+  (t/is (= [] (xt/q tu/*node* "SELECT b FROM foo, UNNEST(foo.b) AS bs(b)"))))
+
 (t/deftest test-cross-join
   (t/is (=plan-file
          "cross-join-1"
@@ -2483,21 +2487,6 @@ UNION ALL
   (t/is (= [{:str "hello, 42.0 at 2020-01-01"}]
            (xt/q tu/*node* "SELECT STR('hello, ', NULL, 42.0, ' at ', DATE '2020-01-01') str"))))
 
-(t/deftest test-unnest-error-doesnt-break-watermark-3924
-  (xt/execute-tx tu/*node* ["INSERT INTO docs RECORDS {_id: 2, col1: ['bar'], col2:' baz'};"])
-  (t/testing "successful unnest works as expected"
-    (t/is (= [{:b "bar", :xt/id 2, :col1 ["bar"], :col2 " baz"}]
-             (xt/q tu/*node* "FROM docs, UNNEST(docs.col1) AS a(b);"))))
-
-  (t/testing "failing unnest throws suitable error, doesn't break subsequent queries"
-    (t/is (thrown-with-msg?
-           UnsupportedOperationException
-           #"org.apache.arrow.vector.NullVector"
-           (xt/q tu/*node* "FROM UNNEST(docs.col1) AS a(b);")))
-
-    (t/is (= [{:b "bar", :xt/id 2, :col1 ["bar"], :col2 " baz"}]
-               (xt/q tu/*node* "FROM docs, UNNEST(docs.col1) AS a(b);")))))
-
 (t/deftest insert-with-transit-param-3907
   (letfn [(->serialised-records [records]
             (map xt-jdbc/->pg-obj records))
@@ -2780,10 +2769,25 @@ UNION ALL
   (t/is (false? (execute-tx->committed? "INSERT INTO docs (_id) FROM generate_series (1, 4) xs (x, foo)"))))
 
 (t/deftest test-full-outer-join
+  (t/testing "uncorelated FOJ"
+    (let [q "SELECT foo, bar FROM d1 FULL OUTER JOIN d2 ON foo = bar"]
+      (t/is
+       (=plan-file "test-full-outer-join-uncorrelated"
+                   (plan-sql q
+                             {:table-info {"public/d1" #{"_id" "bar"} "public/d2" #{"_id" "foo"}}})))
+
+      (xt/execute-tx tu/*node* ["INSERT INTO d1 (_id, foo) VALUES (1, 1), (2, 2), (3, 4)"
+                                "INSERT INTO d2 (_id, bar) VALUES (1, 1), (2, 2), (3, 3)"])
+
+      (t/is (= [{:foo 2, :bar 2} {:foo 1, :bar 1} {:bar 3} {:foo 4}]
+               (xt/q tu/*node* q)))))
+
   (t/is
-   (thrown-with-msg? IllegalArgumentException #"mismatched input 'FULL'"
-                     (plan-sql "SELECT * FROM d1 FULL OUTER JOIN d2 ON true"
-                               {:table-info {"d1" #{"_id" "bar"} "d2" #{"_id" "foo"}}}))))
+   (thrown-with-msg?
+    IllegalArgumentException
+    #"Subqueries are not allowed in this context"
+    (plan-sql "SELECT foo, bar FROM d1 FULL OUTER JOIN d2 ON foo = (SELECT bar)"
+              {:table-info {"public/d1" #{"_id" "bar"} "public/d2" #{"_id" "foo"}}}))))
 
 (t/deftest order-by-ignored-4193
   (xt/submit-tx tu/*node* ["INSERT INTO docs (_id, col1, w) VALUES (1, 'foo', 'x')"
@@ -2796,3 +2800,9 @@ UNION ALL
                   SELECT d1.col1 t
                   WHERE t IS NOT NULL
                   ORDER BY t asc"))))
+
+(t/deftest test-duplicate-column-projection
+  (t/is (thrown-with-msg?
+         IllegalArgumentException
+         #"Duplicate column projection: a"
+         (plan-sql "SELECT 1 AS a, 2 AS a" {}))))

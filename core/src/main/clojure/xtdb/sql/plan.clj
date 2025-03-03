@@ -2,6 +2,7 @@
   (:require [clojure.set :as set]
             [clojure.string :as str]
             [clojure.tools.logging :as log]
+            [clojure.walk :as w]
             [xtdb.antlr :as antlr]
             [xtdb.api :as xt]
             [xtdb.error :as err]
@@ -370,7 +371,7 @@
                                   (str/upper-case))
                       "LEFT" :left-outer-join
                       "RIGHT" :right-outer-join
-                      ;; "FULL" :full-outer-join
+                      "FULL" :full-outer-join
                       :join)
 
           [join-type l r] (if (= join-type :right-outer-join)
@@ -395,14 +396,23 @@
                                                                          :scope (->JoinConditionScope env (->SubqueryScope env l !lhs-refs) r)
                                                                          :!subqs !join-cond-subqs})))]
 
-                       [:apply (if (= join-type :join)
-                                 :cross-join
-                                 join-type)
-                        (into {} !lhs-refs)
-                        (plan-rel l)
-                        [:select join-pred
-                         (-> (plan-rel r)
-                             (apply-sqs !join-cond-subqs))]])))))))))
+                       (if (= join-type :full-outer-join)
+
+                         (if (.isEmpty !join-cond-subqs)
+                           [:full-outer-join
+                            [(w/postwalk-replace (set/map-invert !lhs-refs) join-pred)]
+                            (plan-rel l)
+                            (plan-rel r)]
+                           (add-err! env (->SubqueryDisallowed)))
+
+                         [:apply (if (= join-type :join)
+                                   :cross-join
+                                   join-type)
+                          (into {} !lhs-refs)
+                          (plan-rel l)
+                          [:select join-pred
+                           (-> (plan-rel r)
+                               (apply-sqs !join-cond-subqs))]]))))))))))
 
 (defrecord CrossJoinTable [env !sq-refs l r]
   Scope
@@ -2157,10 +2167,15 @@
         ob-plan (some-> order-by-clause
                         (plan-order-by env scope
                                        (mapv :col-sym projected-cols)))]
+
+        (when-let [dup-cols (not-empty (dups (mapv :col-sym projected-cols)))]
+          (doseq [col dup-cols]
+            (add-err! env (->DuplicateColumnProjection col))))
+
     (reify
       Scope
       (available-cols [_]
-        (->insertion-ordered-set (mapv :col-sym (:projected-cols select-plan))))
+        (->insertion-ordered-set (mapv :col-sym projected-cols)))
 
       (-find-cols [this [col-name table-name] excl-cols]
         (when (nil? table-name)

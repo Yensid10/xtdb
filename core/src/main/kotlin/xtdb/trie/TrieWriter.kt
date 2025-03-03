@@ -14,11 +14,6 @@ import xtdb.util.requiringResolve
 import java.nio.file.Path
 import java.util.*
 
-typealias InstantMicros = Long
-typealias RowIndex = Int
-typealias TableName = String
-typealias TrieKey = String
-
 class TrieWriter(
     allocator: BufferAllocator,
     private val bufferPool: BufferPool,
@@ -83,6 +78,8 @@ class TrieWriter(
             .getOrThrow()
 
     private val nodeWtr = metaRel["nodes"]!!
+    private val nullBranchWtr = nodeWtr.legWriter("nil")
+
     private val iidBranchWtr = nodeWtr.legWriter("branch-iid")
     private val iidBranchElWtr = iidBranchWtr.elementWriter
 
@@ -100,6 +97,12 @@ class TrieWriter(
             .let { it as PageMetadataWriter }
 
     private var pageIdx = 0
+
+    fun writeNull(): RowIndex {
+        val pos = nodeWtr.valueCount
+        nullBranchWtr.writeNull()
+        return pos
+    }
 
     fun writeLeaf(): RowIndex {
         val putReader = dataRel["op"]!!.legReader("put")
