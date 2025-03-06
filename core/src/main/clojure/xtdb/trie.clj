@@ -4,18 +4,20 @@
             [xtdb.types :as types]
             [xtdb.util :as util]
             [xtdb.vector.writer :as vw])
-  (:import com.carrotsearch.hppc.ByteArrayList
-           (java.lang AutoCloseable)
+  (:import (clojure.lang MapEntry)
+           com.carrotsearch.hppc.ByteArrayList
+           (com.google.protobuf ByteString)
+           (java.nio ByteBuffer)
            (java.nio.file Path)
            java.time.LocalDate
-           (java.util ArrayList Arrays List)
-           (org.apache.arrow.memory ArrowBuf BufferAllocator)
+           (java.util ArrayList)
+           (org.apache.arrow.memory BufferAllocator)
            (org.apache.arrow.vector VectorSchemaRoot)
            (org.apache.arrow.vector.types.pojo ArrowType$Union Field Schema)
            org.apache.arrow.vector.types.UnionMode
-           (xtdb.arrow Relation)
+           (xtdb.block.proto TableBlock)
            xtdb.BufferPool
-           (xtdb.trie ArrowHashTrie$Leaf HashTrie$Node ISegment MemoryHashTrie MemoryHashTrie$Leaf MergePlanNode Trie Trie$Key TrieWriter)
+           (xtdb.trie DataRel ISegment MemoryHashTrie MergePlanNode Trie Trie$Key)
            (xtdb.util TemporalBounds TemporalDimension)))
 
 (defn ->trie-key [^long level, ^LocalDate recency, ^bytes part, ^long block-idx]
@@ -47,9 +49,6 @@
 (defn table-name->table-path ^java.nio.file.Path [^String table-name]
   (.resolve tables-dir (-> table-name (str/replace #"[\.\/]" "\\$"))))
 
-(defn table-dir->table-name ^String [^String table-dir]
-  (str/replace-first table-dir #"\$" "/" ))
-
 (defn ->table-data-file-path ^java.nio.file.Path [table-name trie-key]
   (-> (table-name->table-path table-name)
       (.resolve (format "data/%s.arrow" trie-key))))
@@ -79,40 +78,6 @@
   (^xtdb.vector.IRelationWriter [^BufferAllocator allocator data-schema]
    (util/with-close-on-catch [root (VectorSchemaRoot/create data-schema allocator)]
      (vw/root->writer root))))
-
-(defn write-live-trie-node [^TrieWriter trie-wtr, ^HashTrie$Node node, ^Relation data-rel]
-  (let [copier (.rowCopier (.getDataRel trie-wtr) data-rel)]
-    (letfn [(write-node! [^HashTrie$Node node]
-              (if-let [children (.getIidChildren node)]
-                (let [child-count (alength children)
-                      !idxs (int-array child-count)]
-                  (dotimes [n child-count]
-                    (aset !idxs n
-                          (unchecked-int
-                           (if-let [child (aget children n)]
-                             (write-node! child)
-                             -1))))
-
-                  (.writeIidBranch trie-wtr !idxs))
-
-                (let [^MemoryHashTrie$Leaf leaf node]
-                  (-> (Arrays/stream (.getData leaf))
-                      (.forEach (fn [idx]
-                                  (.copyRow copier idx))))
-
-                  (.writeLeaf trie-wtr))))]
-
-      (write-node! node))))
-
-(defn write-live-trie! [^BufferAllocator allocator, ^BufferPool buffer-pool,
-                        table-name, trie-key,
-                        ^MemoryHashTrie trie, ^Relation data-rel]
-  (util/with-open [trie-wtr (TrieWriter. allocator buffer-pool (.getSchema data-rel) table-name trie-key
-                                         false)]
-    (let [trie (.compactLogs trie)]
-      (write-live-trie-node trie-wtr (.getRootNode trie) data-rel)
-
-      (.end trie-wtr))))
 
 (defrecord Segment [trie]
   ISegment
@@ -187,37 +152,7 @@
                    (recur more-pages)))))
            (vec leaves)))))))
 
-(definterface IDataRel
-  (^org.apache.arrow.vector.types.pojo.Schema getSchema [])
-  (^xtdb.arrow.RelationReader loadPage [trie-leaf]))
-
-(deftype ArrowDataRel [^BufferAllocator allocator
-                       ^BufferPool buffer-pool
-                       ^Path data-file
-                       ^Schema schema
-                       ^List rels-to-close]
-  IDataRel
-  (getSchema [_] schema)
-
-  (loadPage [_ trie-leaf]
-    (util/with-open [rb (.getRecordBatch buffer-pool data-file (.getDataPageIndex ^ArrowHashTrie$Leaf trie-leaf))]
-      (let [rel (Relation/fromRecordBatch allocator schema rb)]
-        (.add rels-to-close rel)
-        rel)))
-
-  AutoCloseable
-  (close [_]
-    (util/close rels-to-close)))
-
-(defn open-data-rels [^BufferAllocator allocator, ^BufferPool buffer-pool, table-name, trie-keys]
-  (util/with-close-on-catch [data-rels (ArrayList.)]
-    (doseq [trie-key trie-keys]
-      (let [data-file (->table-data-file-path table-name trie-key)
-            footer (.getFooter buffer-pool data-file)]
-        (.add data-rels (ArrowDataRel. allocator buffer-pool data-file (.getSchema footer) (ArrayList.)))))
-    (vec data-rels)))
-
 (defn load-data-page [^MergePlanNode merge-plan-node]
-  (let [{:keys [^IDataRel data-rel]} (.getSegment merge-plan-node)
+  (let [{:keys [^DataRel data-rel]} (.getSegment merge-plan-node)
         trie-leaf (.getNode merge-plan-node)]
     (.loadPage data-rel trie-leaf)))
