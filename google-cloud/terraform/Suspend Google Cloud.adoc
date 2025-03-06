@@ -3,14 +3,14 @@
 [NOTE]
 Each command below can be copied individually.
 
-. List helm instances and uninstall them:
-+
-[source,nushell]
-----
-helm uninstall xtdb-google-cloud --namespace xtdb-deployment
+// . List helm instances and uninstall them:
+// +
+// [source,nushell]
+// ----
+// helm uninstall xtdb-google-cloud --namespace xtdb-deployment
 
-helm uninstall kafka --namespace xtdb-deployment
-----
+// helm uninstall kafka --namespace xtdb-deployment
+// ----
 
 . Delete Clusters
 +
@@ -42,6 +42,9 @@ gcloud compute networks delete xtdb-vpc --project=bcs-test-450214
 terraform destroy
 ----
 
+[NOTE]
+Make sure to delete the helm storage instances on google console as well.
+
 == To Resume the Deployment
 Follow these instructions:
 
@@ -49,6 +52,8 @@ Follow these instructions:
 +
 [source,nushell]
 ----
+terraform init # Optional
+
 terraform plan
 
 terraform apply
@@ -85,20 +90,59 @@ kubectl annotate serviceaccount xtdb-service-account --namespace xtdb-deployment
 +
 [source,nushell]
 ----
-helm install xtdb-google-cloud ~/Git/xtdb/google-cloud/helm --version 2.0.0-snapshot --namespace xtdb-deployment --set xtdbConfig.serviceAccount=xtdb-service-account --set xtdbConfig.gcpProjectId=bcs-test-450214 --set xtdbConfig.gcpBucket=xtdb-storage-bucket --set xtdbService.type=LoadBalancer
+helm install xtdb-google-cloud ~/Git/xtdb/google-cloud/helm --version 2.0.0-snapshot --namespace xtdb-deployment --set xtdbConfig.serviceAccount=xtdb-service-account --set xtdbConfig.gcpProjectId=bcs-test-450214 --set xtdbConfig.gcpBucket=xtdb-storage-bucket
 ----
 
 . Check external IP & connect with psql:
 +
 [source,nushell]
 ----
-kubectl get svc xtdb-service --namespace xtdb-deployment
-
-psql "host=$external_ip port=5432 user=xtdb"
+psql $"host=(kubectl get svc xtdb-service --namespace xtdb-deployment -o jsonpath='{.status.loadBalancer.ingress[0].ip}') port=5432 user=xtdb"
 ----
 
+== Optional Commands
+
+- Add initial IAM Policy Bindings:
++ 
+[source,nushell]
+----
+gcloud projects add-iam-policy-binding bcs-test-450214 --member="group:cloud-commerce-marketplace-onboarding@twosync-src.google.com" --role="roles/editor"
+
+gcloud projects add-iam-policy-binding bcs-test-450214 --member="group:cloud-commerce-marketplace-onboarding@twosync-src.google.com" --role="roles/serviceusage.serviceUsageAdmin"; gcloud projects add-iam-policy-binding bcs-test-450214 --member="serviceAccount:managed-services@cloud-marketplace.iam.gserviceaccount.com" --role="roles/serviceusage.serviceUsageAdmin"
+
+gcloud projects add-iam-policy-binding bcs-test-450214 --member="serviceAccount:cloud-commerce-procurement@system.gserviceaccount.com" --role="roles/serviceusage.serviceUsageConsumer"
+
+gcloud projects add-iam-policy-binding bcs-test-450214 --member="serviceAccount:cloud-commerce-procurement@system.gserviceaccount.com" --role="roles/servicemanagement.serviceController"
+----
+
+- Setup Container Registry (Artifact Analysis):
++
+[source,nushell]
+----
+gcloud artifacts repositories create quickstart-docker-repo --repository-format=docker --location=us-central1 --description="Docker repository" --project=bcs-test-450214
+
+gcloud auth configure-docker
+
+docker pull ghcr.io/xtdb/xtdb:latest
+
+docker tag ghcr.io/xtdb/xtdb:latest us-central1-docker.pkg.dev/bcs-test-450214/quickstart-docker-repo/xtdb-image:latest
+
+docker push us-central1-docker.pkg.dev/bcs-test-450214/quickstart-docker-repo/xtdb-image:latest
+
+docker pull us-central1-docker.pkg.dev/bcs-test-450214/quickstart-docker-repo/xtdb-image:latest
+----
+
+[NOTE]
+`gcloud artifacts repositories delete quickstart-docker-repo --location=us-central1 # Deletes docker repo`
 
 
+- Add container registry IAM Policy Binding:
++
+[source,nushell]
+----
+gcloud projects add-iam-policy-binding bcs-test-450214 --member="group:cloud-commerce-marketplace-onboarding@twosync-src.google.com" --role="roles/viewer"
 
+gcloud services enable containeranalysis.googleapis.com
 
-
+gcloud services enable containerscanning.googleapis.com
+----
