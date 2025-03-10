@@ -48,7 +48,7 @@ Make sure to delete the helm storage instances on google console as well.
 == To Resume the Deployment
 Follow these instructions:
 
-. Re-plan and apply previosly used & initialsed Terraform:
+. Re-plan and apply previously used & initialsed Terraform:
 +
 [source,nushell]
 ----
@@ -121,7 +121,7 @@ gcloud projects add-iam-policy-binding bcs-test-450214 --member="serviceAccount:
 ----
 gcloud artifacts repositories create quickstart-docker-repo --repository-format=docker --location=us-central1 --description="Docker repository" --project=bcs-test-450214
 
-gcloud auth configure-docker
+gcloud auth configure-docker # us-central1-docker.pkg.dev
 
 docker pull ghcr.io/xtdb/xtdb:latest
 

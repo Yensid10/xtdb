@@ -1,0 +1,42 @@
+applicationApiVersion: v1beta1
+applicationKind: Application
+properties:
+  name:
+    type: string
+    x-google-marketplace:
+      type: NAME
+  namespace:
+    type: string
+    x-google-marketplace:
+      type: NAMESPACE
+  serviceAccount:
+    type: string
+    title: Service Account
+    description: Service account to use for XTDB
+    default: xtdb-service-account
+  gcpProjectId:
+    type: string
+    title: GCP Project ID
+    description: GCP Project ID for XTDB
+    default: bcs-test-450214
+  gcpBucket:
+    type: string
+    title: GCP Storage Bucket
+    description: GCP Storage Bucket for XTDB
+    default: xtdb-storage-bucket
+  kafkaBootstrapServers:
+    type: string
+    title: Kafka Bootstrap Servers
+    description: Kafka bootstrap servers
+    default: "kafka.xtdb-deployment.svc.cluster.local:9092"
+  kafkaLogTopic:
+    type: string
+    title: Kafka Log Topic
+    description: XTDB log topic on Kafka
+    default: "xtdb-log"
+required:
+  - name
+  - namespace
+  - serviceAccount
+  - gcpProjectId
+  - gcpBucket

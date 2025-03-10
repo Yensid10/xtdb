@@ -1,0 +1,36 @@
+apiVersion: app.k8s.io/v1beta1
+kind: Application
+metadata:
+  name: "$name"
+  namespace: "$namespace"
+  annotations:
+    kubernetes-engine.cloud.google.com/icon: >-
+      data:image/svg+xml;base64,$(cat img/xtdb-logo-banner.svg | base64 -w0)
+    marketplace.cloud.google.com/deploy-info: '{"partner_id": "0014M00001h31ZBQAY", "product_id": "xtdb", "partner_name": "Grid Dynamics"}'
+spec:
+  descriptor:
+    type: XTDB
+    version: '1.0.0'
+    description: 'XTDB is a general-purpose bitemporal database for SQL, Datalog & graph queries'
+    maintainers:
+    - name: Grid Dynamics
+      url: https://griddynamics.com
+    links:
+    - description: XTDB Documentation
+      url: https://docs.xtdb.com
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: "$name"
+  componentKinds:
+  - group: apps
+    kind: Deployment
+  - group: apps
+    kind: StatefulSet
+  - group: v1
+    kind: Service
+  - group: v1
+    kind: ConfigMap
+  - group: v1
+    kind: Secret
+  - group: v1
+    kind: PersistentVolumeClaim
