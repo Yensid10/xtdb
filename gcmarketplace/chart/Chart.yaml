@@ -1,6 +1,11 @@
 apiVersion: v2
-name: helm-xtdb-google-cloud
-description: A Helm chart for setting up a simple XTDB cluster on Google Cloud
+name: xtdb
+description: XTDB for Google Cloud
 type: application
-version: 0.1.0
-appVersion: "2.0.0-beta6"
+version: 1.0.0
+appVersion: "1.0.0"
+dependencies:
+- name: kafka
+  version: 31.3.1
+  repository: https://charts.bitnami.com/bitnami
+  condition: kafka.enabled

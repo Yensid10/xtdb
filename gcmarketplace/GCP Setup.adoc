@@ -1,0 +1,458 @@
+= Guide to Setting Up XTDB for Google Cloud Marketplace [bcs-test-450214]
+
+[NOTE]
+Each command below can be copied individually.
+
+[IMPORTANT]
+This needs to be adapted similar to how postgres is listed in the marketplace.
+
+== Part 1: Setting Up a Test GKE Environment
+
+=== Create a Test GKE Cluster
+
+[source,bash]
+----
+# Create a simple GKE cluster (mimicking what a customer would have)
+gcloud container clusters create marketplace-test-cluster --region=us-central1 --num-nodes=1 --machine-type=e2-standard-4 --disk-type=pd-standard --disk-size=100 --project=bcs-test-450214
+
+# Get credentials for the cluster
+gcloud container clusters get-credentials marketplace-test-cluster --region=us-central1
+----
+
+=== Create a Test Namespace
+
+[source,bash]
+----
+# Create a namespace for testing
+kubectl create namespace test-deployment
+----
+
+=== Set Up Service Account with Required Permissions
+
+[source,bash]
+----
+# Create a Kubernetes service account
+kubectl create serviceaccount xtdb-service-account --namespace test-deployment
+
+# Create a GCP service account (if it doesn't exist)
+gcloud iam service-accounts create xtdb-service-account --display-name="XTDB Service Account" --project=bcs-test-450214
+
+# Grant storage permissions to the GCP service account
+gcloud projects add-iam-policy-binding bcs-test-450214 --member="serviceAccount:xtdb-service-account@bcs-test-450214.iam.gserviceaccount.com" --role="roles/storage.admin"
+
+# Set up workload identity federation
+gcloud iam service-accounts add-iam-policy-binding xtdb-service-account@bcs-test-450214.iam.gserviceaccount.com --role roles/iam.workloadIdentityUser --member "serviceAccount:bcs-test-450214.svc.id.goog[test-deployment/xtdb-service-account]"
+
+kubectl annotate serviceaccount xtdb-service-account --namespace test-deployment iam.gke.io/gcp-service-account=xtdb-service-account@bcs-test-450214.iam.gserviceaccount.com
+----
+
+=== Create a Storage Bucket
+
+[source,bash]
+----
+# Create a storage bucket for XTDB
+gcloud storage buckets create gs://xtdb-storage-bucket --location=us-central1
+----
+
+== Part 2: Preparing Your Marketplace Configuration
+
+=== Create a Marketplace Directory Structure
+
+[source,bash]
+----
+# Create the directory structure
+mkdir -p ~/gcmarketplace/chart
+cd ~/gcmarketplace
+----
+
+=== Copy Your Existing Helm Chart
+
+[source,bash]
+----
+# Copy your existing Helm chart
+cp -r ~/Git/xtdb/google-cloud/helm/* ~/gcmarketplace/chart/
+----
+
+=== Add Kafka as a Dependency
+
+Edit `~/gcmarketplace/chart/Chart.yaml` to include Kafka as a dependency:
+
+[source,yaml]
+----
+apiVersion: v2
+name: xtdb
+description: XTDB for Google Cloud
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+dependencies:
+- name: kafka
+  version: 31.3.1
+  repository: https://charts.bitnami.com/bitnami
+  condition: kafka.enabled
+----
+
+=== Create a values.yaml File
+
+Create or update `~/gcmarketplace/chart/values.yaml`:
+
+[source,yaml]
+----
+# Kafka configuration
+kafka:
+  enabled: true
+  listeners:
+    client:
+      protocol: PLAINTEXT
+    controller:
+      protocol: PLAINTEXT
+
+# XTDB configuration
+nodeCount: 3
+
+image:
+  repository: us-central1-docker.pkg.dev/bcs-test-450214/quickstart-docker-repo/xtdb-image
+  tag: latest
+  pullPolicy: IfNotPresent
+
+nodeSelector:
+  iam.gke.io/gke-metadata-server-enabled: "true"
+
+tolerations: []
+
+affinity: {}
+
+resources:
+  limits:
+    cpu: "1000m"
+    memory: "10G"
+    ephemeral-storage: 100Gi
+  requests:
+    cpu: "750m"
+    memory: "10G"
+    ephemeral-storage: 100Gi
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+  seccompProfile:
+    type: RuntimeDefault
+
+xtdbConfig:
+  serviceAccount: "$serviceAccount"
+  gcpProjectId: "$gcpProjectId"
+  gcpBucket: "$gcpBucket"
+  kafkaBootstrapServers: "$kafkaBootstrapServers"
+  kafkaLogTopic: "$kafkaLogTopic"
+  jdkOptions: "-Xmx3000m -Xms3000m -XX:MaxDirectMemorySize=3000m -XX:MaxMetaspaceSize=500m"
+  nodeConfig: |-
+    server:
+      port: 5432
+      tls:
+        enabled: true
+        keystore: /var/lib/xtdb/tls/keystore.p12
+        keystorePassword: !Env TLS_KEYSTORE_PASSWORD
+
+    log: !Kafka
+      bootstrapServers: !Env KAFKA_BOOTSTRAP_SERVERS
+      topic: !Env KAFKA_LOG_TOPIC
+
+    storage: !Remote
+      objectStore: !GoogleCloud
+        projectId: !Env GCP_PROJECT_ID
+        bucket: !Env GCP_BUCKET
+        prefix: xtdb-object-store
+      localDiskCache: /var/lib/xtdb/buffers/disk-cache
+
+    modules:
+    - !HttpServer
+      port: 3000
+      host: "127.0.0.1"  # Only accessible within the pod
+
+    healthz:
+      port: 8080
+      host: "127.0.0.1"  # Only accessible within the pod
+
+  localDiskCache:
+    sizeLimit: "50Gi"
+
+  env:
+    XTDB_LOGGING_LEVEL: "info"
+    TLS_KEYSTORE_PASSWORD: "changeme"  # Should be generated or provided securely
+
+startupProbe:
+  httpGet:
+    path: /healthz/started
+    port: 8080
+  initialDelaySeconds: 60
+  periodSeconds: 30
+  failureThreshold: 10 
+
+livenessProbe:
+  httpGet:
+    path: /healthz/alive
+    port: 8080
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  failureThreshold: 3
+
+xtdbService:
+  type: LoadBalancer
+  server:
+    targetPort: 5432
+    servicePort: 5432
+  # Remove external access to HTTP and healthz
+  httpServer:
+    targetPort: 3000
+    servicePort: null  # Don't expose externally
+  healthzServer:
+    targetPort: 8080
+    servicePort: null  # Don't expose externally
+----
+
+=== Create schema.yaml
+
+Create `~/gcmarketplace/schema.yaml`:
+
+[source,yaml]
+----
+applicationApiVersion: v1beta1
+applicationKind: Application
+properties:
+  name:
+    type: string
+    x-google-marketplace:
+      type: NAME
+  namespace:
+    type: string
+    x-google-marketplace:
+      type: NAMESPACE
+  serviceAccount:
+    type: string
+    title: Service Account
+    description: "Service account with Storage Admin permissions for XTDB"
+    x-google-marketplace:
+      type: SERVICE_ACCOUNT
+      serviceAccount:
+        roles:
+        - type: ClusterRole
+          rulesType: PREDEFINED
+          rulesFromRoleName: edit
+  gcpProjectId:
+    type: string
+    title: GCP Project ID
+    description: "GCP Project ID where your storage bucket is located"
+  gcpBucket:
+    type: string
+    title: GCP Storage Bucket
+    description: "GCP Storage Bucket for XTDB data (must be created beforehand)"
+  kafkaBootstrapServers:
+    type: string
+    title: Kafka Bootstrap Servers
+    description: "Kafka bootstrap servers (leave default if using included Kafka)"
+    default: "kafka.{{ .Release.Namespace }}.svc.cluster.local:9092"
+  kafkaLogTopic:
+    type: string
+    title: Kafka Log Topic
+    description: "XTDB log topic on Kafka"
+    default: "xtdb-log"
+  kafka.enabled:
+    type: boolean
+    title: Deploy Kafka
+    description: "Deploy Kafka as part of this installation"
+    default: true
+required:
+  - name
+  - namespace
+  - serviceAccount
+  - gcpProjectId
+  - gcpBucket
+----
+
+=== Create application.yaml
+
+Create `~/gcmarketplace/application.yaml`:
+
+[source,yaml]
+----
+apiVersion: app.k8s.io/v1beta1
+kind: Application
+metadata:
+  name: "$name"
+  namespace: "$namespace"
+  annotations:
+    kubernetes-engine.cloud.google.com/icon: >-
+      data:image/png;base64,<your-base64-encoded-icon>
+    marketplace.cloud.google.com/deploy-info: '{"partner_id": "your-partner-id", "product_id": "xtdb", "partner_name": "XTDB"}'
+spec:
+  descriptor:
+    type: XTDB
+    version: '1.0.0'
+    description: 'XTDB is a general-purpose bitemporal database for SQL, Datalog & graph queries'
+    maintainers:
+    - name: XTDB
+      url: https://xtdb.com
+    links:
+    - description: User Guide
+      url: https://docs.xtdb.com
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: "$name"
+  componentKinds:
+  - group: apps
+    kind: StatefulSet
+  - group: apps
+    kind: Deployment
+  - group: v1
+    kind: Service
+  - group: v1
+    kind: ConfigMap
+  - group: v1
+    kind: Secret
+  - group: v1
+    kind: PersistentVolumeClaim
+----
+
+=== Create a Deployer Dockerfile
+
+Create `~/gcmarketplace/deployer.dockerfile`:
+
+[source,dockerfile]
+----
+FROM gcr.io/cloud-marketplace-tools/k8s/deployer_helm:0.11.1
+
+COPY chart /data/chart
+COPY schema.yaml /data/
+COPY application.yaml /data-test/
+
+ARG REGISTRY
+ARG TAG
+
+ENV REGISTRY=$REGISTRY
+ENV TAG=$TAG
+
+# Update the values.yaml file with the registry and tag
+RUN sed -i "s|repository:.*|repository: ${REGISTRY}|g" /data/chart/values.yaml && \
+    sed -i "s|tag:.*|tag: ${TAG}|g" /data/chart/values.yaml
+----
+
+=== Create a TLS Certificate Generator
+
+Create `~/gcmarketplace/chart/templates/tls-secret.yaml`:
+
+[source,yaml]
+----
+{{- if not (lookup "v1" "Secret" .Release.Namespace (printf "%s-tls" .Release.Name)) }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ .Release.Name }}-tls
+  labels:
+    {{- include "xtdb.labels" . | nindent 4 }}
+type: Opaque
+data:
+  keystore.p12: {{ .Files.Get "files/keystore.p12" | b64enc }}
+{{- end }}
+----
+
+Create a directory for the keystore and generate a self-signed certificate:
+
+[source,bash]
+----
+mkdir -p ~/gcmarketplace/chart/files
+openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes -subj "/CN=xtdb"
+openssl pkcs12 -export -out ~/gcmarketplace/chart/files/keystore.p12 -inkey key.pem -in cert.pem -password pass:changeme
+----
+
+== Part 3: Building and Testing
+
+=== Set Environment Variables
+
+[source,bash]
+----
+export PROJECT_ID=bcs-test-450214
+export REGISTRY=us-central1-docker.pkg.dev/$PROJECT_ID/quickstart-docker-repo
+export APP_NAME=xtdb
+export VERSION=1.0.0
+----
+
+=== Build and Push the Deployer Image
+
+[source,bash]
+----
+cd ~/gcmarketplace
+
+# Build the deployer image
+docker build -f deployer.dockerfile --build-arg REGISTRY=$REGISTRY --build-arg TAG=$VERSION -t $REGISTRY/{$APP_NAME}/deployer:$VERSION .
+
+# Push the deployer image
+docker push $REGISTRY/{$APP_NAME}/deployer:$VERSION
+----
+
+=== Update Helm Dependencies
+
+[source,bash]
+----
+cd ~/gcmarketplace/chart
+helm dependency update
+----
+
+=== Test with mpdev
+
+[source,bash]
+----
+cd ~/gcmarketplace
+
+# Install mpdev if not already installed
+mkdir -p ~/bin
+gsutil cp gs://cloud-marketplace-tools/mpdev/latest/mpdev ~/bin
+chmod +x ~/bin/mpdev
+export PATH=$PATH:~/bin
+
+# Install Application CRD
+kubectl apply -f "https://raw.githubusercontent.com/GoogleCloudPlatform/marketplace-k8s-app-tools/master/crd/app-crd.yaml"
+
+# Test the deployment
+mpdev install --deployer=$REGISTRY/{$APP_NAME}/deployer:$VERSION --parameters='{"name": "xtdb-test", "namespace": "test-deployment", "serviceAccount": "xtdb-service-account", "gcpProjectId": "bcs-test-450214", "gcpBucket": "xtdb-storage-bucket", "kafka.enabled": true}'
+----
+
+== Part 4: Verifying the Installation
+
+=== Check the Deployment
+
+[source,bash]
+----
+# Check the application status
+kubectl get applications -n test-deployment
+
+# Check the pods
+kubectl get pods -n test-deployment
+
+# Check the services
+kubectl get services -n test-deployment
+----
+
+=== Connect to XTDB
+
+[source,bash]
+----
+# Get the external IP
+export XTDB_IP=$(kubectl get svc xtdb-test-server -n test-deployment -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+
+# Connect with psql (using TLS)
+psql "host=$XTDB_IP port=5432 user=xtdb sslmode=require"
+----
+
+=== Part 5: Cleanup
+
+[source,bash]
+----
+# Uninstall the application
+kubectl delete namespace test-deployment
+
+# Delete the test cluster when done
+gcloud container clusters delete marketplace-test-cluster --region=us-central1 --quiet
+----

@@ -12,28 +12,37 @@ properties:
   serviceAccount:
     type: string
     title: Service Account
-    description: Service account to use for XTDB
-    default: xtdb-service-account
+    description: "Service account with Storage Admin permissions for XTDB"
+    x-google-marketplace:
+      type: SERVICE_ACCOUNT
+      serviceAccount:
+        roles:
+        - type: ClusterRole
+          rulesType: PREDEFINED
+          rulesFromRoleName: edit
   gcpProjectId:
     type: string
     title: GCP Project ID
-    description: GCP Project ID for XTDB
-    default: bcs-test-450214
+    description: "GCP Project ID where your storage bucket is located"
   gcpBucket:
     type: string
     title: GCP Storage Bucket
-    description: GCP Storage Bucket for XTDB
-    default: xtdb-storage-bucket
+    description: "GCP Storage Bucket for XTDB data (must be created beforehand)"
   kafkaBootstrapServers:
     type: string
     title: Kafka Bootstrap Servers
-    description: Kafka bootstrap servers
-    default: "kafka.xtdb-deployment.svc.cluster.local:9092"
+    description: "Kafka bootstrap servers (leave default if using included Kafka)"
+    default: "kafka.{{ .Release.Namespace }}.svc.cluster.local:9092"
   kafkaLogTopic:
     type: string
     title: Kafka Log Topic
-    description: XTDB log topic on Kafka
+    description: "XTDB log topic on Kafka"
     default: "xtdb-log"
+  kafka.enabled:
+    type: boolean
+    title: Deploy Kafka
+    description: "Deploy Kafka as part of this installation"
+    default: true
 required:
   - name
   - namespace

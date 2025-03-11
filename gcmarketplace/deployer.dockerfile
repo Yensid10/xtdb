@@ -10,9 +10,6 @@ ARG TAG
 ENV REGISTRY=$REGISTRY
 ENV TAG=$TAG
 
-# Provide registry prefix and tag for default values for images
-RUN cat /data/chart/values.yaml \
-    | sed "s|repository: .*|repository: ${REGISTRY}/xtdb-image|g" \
-    | sed "s|tag: .*|tag: ${TAG}|g" \
-    > /data/chart/values.yaml.new \
-    && mv /data/chart/values.yaml.new /data/chart/values.yaml
+# Update the values.yaml file with the registry and tag
+RUN sed -i "s|repository:.*|repository: ${REGISTRY}|g" /data/chart/values.yaml && \
+    sed -i "s|tag:.*|tag: ${TAG}|g" /data/chart/values.yaml

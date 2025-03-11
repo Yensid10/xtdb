@@ -1,14 +1,25 @@
+# Kafka configuration
+kafka:
+  enabled: true
+  listeners:
+    client:
+      protocol: PLAINTEXT
+    controller:
+      protocol: PLAINTEXT
+
+# XTDB configuration
 nodeCount: 3
 
 image:
-  repository: ${REGISTRY}
-  tag: ${TAG}
+  repository: us-central1-docker.pkg.dev/bcs-test-450214/quickstart-docker-repo/xtdb-image
+  # tag: 2.0.0-beta5
+  tag: latest
   pullPolicy: IfNotPresent
 
 nodeSelector:
   iam.gke.io/gke-metadata-server-enabled: "true"
-  cloud.google.com/gke-ephemeral-storage-local-ssd: "true"
-  node_pool: "xtdb-pool"
+  # cloud.google.com/gke-ephemeral-storage-local-ssd: "true"
+  # node_pool: "xtdb-pool"
 
 tolerations: []
 
@@ -34,25 +45,19 @@ securityContext:
     type: RuntimeDefault
 
 xtdbConfig:
-  # These will be filled by marketplace parameters
   serviceAccount: "$serviceAccount"
   gcpProjectId: "$gcpProjectId"
   gcpBucket: "$gcpBucket"
-  # You might want to make these configurable too
   kafkaBootstrapServers: "$kafkaBootstrapServers"
   kafkaLogTopic: "$kafkaLogTopic"
-
-  # OPTIONAL
-  # JDK options - ensure that heap + direct memory + metaspace <= memory limit, and that some overhead is left for the OS
-  # See https://docs.oracle.com/cd/E13150_01/jrockit_jvm/jrockit/jrdocs/refman/optionX.html
   jdkOptions: "-Xmx3000m -Xms3000m -XX:MaxDirectMemorySize=3000m -XX:MaxMetaspaceSize=500m"
-
-  # We mount and use the below YAML for configuring the XTDB nodes and their modules.
-  # The !Env values are set by Environment Variables set on the XTDB statefulset pods.
-  # See the XTDB configuration documentation for options: https://docs.xtdb.com/ops/config.html
   nodeConfig: |-
     server:
       port: 5432
+      tls:
+        enabled: true
+        keystore: /var/lib/xtdb/tls/keystore.p12
+        keystorePassword: !Env TLS_KEYSTORE_PASSWORD
 
     log: !Kafka
       bootstrapServers: !Env KAFKA_BOOTSTRAP_SERVERS
@@ -65,12 +70,14 @@ xtdbConfig:
         prefix: xtdb-object-store
       localDiskCache: /var/lib/xtdb/buffers/disk-cache
 
-    healthz:
-      port: 8080
-
     modules:
     - !HttpServer
-      port: 3000 
+      port: 3000
+      host: "127.0.0.1"  # Only accessible within the pod
+
+    healthz:
+      port: 8080
+      host: "127.0.0.1"  # Only accessible within the pod
 
   # Volume size settings for XTDB Local Disk Cache (uses ephemeral storage)
   localDiskCache:
@@ -80,6 +87,7 @@ xtdbConfig:
   env:
     # (ENV_VAR_NAME: Value)
     XTDB_LOGGING_LEVEL: "info" # See https://docs.xtdb.com/ops/troubleshooting/overview.html
+    TLS_KEYSTORE_PASSWORD: "password" # Should be generated or provided securely
 
 startupProbe:
   httpGet:
@@ -108,13 +116,9 @@ xtdbService:
     # Port of the http server on the nodes
     targetPort: 3000
     # Port exposed by the service
-    servicePort: 3000
+    servicePort: null # Don't expose externally
   healthzServer:
     # Port of the healthz server on the nodes
     targetPort: 8080
     # Port exposed by the service
-    servicePort: 8080
-
-applicationLabels:
-  app.kubernetes.io/name: "$name"
-  app.kubernetes.io/version: "$version"
+    servicePort: null # Don't expose externally
