@@ -19,7 +19,6 @@
            xtdb.api.storage.Storage
            xtdb.arrow.Relation
            xtdb.buffer_pool.LocalBufferPool
-           (xtdb.metadata ITableMetadata)
            (xtdb.trie ArrowHashTrie ArrowHashTrie$Leaf HashTrieKt MergePlanNode MergePlanTask)
            (xtdb.util TemporalBounds TemporalDimension)
            (xtdb.vector RelationWriter)))
@@ -582,8 +581,7 @@
   (scan/->ArrowMergePlanPage (str->path data-file)
                              (->constantly-int-pred true)
                              page-idx
-                             (reify ITableMetadata
-                               (temporalBounds [_ _] (TemporalBounds.)))))
+                             nil))
 
 (defn dir->buffer-pool
   "Creates a local storage buffer pool from the given directory."

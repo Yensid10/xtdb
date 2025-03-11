@@ -9,8 +9,6 @@ import org.apache.arrow.vector.ipc.message.ArrowRecordBatch
 import xtdb.BufferPool
 import xtdb.IEvictBufferTest
 import xtdb.api.storage.ObjectStore.StoredObject
-import xtdb.api.storage.Storage.openStorageChildAllocator
-import xtdb.api.storage.Storage.registerMetrics
 import xtdb.arrow.ArrowUtil.openArrowBufView
 import xtdb.arrow.ArrowUtil.readArrowFooter
 import xtdb.arrow.ArrowUtil.toArrowRecordBatchView
@@ -18,6 +16,8 @@ import xtdb.arrow.ArrowUtil.toByteArray
 import xtdb.arrow.Relation
 import xtdb.trie.FileSize
 import xtdb.util.closeOnCatch
+import xtdb.util.openChildAllocator
+import xtdb.util.register
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.nio.channels.Channels.newChannel
@@ -26,10 +26,10 @@ import java.util.*
 
 class MemoryBufferPool(
     allocator: BufferAllocator,
-    meterRegistry: MeterRegistry = SimpleMeterRegistry()
+    meterRegistry: MeterRegistry? = null
 ) : BufferPool, IEvictBufferTest {
 
-    private val allocator = allocator.openStorageChildAllocator().also { it.registerMetrics(meterRegistry) }
+    private val allocator = allocator.openChildAllocator("buffer-pool").also { meterRegistry?.register(it) }
 
     private val memoryStore: NavigableMap<Path, ArrowBuf> = TreeMap()
 

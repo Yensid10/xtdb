@@ -36,11 +36,12 @@
            (xtdb.arrow VectorIndirection VectorReader)
            (xtdb.bitemporal IRowConsumer Polygon PolygonCalculator)
            (xtdb.indexer LiveTable$Watermark Watermark Watermark$Source)
-           (xtdb.metadata IMetadataManager ITableMetadata)
+           (xtdb.metadata PageMetadata PageMetadata$Factory)
            xtdb.operator.SelectionSpec
-           (xtdb.trie ArrowHashTrie$Leaf EventRowPointer EventRowPointer$Arrow HashTrie HashTrieKt MemoryHashTrie$Leaf MergePlanNode MergePlanTask TrieCatalog)
+           (xtdb.trie ArrowHashTrie$Leaf EventRowPointer EventRowPointer$Arrow HashTrie HashTrieKt MemoryHashTrie$Leaf MergePlanNode MergePlanTask TrieCatalog Trie)
            (xtdb.util TemporalBounds TemporalDimension)
-           (xtdb.vector IMultiVectorRelationFactory IRelationWriter IVectorReader IVectorWriter IndirectMultiVectorReader RelationReader RelationWriter)))
+           (xtdb.vector IMultiVectorRelationFactory IRelationWriter IVectorReader IVectorWriter IndirectMultiVectorReader RelationReader RelationWriter)
+           (xtdb.bloom BloomUtils)))
 
 (s/def ::table symbol?)
 
@@ -321,20 +322,19 @@
                   (util/->iid eid)
                   dummy-iid)))))))))
 
-(defn filter-pushdown-bloom-page-idx-pred ^IntPredicate [^ITableMetadata table-metadata ^String col-name]
+(defn filter-pushdown-bloom-page-idx-pred ^IntPredicate [^PageMetadata page-metadata ^String col-name]
   (when-let [^MutableRoaringBitmap pushdown-bloom (get *column->pushdown-bloom* (symbol col-name))]
-    (let [metadata-rdr (VectorReader/from (.metadataReader table-metadata))
+    (let [metadata-rdr (VectorReader/from (.getMetadataLeafReader page-metadata))
           bloom-rdr (-> (.keyReader metadata-rdr "columns")
                         (.elementReader)
                         (.keyReader "bloom"))]
       (reify IntPredicate
         (test [_ page-idx]
           (boolean
-           (let [bloom-vec-idx (.rowIndex table-metadata col-name page-idx)]
-             (and (>= bloom-vec-idx 0)
-                  (not (nil? (.getObject bloom-rdr bloom-vec-idx)))
-                  (MutableRoaringBitmap/intersects pushdown-bloom
-                                                   (bloom/bloom->bitmap bloom-rdr bloom-vec-idx))))))))))
+            (let [bloom-vec-idx (.rowIndex page-metadata col-name page-idx)]
+              (and (>= bloom-vec-idx 0)
+                   (not (nil? (.getObject bloom-rdr bloom-vec-idx)))
+                   (MutableRoaringBitmap/intersects pushdown-bloom (BloomUtils/bloomToBitmap bloom-rdr bloom-vec-idx))))))))))
 
 (defn ->path-pred [^ArrowBuf iid-arrow-buf]
   (when iid-arrow-buf
@@ -343,7 +343,7 @@
         (test [_ path]
           (zero? (HashTrie/compareToPath iid-ptr path)))))))
 
-(defrecord ArrowMergePlanPage [data-file-path ^IntPredicate page-idx-pred ^long page-idx ^ITableMetadata table-metadata]
+(defrecord ArrowMergePlanPage [data-file-path ^IntPredicate page-idx-pred ^long page-idx ^PageMetadata page-metadata]
   MergePlanPage
   (load-page [_mpg buffer-pool vsr-cache]
     (let [^BufferPool bp buffer-pool]
@@ -356,7 +356,7 @@
   (test-metadata [_mpg]
     (.test page-idx-pred page-idx))
 
-  (temporal-bounds [_mpg] (.temporalBounds table-metadata (int page-idx))))
+  (temporal-bounds [_mpg] (.temporalBounds page-metadata (int page-idx))))
 
 (def ^:private non-constraint-bounds (TemporalBounds.))
 
@@ -377,7 +377,7 @@
           :table-catalog (ig/ref :xtdb/table-catalog)
           :trie-catalog (ig/ref :xtdb/trie-catalog)}))
 
-(defmethod ig/init-key ::scan-emitter [_ {:keys [^BufferAllocator allocator, ^IMetadataManager metadata-mgr, ^BufferPool buffer-pool,
+(defmethod ig/init-key ::scan-emitter [_ {:keys [^BufferAllocator allocator, ^PageMetadata$Factory metadata-mgr, ^BufferPool buffer-pool,
                                                  ^TrieCatalog trie-catalog, table-catalog]}]
   (let [table->template-rel+trie (info-schema/table->template-rel+tries allocator)]
     (reify IScanEmitter
@@ -388,12 +388,12 @@
                         col-name (str col-name)]
                     ;; TODO move to fields here
                     (-> (or (some-> (types/temporal-col-types col-name) types/col-type->field)
-                            (or (get-in info-schema/derived-tables [(symbol table) (symbol col-name)])
-                                (get-in info-schema/template-tables [(symbol table) (symbol col-name)])
-                                (types/merge-fields (table-cat/column-field table-catalog table col-name)
-                                                    (some-> (.getLiveIndex wm)
-                                                            (.liveTable table)
-                                                            (.columnField col-name)))))
+                            (get-in info-schema/derived-tables [(symbol table) (symbol col-name)])
+                            (get-in info-schema/template-tables [(symbol table) (symbol col-name)])
+                            (types/merge-fields (table-cat/column-field table-catalog table col-name)
+                                                (some-> (.getLiveIndex wm)
+                                                        (.liveTable table)
+                                                        (.columnField col-name))))
                         (types/field-with-name col-name))))]
           (->> scan-cols
                (into {} (map (juxt identity ->field))))))
@@ -453,25 +453,25 @@
                                ^LiveTable$Watermark live-table-wm (some-> (.getLiveIndex watermark) (.liveTable table-name))
                                temporal-bounds (->temporal-bounds args scan-opts snapshot-time)]
                            (util/with-open [iid-arrow-buf (when iid-bb (util/->arrow-buf-view allocator iid-bb))]
-                             (let [merge-tasks (util/with-open [table-metadatas (LinkedList.)]
+                             (let [merge-tasks (util/with-open [page-metadatas (LinkedList.)]
                                                  (let [segments (cond-> (mapv (fn [{:keys [trie-key]}]
-                                                                                (let [meta-path (trie/->table-meta-file-path table-name trie-key)
-                                                                                      {:keys [trie] :as table-metadata} (.openTableMetadata metadata-mgr meta-path)]
-                                                                                  (.add table-metadatas table-metadata)
-                                                                                  (into (trie/->Segment trie)
-                                                                                        {:data-file-path (trie/->table-data-file-path table-name trie-key)
+                                                                                (let [meta-path (Trie/metaFilePath table-name trie-key)
+                                                                                      page-metadata (.openPageMetadata metadata-mgr meta-path)]
+                                                                                  (.add page-metadatas page-metadata)
+                                                                                  (into (trie/->Segment (.getTrie page-metadata))
+                                                                                        {:data-file-path (Trie/dataFilePath table-name trie-key)
                                                                                          :page-idx-pred (reduce (fn [^IntPredicate page-idx-pred col-name]
-                                                                                                                  (if-let [bloom-page-idx-pred (filter-pushdown-bloom-page-idx-pred table-metadata col-name)]
+                                                                                                                  (if-let [bloom-page-idx-pred (filter-pushdown-bloom-page-idx-pred page-metadata col-name)]
                                                                                                                     (.and page-idx-pred bloom-page-idx-pred)
                                                                                                                     page-idx-pred))
-                                                                                                                (.build metadata-pred table-metadata)
+                                                                                                                (.build metadata-pred page-metadata)
                                                                                                                 col-names)
-                                                                                         :table-metadata table-metadata})))
+                                                                                         :page-metadata page-metadata})))
                                                                               (-> (cat/trie-state trie-catalog table-name)
                                                                                   (cat/current-tries)))
 
-                                                                  live-table-wm (conj (-> (trie/->Segment (.liveTrie live-table-wm))
-                                                                                          (assoc :memory-rel (.liveRelation live-table-wm))))
+                                                                  live-table-wm (conj (-> (trie/->Segment (.getLiveTrie live-table-wm))
+                                                                                          (assoc :memory-rel (.getLiveRelation live-table-wm))))
                                                                   template-table? (conj (let [[memory-rel trie] (table->template-rel+trie (symbol table-name))]
                                                                                           (-> (trie/->Segment trie)
                                                                                               (assoc :memory-rel memory-rel)))))]
@@ -479,13 +479,13 @@
                                                         (into [] (keep (fn [^MergePlanTask mpt]
                                                                          (when-let [leaves (trie/->merge-task
                                                                                             (for [^MergePlanNode mpn (.getMpNodes mpt)
-                                                                                                  :let [{:keys [data-file-path table-metadata page-idx-pred trie memory-rel]} (.getSegment mpn)
+                                                                                                  :let [{:keys [data-file-path page-metadata page-idx-pred trie memory-rel]} (.getSegment mpn)
                                                                                                         node (.getNode mpn)]]
                                                                                               (if data-file-path
                                                                                                 (->ArrowMergePlanPage data-file-path
                                                                                                                       page-idx-pred
                                                                                                                       (.getDataPageIndex ^ArrowHashTrie$Leaf node)
-                                                                                                                      table-metadata)
+                                                                                                                      page-metadata)
                                                                                                 (->MemoryMergePlanPage memory-rel trie node)))
                                                                                             temporal-bounds)]
                                                                            {:path (.getPath mpt)

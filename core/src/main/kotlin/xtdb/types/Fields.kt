@@ -1,14 +1,18 @@
 package xtdb.types
 
+import clojure.lang.PersistentHashSet
 import org.apache.arrow.vector.types.TimeUnit.MICROSECOND
 import org.apache.arrow.vector.types.Types.MinorType
 import org.apache.arrow.vector.types.UnionMode
 import org.apache.arrow.vector.types.pojo.ArrowType
+import org.apache.arrow.vector.types.pojo.Field
 import org.apache.arrow.vector.types.pojo.FieldType
 import org.apache.arrow.vector.types.pojo.Schema
+import xtdb.trie.ColumnName
 import xtdb.types.Fields.asFieldList
 import xtdb.types.NamelessField.Companion.asField
 import xtdb.types.NamelessField.Companion.asNullableField
+import xtdb.util.requiringResolve
 import org.apache.arrow.vector.types.pojo.ArrowType.List.INSTANCE as LIST_TYPE
 import org.apache.arrow.vector.types.pojo.ArrowType.Null.INSTANCE as NULL_TYPE
 import org.apache.arrow.vector.types.pojo.ArrowType.Struct.INSTANCE as STRUCT_TYPE
@@ -45,6 +49,9 @@ data class NamelessField(val fieldType: FieldType, val children: List<ArrowField
     }
 }
 
+val ArrowField.asPair get() = name to NamelessField(fieldType, children)
+fun ArrowField.withName(name: ColumnName) = Field(name, fieldType, children)
+
 @Suppress("FunctionName")
 object Fields {
 
@@ -56,6 +63,7 @@ object Fields {
     val VAR_BINARY = MinorType.VARBINARY.asField
 
     val TEMPORAL = ArrowType.Timestamp(MICROSECOND, "UTC").asField
+    val IID = ArrowType.FixedSizeBinary(16).asField
 
     fun Union(vararg legs: Pair<FieldName, NamelessField>) =
         ArrowType.Union(UnionMode.Dense, null).asField(*legs)
@@ -75,6 +83,10 @@ object Fields {
 
     internal val Iterable<Pair<FieldName, NamelessField>>.asFieldList
         get() = map { it.second.toArrowField(it.first) }
+
+    fun mergeFields(fields: List<Field>): Field =
+        // TODO: migrate over here
+        requiringResolve("xtdb.types/merge-fields").applyTo(PersistentHashSet.create(fields).seq()) as Field
 }
 
 

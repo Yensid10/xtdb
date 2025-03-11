@@ -11,12 +11,14 @@ import org.apache.arrow.vector.ipc.WriteChannel
 import org.apache.arrow.vector.ipc.message.*
 import org.apache.arrow.vector.types.pojo.Field
 import org.apache.arrow.vector.types.pojo.Schema
+import xtdb.ArrowWriter
 import xtdb.api.query.IKeyFn
 import xtdb.api.query.IKeyFn.KeyFn.KEBAB_CASE_KEYWORD
 import xtdb.arrow.ArrowUtil.arrowBufToRecordBatch
 import xtdb.arrow.Relation.UnloadMode.FILE
 import xtdb.arrow.Relation.UnloadMode.STREAM
 import xtdb.arrow.Vector.Companion.fromField
+import xtdb.trie.FileSize
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.nio.channels.Channels
@@ -63,6 +65,11 @@ class Relation(val vectors: SequencedMap<String, Vector>, override var rowCount:
             copiers.forEach { it.copyRow(srcIdx) }
             endRow()
         }
+    }
+
+    fun append(rel: RelationReader) {
+        val copier = rowCopier(rel)
+        repeat(rel.rowCount) { copier.copyRow(it) }
     }
 
     fun loadFromArrow(root: VectorSchemaRoot) {
@@ -120,7 +127,7 @@ class Relation(val vectors: SequencedMap<String, Vector>, override var rowCount:
                 }
             }
 
-    inner class RelationUnloader(private val ch: WriteChannel, private val mode: UnloadMode) : AutoCloseable {
+    inner class RelationUnloader(private val ch: WriteChannel, private val mode: UnloadMode) : ArrowWriter {
 
         private val schema = Schema(this@Relation.vectors.values.map { it.field })
         private val arrowBlocks = mutableListOf<ArrowBlock>()
@@ -134,7 +141,7 @@ class Relation(val vectors: SequencedMap<String, Vector>, override var rowCount:
             }
         }
 
-        fun writePage() {
+        override fun writePage() {
             try {
                 openArrowRecordBatch().use { recordBatch ->
                     MessageSerializer.serialize(ch, recordBatch)
@@ -145,8 +152,9 @@ class Relation(val vectors: SequencedMap<String, Vector>, override var rowCount:
             }
         }
 
-        fun end() {
+        override fun end(): FileSize {
             mode.end(ch, schema, arrowBlocks)
+            return ch.currentPosition
         }
 
         override fun close() {
@@ -207,14 +215,16 @@ class Relation(val vectors: SequencedMap<String, Vector>, override var rowCount:
 
     private class ChannelLoader(
         private val al: BufferAllocator,
-        private val ch: SeekableReadChannel,
+        ch: SeekableByteChannel,
         footer: ArrowFooter
     ) : Loader() {
+        val arrowCh = SeekableReadChannel(ch)
+
         inner class Page(private val idx: Int, private val arrowBlock: ArrowBlock) : Loader.Page {
             override fun load(rel: Relation) {
-                ch.setPosition(arrowBlock.offset)
+                arrowCh.setPosition(arrowBlock.offset)
 
-                (MessageSerializer.deserializeRecordBatch(ch, arrowBlock, al)
+                (MessageSerializer.deserializeRecordBatch(arrowCh, arrowBlock, al)
                     ?: error("Failed to deserialize record batch $idx, offset ${arrowBlock.offset}"))
 
                     .use { rel.load(it) }
@@ -224,7 +234,7 @@ class Relation(val vectors: SequencedMap<String, Vector>, override var rowCount:
         override val schema: Schema = footer.schema
         override val pages = footer.recordBatches.mapIndexed(::Page)
 
-        override fun close() = ch.close()
+        override fun close() = arrowCh.close()
     }
 
     private class BufferLoader(
@@ -249,11 +259,11 @@ class Relation(val vectors: SequencedMap<String, Vector>, override var rowCount:
 
     companion object {
         @JvmStatic
-        fun readFooter(ch: SeekableReadChannel): ArrowFooter {
+        fun readFooter(ch: SeekableByteChannel): ArrowFooter {
             val buf = ByteBuffer.allocate(Int.SIZE_BYTES + MAGIC.size)
             val footerLengthOffset = ch.size() - buf.remaining()
-            ch.setPosition(footerLengthOffset)
-            ch.readFully(buf)
+            ch.position(footerLengthOffset)
+            ch.read(buf)
             buf.flip()
 
             val array = buf.array()
@@ -267,18 +277,17 @@ class Relation(val vectors: SequencedMap<String, Vector>, override var rowCount:
             require(footerLength + MAGIC.size * 2 + Int.SIZE_BYTES <= ch.size()) { "Footer length exceeds file size" }
 
             val footerBuffer = ByteBuffer.allocate(footerLength)
-            ch.setPosition(footerLengthOffset - footerLength)
-            ch.readFully(footerBuffer)
+            ch.position(footerLengthOffset - footerLength)
+            ch.read(footerBuffer)
             footerBuffer.flip()
             return ArrowFooter(getRootAsFooter(footerBuffer))
         }
 
         @JvmStatic
         fun loader(al: BufferAllocator, ch: SeekableByteChannel): Loader {
-            val readCh = SeekableReadChannel(ch)
-            require(readCh.size() > MAGIC.size * 2 + 4) { "File is too small to be an Arrow file" }
+            require(ch.size() > MAGIC.size * 2 + 4) { "File is too small to be an Arrow file" }
 
-            return ChannelLoader(al, readCh, readFooter(readCh))
+            return ChannelLoader(al, ch, readFooter(ch))
         }
 
         @JvmStatic

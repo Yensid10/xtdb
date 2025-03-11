@@ -3,22 +3,19 @@
             [clojure.test :as t]
             [xtdb.api :as xt]
             [xtdb.compactor :as c]
-            [xtdb.indexer.live-index :as li]
+            [xtdb.metadata :as meta]
             [xtdb.node :as xtn]
             [xtdb.object-store :as os]
             [xtdb.test-json :as tj]
             [xtdb.test-util :as tu]
-            [xtdb.time :as time]
             [xtdb.trie :as trie]
             [xtdb.trie-catalog :as cat]
             [xtdb.util :as util])
-  (:import [java.nio ByteBuffer]
-           [java.time Duration]
-           [xtdb BufferPool]
+  (:import (java.time Duration)
+           (xtdb BufferPool)
            xtdb.api.storage.Storage
-           (xtdb.arrow Relation RelationReader)
-           [xtdb.metadata IMetadataManager]
-           [xtdb.trie DataRel HashTrie]))
+           (xtdb.arrow RelationReader)
+           (xtdb.trie DataRel Trie)))
 
 (t/use-fixtures :each tu/with-allocator tu/with-node)
 
@@ -209,103 +206,6 @@
                             ["l03-r20200102-p2-b03"] ["l03-r20200101-p2-b07"] ["l03-r20200101-p2-b0b"] ["l03-r20200101-p2-b0f"]
                             )))))))
 
-(t/deftest test-merges-segments
-  (util/with-open [lt0 (tu/open-live-table "foo")
-                   lt1 (tu/open-live-table "foo")]
-
-    (tu/index-tx! lt0 #xt/tx-key {:tx-id 0, :system-time #xt/instant "2020-01-01T00:00:00Z"}
-                  [{:xt/id "foo", :v 0}
-                   {:xt/id "bar", :v 0}])
-
-    (tu/index-tx! lt0 #xt/tx-key {:tx-id 1, :system-time #xt/instant "2021-01-01T00:00:00Z"}
-                  [{:xt/id "bar", :v 1}])
-
-    (tu/index-tx! lt1 #xt/tx-key {:tx-id 2, :system-time #xt/instant "2022-01-01T00:00:00Z"}
-                  [{:xt/id "foo", :v 1}])
-
-    (tu/index-tx! lt1 #xt/tx-key {:tx-id 3, :system-time #xt/instant "2023-01-01T00:00:00Z"}
-                  [{:xt/id "foo", :v 2}
-                   {:xt/id "bar", :v 2}])
-
-    (with-open [live-rel0 (.openAsRelation (.getLiveRelation lt0))
-                live-rel1 (.openAsRelation (.getLiveRelation lt1))]
-
-      (let [segments [(-> (trie/->Segment (.compactLogs (li/live-trie lt0)))
-                          (assoc :data-rel (DataRel/live live-rel0)))
-                      (-> (trie/->Segment (.compactLogs (li/live-trie lt1)))
-                          (assoc :data-rel (DataRel/live live-rel1)))]]
-
-        (t/testing "merge segments"
-          (util/with-open [data-rel (Relation. tu/*allocator* (c/->log-data-rel-schema (map :data-rel segments)))
-                           recency-wtr (c/open-recency-wtr tu/*allocator*)]
-
-            (c/merge-segments-into data-rel recency-wtr segments nil)
-
-            (t/is (= [{:xt/iid #uuid "9e3f856e-6899-8313-827f-f18dd4d88e78",
-                       :xt/system-from (time/->zdt #inst "2023")
-                       :xt/valid-from (time/->zdt #inst "2023")
-                       :xt/valid-to (time/->zdt time/end-of-time)
-                       :op {:v 2, :xt/id "bar"}}
-                      {:xt/iid #uuid "9e3f856e-6899-8313-827f-f18dd4d88e78",
-                       :xt/system-from (time/->zdt #inst "2021")
-                       :xt/valid-from (time/->zdt #inst "2021")
-                       :xt/valid-to (time/->zdt time/end-of-time)
-                       :op {:v 1, :xt/id "bar"}}
-                      {:xt/iid #uuid "9e3f856e-6899-8313-827f-f18dd4d88e78",
-                       :xt/system-from (time/->zdt #inst "2020")
-                       :xt/valid-from (time/->zdt #inst "2020")
-                       :xt/valid-to (time/->zdt time/end-of-time)
-                       :op {:v 0, :xt/id "bar"}}
-                      {:xt/iid #uuid "d9c7fae2-a04e-0471-6493-6265ba33cf80",
-                       :xt/system-from (time/->zdt #inst "2023")
-                       :xt/valid-from (time/->zdt #inst "2023")
-                       :xt/valid-to (time/->zdt time/end-of-time)
-                       :op {:v 2, :xt/id "foo"}}
-                      {:xt/iid #uuid "d9c7fae2-a04e-0471-6493-6265ba33cf80",
-                       :xt/system-from (time/->zdt #inst "2022")
-                       :xt/valid-from (time/->zdt #inst "2022")
-                       :xt/valid-to (time/->zdt time/end-of-time)
-                       :op {:v 1, :xt/id "foo"}}
-                      {:xt/iid #uuid "d9c7fae2-a04e-0471-6493-6265ba33cf80",
-                       :xt/system-from (time/->zdt #inst "2020")
-                       :xt/valid-from (time/->zdt #inst "2020")
-                       :xt/valid-to (time/->zdt time/end-of-time)
-                       :op {:v 0, :xt/id "foo"}}]
-
-                     (->> (.toMaps data-rel)
-                          (mapv #(update % :xt/iid (comp util/byte-buffer->uuid ByteBuffer/wrap))))))
-
-            (t/is (= [(time/->zdt time/end-of-time) (time/->zdt #inst "2023") (time/->zdt #inst "2021")
-                      (time/->zdt time/end-of-time) (time/->zdt #inst "2023") (time/->zdt #inst "2022")]
-                     (-> recency-wtr .getAsList)))))
-
-        (t/testing "merge segments with path predicate"
-          (util/with-open [data-rel (Relation. tu/*allocator* (c/->log-data-rel-schema (map :data-rel segments)))
-                           recency-wtr (c/open-recency-wtr tu/*allocator*)]
-            (c/merge-segments-into data-rel recency-wtr segments (byte-array [2]))
-
-            (t/is (= [{:xt/iid #uuid "9e3f856e-6899-8313-827f-f18dd4d88e78",
-                       :xt/system-from (time/->zdt #inst "2023")
-                       :xt/valid-from (time/->zdt #inst "2023")
-                       :xt/valid-to (time/->zdt time/end-of-time)
-                       :op {:v 2, :xt/id "bar"}}
-                      {:xt/iid #uuid "9e3f856e-6899-8313-827f-f18dd4d88e78",
-                       :xt/system-from (time/->zdt #inst "2021")
-                       :xt/valid-from (time/->zdt #inst "2021")
-                       :xt/valid-to (time/->zdt time/end-of-time)
-                       :op {:v 1, :xt/id "bar"}}
-                      {:xt/iid #uuid "9e3f856e-6899-8313-827f-f18dd4d88e78",
-                       :xt/system-from (time/->zdt #inst "2020")
-                       :xt/valid-from (time/->zdt #inst "2020")
-                       :xt/valid-to (time/->zdt time/end-of-time)
-                       :op {:v 0, :xt/id "bar"}}]
-
-                     (->> (.toMaps data-rel)
-                          (mapv #(update % :xt/iid (comp util/byte-buffer->uuid ByteBuffer/wrap))))))
-
-            (t/is (= [(time/->zdt time/end-of-time) (time/->zdt #inst "2023") (time/->zdt #inst "2021")]
-                     (.getAsList recency-wtr)))))))))
-
 (defn tables-key ^String [table] (str "objects/" Storage/version "/tables/" table))
 
 (t/deftest test-l1-compaction
@@ -399,7 +299,7 @@
               c/*ignore-signal-block?* true]
       (util/with-open [node (tu/->local-node {:node-dir node-dir, :rows-per-block 10})]
         (let [^BufferPool bp (tu/component node :xtdb/buffer-pool)
-              ^IMetadataManager meta-mgr (tu/component node :xtdb.metadata/metadata-manager)]
+              meta-mgr (meta/<-node node)]
           (letfn [(submit! [xs]
                     (last (for [batch (partition-all 8 xs)]
                             (xt/submit-tx node [(into [:put-docs :foo]
@@ -413,12 +313,14 @@
             (let [table-name "foo"
                   meta-files (->> (.listAllObjects bp (trie/->table-meta-dir table-name))
                                   (mapv (comp :key os/<-StoredObject)))]
+
+              ;; TODO this doseq seems to return nothing, so nothing gets tested?
               (doseq [{:keys [trie-key]} (map trie/parse-trie-file-path meta-files)]
-                (util/with-open [{:keys [^HashTrie trie] :as _table-metadata} (.openTableMetadata meta-mgr (trie/->table-meta-file-path table-name trie-key))
+                (util/with-open [page-meta (.openPageMetadata meta-mgr (Trie/metaFilePath table-name trie-key))
                                  ^DataRel data-rel (first (DataRel/openRels tu/*allocator* bp table-name [trie-key]))]
 
                   ;; checking that every page relation has a positive row count
-                  (t/is (empty? (->> (mapv #(.loadPage data-rel %) (.getLeaves trie))
+                  (t/is (empty? (->> (mapv #(.loadPage data-rel %) (.getLeaves (.getTrie page-meta)))
                                      (map #(.getRowCount ^RelationReader %))
                                      (filter zero?)))))))))))))
 
@@ -542,34 +444,3 @@
       (tj/check-json (.toPath (io/as-file (io/resource "xtdb/compactor-test/compaction-with-erase")))
                      (.resolve node-dir (tables-key "public$foo")) #"l01-rc-(.+)\.arrow"))))
 
-(t/deftest recency-bucketing-bug
-  (let [node-dir (util/->path "target/compactor/recency-bucketing-bug")]
-    (util/delete-dir node-dir)
-
-    (binding [c/*page-size* 2
-              c/*ignore-signal-block?* true]
-
-      (util/with-open [node (tu/->local-node {:node-dir node-dir})]
-
-        (dotimes [x 2]
-          (xt/submit-tx node
-                        [[:put-docs {:into :docs
-                                     :valid-from #xt/zoned-date-time "2024-01-01T00:00Z[UTC]" ,
-                                     :valid-to #xt/zoned-date-time "2025-01-01T00:00Z[UTC]" }
-                          {:xt/id x :col1 "yes"}]])
-          (xt/submit-tx node [[:put-docs {:into :docs
-                                          :valid-from #xt/zoned-date-time "2024-01-03T00:00Z[UTC]" ,
-                                          :valid-to #xt/zoned-date-time "2024-01-04T00:00Z[UTC]"}
-                               {:xt/id x :col1 "no"}]]))
-        (tu/finish-block! node)
-        (c/compact-all! node)
-
-        (t/is (= [{:xt/id 0,
-                   :col1 "yes",
-                   :xt/valid-time
-                   #xt/tstz-range [#xt/zoned-date-time "2024-01-01T00:00Z" #xt/zoned-date-time "2024-01-03T00:00Z"]}
-                  {:xt/id 0,
-                   :col1 "yes",
-                   :xt/valid-time
-                   #xt/tstz-range [#xt/zoned-date-time "2024-01-04T00:00Z" #xt/zoned-date-time "2025-01-01T00:00Z"]}]
-                 (xt/q node "SELECT *, _valid_time FROM docs FOR ALL VALID_TIME WHERE _id = 0 AND col1 = 'yes'")))))))

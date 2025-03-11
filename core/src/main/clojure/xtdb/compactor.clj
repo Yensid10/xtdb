@@ -1,165 +1,20 @@
 (ns xtdb.compactor
-  (:require [clojure.tools.logging :as log]
-            [integrant.core :as ig]
-            [xtdb.metrics :as metrics]
+  (:require [integrant.core :as ig]
             xtdb.metadata
             [xtdb.trie :as trie]
             [xtdb.trie-catalog :as cat]
-            [xtdb.types :as types]
             [xtdb.util :as util])
-  (:import [java.nio.channels ClosedByInterruptException]
-           [java.util Arrays Comparator LinkedList PriorityQueue]
-           (java.util.function Predicate)
-           [org.apache.arrow.memory BufferAllocator]
-           [org.apache.arrow.memory.util ArrowBufPointer]
-           (org.apache.arrow.vector.types.pojo Field FieldType)
-           (xtdb BufferPool)
-           xtdb.api.CompactorConfig
-           (xtdb.api.log Log)
-           (xtdb.arrow Relation RelationReader RowCopier Vector VectorWriter)
-           (xtdb.bitemporal IPolygonReader PolygonCalculator)
-           xtdb.BufferPool
-           (xtdb.compactor Compactor Compactor$Impl Compactor$Job)
-           (xtdb.metadata IMetadataManager)
-           (xtdb.trie DataRel EventRowPointer EventRowPointer$XtArrow HashTrieKt MergePlanTask TrieCatalog TrieWriter)
-           (xtdb.util TemporalBounds)))
+  (:import xtdb.api.CompactorConfig
+           (xtdb.compactor Compactor Compactor$Impl Compactor$Job Compactor$JobCalculator)
+           xtdb.trie.TrieCatalog))
 
 (def ^:dynamic *ignore-signal-block?* false)
-
-(defn- ->reader->copier [^Relation data-wtr]
-  (let [iid-wtr (.get data-wtr "_iid")
-        sf-wtr (.get data-wtr "_system_from")
-        vf-wtr (.get data-wtr "_valid_from")
-        vt-wtr (.get data-wtr "_valid_to")
-        op-wtr (.get data-wtr "op")]
-    (fn reader->copier [^RelationReader data-rdr]
-      (let [iid-copier (-> (.get data-rdr "_iid") (.rowCopier iid-wtr))
-            sf-copier (-> (.get data-rdr "_system_from") (.rowCopier sf-wtr))
-            vf-copier (-> (.get data-rdr "_valid_from") (.rowCopier vf-wtr))
-            vt-copier (-> (.get data-rdr "_valid_to") (.rowCopier vt-wtr))
-            op-copier (-> (.get data-rdr "op") (.rowCopier op-wtr))]
-        (reify RowCopier
-          (copyRow [_ ev-idx]
-            (let [pos (.copyRow iid-copier ev-idx)]
-              (.copyRow sf-copier ev-idx)
-              (.copyRow vf-copier ev-idx)
-              (.copyRow vt-copier ev-idx)
-              (.copyRow op-copier ev-idx)
-              (.endRow data-wtr)
-
-              pos)))))))
-
-(defn merge-segments-into [^Relation data-rel, ^VectorWriter recency-wtr, segments, ^bytes path-filter]
-  (let [reader->copier (->reader->copier data-rel)
-        polygon-calculator (PolygonCalculator.)
-
-        is-valid-ptr (ArrowBufPointer.)]
-
-    (doseq [^MergePlanTask merge-plan-task (HashTrieKt/toMergePlan segments
-                                                                   (when path-filter
-                                                                     (let [path-len (alength path-filter)]
-                                                                       (reify Predicate
-                                                                         (test [_ page-path]
-                                                                           (let [^bytes page-path page-path
-                                                                                 len (min path-len (alength page-path))]
-                                                                             (Arrays/equals path-filter 0 len
-                                                                                            page-path 0 len))))))
-                                                                   (TemporalBounds.))
-            :let [_ (when (Thread/interrupted)
-                      (throw (InterruptedException.)))
-
-                  mp-nodes (.getMpNodes merge-plan-task)
-                  ^bytes path (.getPath merge-plan-task)
-                  data-rdrs (mapv trie/load-data-page mp-nodes)
-                  merge-q (PriorityQueue. (Comparator/comparing :ev-ptr (EventRowPointer/comparator)))
-                  path (if (or (nil? path-filter)
-                               (> (alength path) (alength path-filter)))
-                         path
-                         path-filter)]]
-
-      (doseq [^RelationReader data-rdr data-rdrs
-              :when data-rdr
-              :let [ev-ptr (EventRowPointer$XtArrow. data-rdr path)
-                    row-copier (reader->copier data-rdr)]]
-        (when (.isValid ev-ptr is-valid-ptr path)
-          (.add merge-q {:ev-ptr ev-ptr, :row-copier row-copier})))
-
-      (loop [seen-erase? false]
-        (when-let [{:keys [^EventRowPointer ev-ptr, ^RowCopier row-copier] :as q-obj} (.poll merge-q)]
-          (let [new-previous-polygon  (if-let [polygon (.calculate polygon-calculator ev-ptr)]
-                                        (do
-                                          (.copyRow row-copier (.getIndex ev-ptr))
-                                          (.writeLong recency-wtr (.getRecency ^IPolygonReader polygon))
-                                          false)
-
-                                        (do
-                                          ;; the first time we encounter an erase
-                                          (when-not seen-erase?
-                                            (.copyRow row-copier (.getIndex ev-ptr))
-                                            ;; TODO this can likely become system-time, but we wanted to play it safe for now
-                                            (.writeLong recency-wtr Long/MAX_VALUE))
-                                          true))]
-            (.nextIndex ev-ptr)
-            (when (.isValid ev-ptr is-valid-ptr path)
-              (.add merge-q q-obj))
-            (recur new-previous-polygon)))))
-
-    nil))
-
-(defn ->log-data-rel-schema ^org.apache.arrow.vector.types.pojo.Schema [data-rels]
-  (trie/data-rel-schema (-> (for [^DataRel data-rel data-rels]
-                              (-> (.getSchema data-rel)
-                                  (.findField "op")
-                                  (.getChildren) ^Field first))
-                            (->> (apply types/merge-fields))
-                            (types/field-with-name "put"))))
-
-(defn open-recency-wtr ^xtdb.arrow.Vector [allocator]
-  (Vector/fromField allocator
-                    (Field. "_recency"
-                            (FieldType/notNullable #xt.arrow/type [:timestamp-tz :micro "UTC"])
-                            nil)))
-
-(defn exec-compaction-job! [^BufferAllocator allocator, ^BufferPool buffer-pool, ^IMetadataManager metadata-mgr
-                            {:keys [page-size]} {:keys [table-name part trie-keys out-trie-key]}]
-  (try
-    (log/debugf "compacting '%s' '%s' -> '%s'..." table-name trie-keys out-trie-key)
-
-    (util/with-open [table-metadatas (LinkedList.)
-                     data-rels (DataRel/openRels allocator buffer-pool table-name trie-keys)]
-      (doseq [trie-key trie-keys]
-        (.add table-metadatas (.openTableMetadata metadata-mgr (trie/->table-meta-file-path table-name trie-key))))
-
-      (let [segments (mapv (fn [{:keys [trie] :as _table-metadata} data-rel]
-                             (-> (trie/->Segment trie) (assoc :data-rel data-rel)))
-                           table-metadatas
-                           data-rels)
-            schema (->log-data-rel-schema (map :data-rel segments))
-
-            data-file-size (util/with-open [data-rel (Relation. allocator schema)
-                                            recency-wtr (open-recency-wtr allocator)]
-                             (merge-segments-into data-rel recency-wtr segments (byte-array part))
-
-                             (util/with-open [trie-wtr (TrieWriter. allocator buffer-pool
-                                                                    schema table-name out-trie-key
-                                                                    true)]
-
-                               (Compactor/writeRelation trie-wtr data-rel page-size)))]
-
-        (log/debugf "compacted '%s' -> '%s'." table-name out-trie-key)
-
-        [(cat/->added-trie table-name out-trie-key data-file-size)]))
-
-    (catch ClosedByInterruptException _ (throw (InterruptedException.)))
-    (catch InterruptedException e (throw e))
-
-    (catch Throwable t
-      (log/error t "Error running compaction job.")
-      (throw t))))
 
 (defrecord Job [table-name trie-keys part out-trie-key]
   Compactor$Job
   (getTableName [_] table-name)
+  (getTrieKeys [_] (set trie-keys))
+  (getPart [_] part)
   (getOutputTrieKey [_] out-trie-key))
 
 (defn- l0->l1-compaction-job [table-name {l0 [0 nil []], l1c [1 nil []]} {:keys [^long file-size-target]}]
@@ -245,29 +100,23 @@
 
 (def ^:dynamic *page-size* 1024)
 
-(defn- open-compactor [{:keys [allocator, ^BufferPool buffer-pool, ^Log log, ^TrieCatalog trie-catalog, metadata-mgr,
-                               ^long threads metrics-registry]}]
-  (util/with-close-on-catch [allocator (util/->child-allocator allocator "compactor")]
-    (metrics/add-allocator-gauge metrics-registry "compactor.allocator.allocated_memory" allocator)
-    (let [page-size *page-size*]
-      (Compactor/open
-       (reify Compactor$Impl
-         (availableJobs [_]
-           (->> (.getTableNames trie-catalog)
-                (into [] (mapcat (fn [table-name]
-                                   (compaction-jobs table-name (cat/trie-state trie-catalog table-name) trie-catalog))))))
+(defn- open-compactor [{:keys [allocator buffer-pool metadata-mgr
+                               log, ^TrieCatalog trie-catalog, metrics-registry
+                               threads]}]
+  (Compactor$Impl. allocator buffer-pool metadata-mgr
+                   log trie-catalog metrics-registry
+                   (reify Compactor$JobCalculator
+                     (availableJobs [_]
+                       (->> (.getTableNames trie-catalog)
+                            (into [] (mapcat (fn [table-name]
+                                               (compaction-jobs table-name (cat/trie-state trie-catalog table-name) trie-catalog)))))))
 
-         (executeJob [_ job]
-           (exec-compaction-job! allocator buffer-pool metadata-mgr {:page-size page-size} job))
-
-         (close [_] (util/close allocator)))
-
-       log trie-catalog *ignore-signal-block?* threads))))
+                   *ignore-signal-block?* threads *page-size*))
 
 (defmethod ig/init-key :xtdb/compactor [_ {:keys [threads] :as opts}]
   (if (pos? threads)
     (open-compactor opts)
-    (Compactor/getNoop)))
+    Compactor/NOOP))
 
 (defmethod ig/halt-key! :xtdb/compactor [_ compactor]
   (util/close compactor))

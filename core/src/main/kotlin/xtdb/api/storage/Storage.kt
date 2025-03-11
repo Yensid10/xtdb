@@ -4,7 +4,6 @@ package xtdb.api.storage
 
 import com.github.benmanes.caffeine.cache.Cache
 import com.github.benmanes.caffeine.cache.Caffeine
-import io.micrometer.core.instrument.Gauge
 import io.micrometer.core.instrument.MeterRegistry
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry
 import kotlinx.serialization.SerialName
@@ -20,6 +19,7 @@ import xtdb.buffer_pool.MemoryBufferPool
 import xtdb.buffer_pool.RemoteBufferPool
 import xtdb.util.StringUtil.asLexHex
 import xtdb.util.closeOnCatch
+import xtdb.util.openChildAllocator
 import java.nio.file.Path
 
 object Storage {
@@ -38,15 +38,6 @@ object Storage {
     @Serializable
     sealed interface Factory {
         fun open(allocator: BufferAllocator, meterRegistry: MeterRegistry = SimpleMeterRegistry()): BufferPool
-    }
-
-    internal fun BufferAllocator.openStorageChildAllocator() =
-        newChildAllocator("buffer-pool", 0, Long.MAX_VALUE)
-
-    internal fun BufferAllocator.registerMetrics(meterRegistry: MeterRegistry) = apply {
-        Gauge.builder("buffer-pool.allocator.allocated_memory", this) { al -> al.allocatedMemory.toDouble() }
-            .baseUnit("bytes")
-            .register(meterRegistry)
     }
 
     internal fun arrowFooterCache(maxEntries: Long = 1024): Cache<Path, ArrowFooter> =

@@ -1,24 +1,21 @@
 (ns xtdb.trie
-  (:require [clojure.string :as str]
-            [xtdb.buffer-pool]
-            [xtdb.types :as types]
-            [xtdb.util :as util]
-            [xtdb.vector.writer :as vw])
-  (:import (clojure.lang MapEntry)
-           com.carrotsearch.hppc.ByteArrayList
-           (com.google.protobuf ByteString)
-           (java.nio ByteBuffer)
+  (:require [xtdb.buffer-pool]
+            [xtdb.util :as util])
+  (:import com.carrotsearch.hppc.ByteArrayList
            (java.nio.file Path)
            java.time.LocalDate
            (java.util ArrayList)
-           (org.apache.arrow.memory BufferAllocator)
-           (org.apache.arrow.vector VectorSchemaRoot)
-           (org.apache.arrow.vector.types.pojo ArrowType$Union Field Schema)
-           org.apache.arrow.vector.types.UnionMode
-           (xtdb.block.proto TableBlock)
            xtdb.BufferPool
-           (xtdb.trie DataRel ISegment MemoryHashTrie MergePlanNode Trie Trie$Key)
-           (xtdb.util TemporalBounds TemporalDimension)))
+           (xtdb.trie ISegment MemoryHashTrie Trie Trie$Key)
+           (xtdb.util TemporalBounds TemporalDimension)
+           xtdb.log.proto.TrieDetails))
+
+(defn ->trie-details ^TrieDetails [table-name, trie-key, ^long data-file-size]
+  (.. (TrieDetails/newBuilder)
+      (setTableName table-name)
+      (setTrieKey trie-key)
+      (setDataFileSize data-file-size)
+      (build)))
 
 (defn ->trie-key [^long level, ^LocalDate recency, ^bytes part, ^long block-idx]
   (str (Trie$Key. level recency (some-> part ByteArrayList/from) block-idx)))
@@ -44,44 +41,16 @@
   (-> (parse-trie-key (str (.getFileName file-path)))
       (assoc :file-path file-path)))
 
-(def ^java.nio.file.Path tables-dir (util/->path "tables"))
-
 (defn table-name->table-path ^java.nio.file.Path [^String table-name]
-  (.resolve tables-dir (-> table-name (str/replace #"[\.\/]" "\\$"))))
-
-(defn ->table-data-file-path ^java.nio.file.Path [table-name trie-key]
-  (-> (table-name->table-path table-name)
-      (.resolve (format "data/%s.arrow" trie-key))))
+  (Trie/getTablePath table-name))
 
 (defn ->table-meta-dir ^java.nio.file.Path [table-name]
-  (-> (table-name->table-path table-name)
-      (.resolve "meta")))
-
-(defn ->table-meta-file-path [table-name trie-key]
-  (-> (->table-meta-dir table-name)
-      (.resolve (format "%s.arrow" trie-key))))
-
-(defn data-rel-schema ^org.apache.arrow.vector.types.pojo.Schema [^Field put-doc-field]
-  (Schema. [(types/col-type->field "_iid" [:fixed-size-binary 16])
-            (types/col-type->field "_system_from" types/temporal-col-type)
-            (types/col-type->field "_valid_from" types/temporal-col-type)
-            (types/col-type->field "_valid_to" types/temporal-col-type)
-            (types/->field "op" (ArrowType$Union. UnionMode/Dense (int-array (range 3))) false
-                           put-doc-field
-                           (types/col-type->field "delete" :null)
-                           (types/col-type->field "erase" :null))]))
-
-(defn open-log-data-wtr
-  (^xtdb.vector.IRelationWriter [^BufferAllocator allocator]
-   (open-log-data-wtr allocator (data-rel-schema (types/col-type->field "put" [:struct {}]))))
-
-  (^xtdb.vector.IRelationWriter [^BufferAllocator allocator data-schema]
-   (util/with-close-on-catch [root (VectorSchemaRoot/create data-schema allocator)]
-     (vw/root->writer root))))
+  (Trie/metaFileDir table-name))
 
 (defrecord Segment [trie]
   ISegment
-  (getTrie [_] trie))
+  (getTrie [_] trie)
+  (getDataRel [this] (:data-rel this)))
 
 (defprotocol MergePlanPage
   (load-page [mpg ^BufferPool buffer-pool vsr-cache])
@@ -151,8 +120,3 @@
                      (.add leaves page))
                    (recur more-pages)))))
            (vec leaves)))))))
-
-(defn load-data-page [^MergePlanNode merge-plan-node]
-  (let [{:keys [^DataRel data-rel]} (.getSegment merge-plan-node)
-        trie-leaf (.getNode merge-plan-node)]
-    (.loadPage data-rel trie-leaf)))

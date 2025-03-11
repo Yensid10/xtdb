@@ -10,7 +10,7 @@ private const val LOG_LIMIT = 64
 private const val PAGE_LIMIT = 1024
 private const val MAX_LEVEL = 64
 
-data class MemoryHashTrie(override val rootNode: Node, val iidReader: IVectorReader) : HashTrie<MemoryHashTrie.Node> {
+data class MemoryHashTrie(override val rootNode: Node, val iidReader: IVectorReader) : HashTrie<MemoryHashTrie.Node, MemoryHashTrie.Leaf> {
     sealed interface Node : HashTrie.Node<Node> {
         fun add(trie: MemoryHashTrie, newIdx: Int): Node
 
@@ -29,7 +29,7 @@ data class MemoryHashTrie(override val rootNode: Node, val iidReader: IVectorRea
         fun build(): MemoryHashTrie = MemoryHashTrie(Leaf(logLimit, pageLimit, rootPath), iidReader)
     }
 
-    fun add(idx: Int) = copy(rootNode = rootNode.add(this, idx))
+    operator fun plus(idx: Int) = copy(rootNode = rootNode.add(this, idx))
 
     @Suppress("unused")
     fun withIidReader(iidReader: IVectorReader) = copy(iidReader = iidReader)
