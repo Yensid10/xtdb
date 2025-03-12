@@ -1,5 +1,7 @@
 applicationApiVersion: v1beta1
 applicationKind: Application
+
+# Adapted from postgresql's schema.yaml
 properties:
   name:
     type: string
@@ -9,9 +11,9 @@ properties:
     type: string
     x-google-marketplace:
       type: NAMESPACE
-  serviceAccount:
+  xtdb.serviceAccount:
     type: string
-    title: Service Account
+    title: XTDB Service Account
     description: "Service account with Storage Admin permissions for XTDB"
     x-google-marketplace:
       type: SERVICE_ACCOUNT
@@ -43,9 +45,35 @@ properties:
     title: Deploy Kafka
     description: "Deploy Kafka as part of this installation"
     default: true
+  xtdb.persistence.storageClass:
+    type: string
+    title: StorageClass
+    description: StorageClass for XTDB persistent volumes
+    x-google-marketplace:
+      type: STORAGE_CLASS
+      storageClass:
+        type: SSD
+  xtdb.persistence.size:
+    type: string
+    title: Storage size for persistent volumes
+    default: "50Gi"
+    description: XTDB local disk cache size
+    pattern: '^[1-9][0-9]*(\.[0-9]+)?[TGM]i?$'
+  tls.keystorePassword:
+    type: string
+    x-google-marketplace:
+      type: GENERATED_PASSWORD
+      generatedPassword:
+        length: 16
+  tls.enabled:
+    type: boolean
+    title: Enable TLS Security
+    description: Enable TLS secure communication for XTDB
+    default: true
 required:
   - name
   - namespace
-  - serviceAccount
+  - xtdb.serviceAccount
   - gcpProjectId
   - gcpBucket
+  - tls.keystorePassword

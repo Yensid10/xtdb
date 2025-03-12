@@ -408,12 +408,18 @@ cd ~/gcmarketplace
 
 # Install mpdev if not already installed
 mkdir -p ~/bin
-gsutil cp gs://cloud-marketplace-tools/mpdev/latest/mpdev ~/bin
-chmod +x ~/bin/mpdev
-export PATH=$PATH:~/bin
+docker pull gcr.io/cloud-marketplace-tools/k8s/dev
+set BIN_FILE "/mnt/c/Users/bensh/bin/mpdev"
+docker run \
+      gcr.io/cloud-marketplace-tools/k8s/dev \
+      cat /scripts/dev > $BIN_FILE
+chmod +x $BIN_FILE
 
 # Install Application CRD
 kubectl apply -f "https://raw.githubusercontent.com/GoogleCloudPlatform/marketplace-k8s-app-tools/master/crd/app-crd.yaml"
+
+# Test mpdev
+mpdev
 
 # Test the deployment
 mpdev install --deployer=$REGISTRY/{$APP_NAME}/deployer:$VERSION --parameters='{"name": "xtdb-test", "namespace": "test-deployment", "serviceAccount": "xtdb-service-account", "gcpProjectId": "bcs-test-450214", "gcpBucket": "xtdb-storage-bucket", "kafka.enabled": true}'
