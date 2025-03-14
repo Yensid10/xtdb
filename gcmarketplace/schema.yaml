@@ -1,5 +1,26 @@
-applicationApiVersion: v1beta1
-applicationKind: Application
+x-google-marketplace:
+  schemaVersion: v2
+  applicationApiVersion: v1beta1
+  publishedVersion: '1.0.0'
+  publishedVersionMetadata:
+    releaseNote: >-
+      Initial release of XTDB for Google Cloud Marketplace.
+    releaseTypes:
+    - Feature
+    recommended: true
+  images:
+    xtdb:
+      properties:
+        imageXtdbRepo:
+          type: REPO_WITH_REGISTRY
+        imageXtdbTag:
+          type: TAG
+    kafka:
+      properties:
+        imageKafkaRepo:
+          type: REPO_WITH_REGISTRY
+        imageKafkaTag:
+          type: TAG
 
 # Adapted from postgresql's schema.yaml
 properties:
@@ -14,7 +35,7 @@ properties:
   xtdb.serviceAccount:
     type: string
     title: XTDB Service Account
-    description: "Service account with Storage Admin permissions for XTDB"
+    description: "Service account for XTDB. This service account requires Storage Admin (roles/storage.admin) permissions to read and write data to Google Cloud Storage. After deployment, this service account will be used with Workload Identity to access Google Cloud resources from the Kubernetes cluster."
     x-google-marketplace:
       type: SERVICE_ACCOUNT
       serviceAccount:
@@ -25,11 +46,11 @@ properties:
   gcpProjectId:
     type: string
     title: GCP Project ID
-    description: "GCP Project ID where your storage bucket is located"
+    description: "GCP Project ID where your storage bucket is located. You must create this bucket before deployment."
   gcpBucket:
     type: string
     title: GCP Storage Bucket
-    description: "GCP Storage Bucket for XTDB data (must be created beforehand)"
+    description: "GCP Storage Bucket for XTDB data (must be created beforehand with Storage Admin permissions for the service account)"
   kafkaBootstrapServers:
     type: string
     title: Kafka Bootstrap Servers
@@ -48,7 +69,7 @@ properties:
   xtdb.persistence.storageClass:
     type: string
     title: StorageClass
-    description: StorageClass for XTDB persistent volumes
+    description: "StorageClass for XTDB persistent volumes. This determines the type of disk used for XTDB's local storage."
     x-google-marketplace:
       type: STORAGE_CLASS
       storageClass:
@@ -57,10 +78,12 @@ properties:
     type: string
     title: Storage size for persistent volumes
     default: "50Gi"
-    description: XTDB local disk cache size
+    description: "XTDB local disk cache size. This determines how much local storage is allocated for XTDB's cache."
     pattern: '^[1-9][0-9]*(\.[0-9]+)?[TGM]i?$'
   tls.keystorePassword:
     type: string
+    title: TLS Keystore Password
+    description: "Password for the TLS keystore. This is automatically generated."
     x-google-marketplace:
       type: GENERATED_PASSWORD
       generatedPassword:
@@ -68,8 +91,16 @@ properties:
   tls.enabled:
     type: boolean
     title: Enable TLS Security
-    description: Enable TLS secure communication for XTDB
+    description: "Enable TLS secure communication for XTDB"
     default: true
+  xtdb.adminPassword:
+    type: string
+    title: XTDB Admin Password
+    description: "Password for the XTDB admin user. This is automatically generated."
+    x-google-marketplace:
+      type: GENERATED_PASSWORD
+      generatedPassword:
+        length: 16
 required:
   - name
   - namespace
@@ -77,3 +108,4 @@ required:
   - gcpProjectId
   - gcpBucket
   - tls.keystorePassword
+  - xtdb.adminPassword

@@ -10,5 +10,8 @@
             "username": "xtdb",
             "password": "xtdb"
         }
+    ],
+    "cSpell.words": [
+      "serviceaccount"
     ]
 }

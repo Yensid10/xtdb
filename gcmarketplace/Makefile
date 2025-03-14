@@ -10,16 +10,16 @@ CHART_NAME := xtdb
 APP_ID ?= $(CHART_NAME)
 
 TRACK ?= 1.0.0
-SERVICE_NAME := services/your-service-id.cloudpartnerservices.goog
+MARKETPLACE_TOOLS_TAG ?= 0.11.1
 
 # Define image tags
 XTDB_TAG ?= $(TRACK)
 KAFKA_TAG ?= 31.3.1
 
 # Define image sources
-PROJECT_ID ?= bcs-test-450214
-REGISTRY ?= us-central1-docker.pkg.dev/$(PROJECT_ID)/quickstart-docker-repo
-IMAGE_XTDB ?= $(REGISTRY)/xtdb-image:$(XTDB_TAG)
+PROJECT_ID ?= $(shell gcloud config get-value project)
+REGISTRY ?= us-central1-docker.pkg.dev/$(PROJECT_ID)/xtdb-repo
+IMAGE_XTDB ?= $(REGISTRY)/xtdb:$(XTDB_TAG)
 IMAGE_KAFKA ?= docker.io/bitnami/kafka:$(KAFKA_TAG)
 
 # Main image
@@ -37,76 +37,209 @@ RELEASE ?= $(XTDB_TAG)-$(BUILD_ID)
 NAME ?= $(APP_ID)-1
 
 # Deployment namespace
-NAMESPACE ?= test-deployment
+NAMESPACE ?= xtdb-deployment
+
+# GKE and infrastructure configuration
+VPC_NAME ?= xtdb-vpc
+VPC_SUBNET_NAME ?= xtdb-vpc-public-subnet
+VPC_SUBNET_IP ?= 10.10.10.0/24
+VPC_SUBNET_REGION ?= us-central1
+KUBERNETES_CLUSTER_NAME ?= xtdb-cluster
+KUBERNETES_CLUSTER_REGION ?= us-central1
+KUBERNETES_CLUSTER_ZONE ?= us-central1-a
+NODE_MACHINE_TYPE ?= n2-highmem-2
+NODE_DISK_SIZE ?= 50
+NODE_DISK_TYPE ?= pd-standard
+NODE_COUNT ?= 1
+EPHEMERAL_SSD_COUNT ?= 1
 
 # Additional variables for deployment parameters
 ifdef KAFKA_ENABLED
   KAFKA_ENABLED_FIELD = , "kafka.enabled": $(KAFKA_ENABLED)
 endif
 
-ifdef TLS_ENABLED
-  TLS_ENABLED_FIELD = , "tls.enabled": $(TLS_ENABLED)
-endif
-
 # Default deployment parameters
 APP_PARAMETERS ?= { \
-  "name": "$(NAME)", \
+  "name": "xtdb-kubernetes-deployment", \
   "namespace": "$(NAMESPACE)", \
   "xtdb.serviceAccount": "xtdb-service-account", \
   "gcpProjectId": "$(PROJECT_ID)", \
-  "gcpBucket": "xtdb-storage-bucket" \
-  $(KAFKA_ENABLED_FIELD) \
-  $(TLS_ENABLED_FIELD) \
+  "gcpBucket": "xtdb-storage-bucket", \
+  "kafka.enabled": true, \
+  "tls.enabled": true, \
+  "tls.keystorePassword": "auto-generate", \
+  "xtdb.adminPassword": "auto-generate", \
+  "nodeCount": 3, \
+  "xtdb.persistence.size": "50Gi" \
 }
 
 # Build and deployment targets
-.PHONY: build-deployer push-deployer deploy clean
+.PHONY: setup-vpc setup-service-account setup-bucket setup-infra setup-namespace setup-workload-identity generate-tls build-xtdb-image build-deployer push-deployer update-deps deploy verify clean cleanup-deployment cleanup-infra cleanup-all setup-all post-install-setup
 
-# Build the deployer image
+# =============================================
+# Infrastructure Setup (in chronological order)
+# =============================================
+
+# 1. Setup VPC and subnet (first infrastructure component)
+setup-vpc:
+	@echo "Creating VPC and subnet..."
+	gcloud compute networks create $(VPC_NAME) \
+		--project=$(PROJECT_ID) \
+		--subnet-mode=custom
+	gcloud compute networks subnets create $(VPC_SUBNET_NAME) \
+		--project=$(PROJECT_ID) \
+		--network=$(VPC_NAME) \
+		--region=$(VPC_SUBNET_REGION) \
+		--range=$(VPC_SUBNET_IP)
+
+# 2. Setup service account (needed for both GKE and storage)
+setup-service-account:
+	@echo "Creating service account..."
+	gcloud iam service-accounts create xtdb-service-account \
+		--project=$(PROJECT_ID) \
+		--display-name="XTDB Service Account" || true
+	gcloud projects add-iam-policy-binding $(PROJECT_ID) \
+		--member="serviceAccount:xtdb-service-account@$(PROJECT_ID).iam.gserviceaccount.com" \
+		--role="roles/storage.admin"
+
+# 3. Setup GCS bucket (storage for XTDB)
+setup-bucket:
+	@echo "Creating GCS bucket..."
+	gcloud storage buckets create gs://xtdb-storage-$(PROJECT_ID) \
+		--project=$(PROJECT_ID) \
+		--location=$(VPC_SUBNET_REGION) \
+		--default-storage-class=STANDARD || true
+
+# 4. Setup GKE cluster with advanced configuration
+setup-infra: 
+	@echo "Creating GKE cluster with Terraform-equivalent configuration..."
+	gcloud container clusters create $(KUBERNETES_CLUSTER_NAME) \
+		--project=$(PROJECT_ID) \
+		--zone=$(KUBERNETES_CLUSTER_ZONE) \
+		--network=$(VPC_NAME) \
+		--subnetwork=$(VPC_SUBNET_NAME) \
+		--num-nodes=$(NODE_COUNT) \
+		--machine-type=$(NODE_MACHINE_TYPE) \
+		--disk-size=$(NODE_DISK_SIZE) \
+		--disk-type=$(NODE_DISK_TYPE) \
+		--local-ssd-count=$(EPHEMERAL_SSD_COUNT) \
+		--workload-pool=$(PROJECT_ID).svc.id.goog
+	
+	@echo "Creating application node pool..."
+	gcloud container node-pools create application-pool \
+		--cluster=$(KUBERNETES_CLUSTER_NAME) \
+		--project=$(PROJECT_ID) \
+		--zone=$(KUBERNETES_CLUSTER_ZONE) \
+		--machine-type=$(NODE_MACHINE_TYPE) \
+		--disk-size=$(NODE_DISK_SIZE) \
+		--disk-type=$(NODE_DISK_TYPE) \
+		--local-ssd-count=$(EPHEMERAL_SSD_COUNT) \
+		--num-nodes=$(NODE_COUNT)
+	
+	@echo "Getting cluster credentials..."
+	gcloud container clusters get-credentials $(KUBERNETES_CLUSTER_NAME) \
+		--zone=$(KUBERNETES_CLUSTER_ZONE) \
+		--project=$(PROJECT_ID)
+
+# 5. Setup namespace and Kubernetes service account
+setup-namespace:
+	@echo "Creating namespace and Kubernetes service account..."
+	kubectl create namespace $(NAMESPACE) || true
+	kubectl create serviceaccount xtdb-service-account --namespace $(NAMESPACE) || true
+
+# # 6. Setup workload identity (connects K8s SA to GCP SA)
+# setup-workload-identity:
+# 	@echo "Setting up workload identity..."
+# 	gcloud iam service-accounts add-iam-policy-binding \
+# 		xtdb-service-account@$(PROJECT_ID).iam.gserviceaccount.com \
+# 		--role roles/iam.workloadIdentityUser \
+# 		--member "serviceAccount:$(PROJECT_ID).svc.id.goog[$(NAMESPACE)/xtdb-service-account]"
+# 	kubectl annotate serviceaccount xtdb-service-account \
+# 		--namespace $(NAMESPACE) \
+# 		iam.gke.io/gcp-service-account=xtdb-service-account@$(PROJECT_ID).iam.gserviceaccount.com \
+# 		--overwrite
+
+# =============================================
+# Application Build and Deployment
+# =============================================
+
+# 7. Generate TLS certificates if needed
+generate-tls:
+	@echo "Generating TLS certificates..."
+	# Add your TLS generation commands here if needed
+
+# 8. Update Helm dependencies
+update-deps:
+	@echo "Updating Helm dependencies..."
+	cd chart/xtdb && helm dependency update
+
+# 9. Build the deployer image
 build-deployer:
-	docker build -f deployer.dockerfile \
+	@echo "Building deployer image..."
+	docker build \
 		--build-arg REGISTRY=$(REGISTRY) \
 		--build-arg TAG=$(XTDB_TAG) \
-		-t $(REGISTRY)/$(APP_ID)/deployer:$(XTDB_TAG) .
+		--build-arg MARKETPLACE_TOOLS_TAG=$(MARKETPLACE_TOOLS_TAG) \
+		-t $(REGISTRY)/xtdb/deployer:$(XTDB_TAG) .
 
-# Push the deployer image
-push-deployer: build-deployer
-	docker push $(REGISTRY)/$(APP_ID)/deployer:$(XTDB_TAG)
+# 10. Push the deployer image
+push-deployer: 
+	@echo "Pushing deployer image..."
+	docker push $(REGISTRY)/xtdb/deployer:$(XTDB_TAG)
 
-# Update Helm dependencies
-update-deps:
-	cd chart && helm dependency update
-
-# Deploy to test environment
-deploy: push-deployer update-deps
+# 11. Deploy to test environment
+deploy:
+	@echo "Setting up workload identity before deployment..."
+	gcloud iam service-accounts add-iam-policy-binding \
+		xtdb-service-account@$(PROJECT_ID).iam.gserviceaccount.com \
+		--role roles/iam.workloadIdentityUser \
+		--member "serviceAccount:$(PROJECT_ID).svc.id.goog[$(NAMESPACE)/xtdb-service-account]"
+	kubectl annotate serviceaccount xtdb-service-account \
+		--namespace $(NAMESPACE) \
+		iam.gke.io/gcp-service-account=xtdb-service-account@$(PROJECT_ID).iam.gserviceaccount.com \
+		--overwrite || true
+	
+	@echo "Deploying XTDB..."
 	kubectl apply -f "https://raw.githubusercontent.com/GoogleCloudPlatform/marketplace-k8s-app-tools/master/crd/app-crd.yaml"
-	mpdev install --deployer=$(REGISTRY)/$(APP_ID)/deployer:$(XTDB_TAG) \
+	mpdev install --deployer=$(REGISTRY)/xtdb/deployer:$(XTDB_TAG) \
 		--parameters='$(APP_PARAMETERS)'
 
-# Clean up test deployment
-clean:
+# 12. Verify deployment
+verify:
+	@echo "Verifying XTDB deployment..."
+	kubectl get pods -n $(NAMESPACE)
+	kubectl get services -n $(NAMESPACE)
+	@echo "XTDB should be accessible at:"
+	@kubectl get service xtdb-service -n $(NAMESPACE) -o jsonpath="{.status.loadBalancer.ingress[0].ip}:{.spec.ports[0].port}" || echo "Service not available yet"
+
+# =============================================
+# Cleanup Operations (in reverse order)
+# =============================================
+
+# Clean up deployment
+cleanup-deployment:
+	@echo "Cleaning up deployment..."
 	kubectl delete namespace $(NAMESPACE) || true
 
-# Generate TLS certificate
-generate-tls:
-	mkdir -p chart/files
-	openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes -subj "/CN=xtdb"
-	openssl pkcs12 -export -out chart/files/keystore.p12 -inkey key.pem -in cert.pem -password pass:changeme
+# Cleanup infrastructure (in reverse order of creation)
+cleanup-infra:
+	@echo "Cleaning up infrastructure..."
+	gcloud container clusters delete $(KUBERNETES_CLUSTER_NAME) --zone=$(KUBERNETES_CLUSTER_ZONE) --quiet
+	# Only try to delete node pool if cluster still exists (which it shouldn't)
+	if gcloud container clusters describe $(KUBERNETES_CLUSTER_NAME) --zone=$(KUBERNETES_CLUSTER_ZONE) &>/dev/null; then \
+		gcloud container node-pools delete application-pool --cluster=$(KUBERNETES_CLUSTER_NAME) --zone=$(KUBERNETES_CLUSTER_ZONE) --quiet; \
+	fi
+	gcloud storage rm -r gs://xtdb-storage-$(PROJECT_ID) || true
+	gcloud iam service-accounts delete xtdb-service-account@$(PROJECT_ID).iam.gserviceaccount.com --quiet || true
+	gcloud compute networks subnets delete $(VPC_SUBNET_NAME) --region=$(VPC_SUBNET_REGION) --quiet || true
+	gcloud compute networks delete $(VPC_NAME) --quiet || true
 
-# Setup test environment
-setup-test:
-	gcloud container clusters create marketplace-test-cluster --region=us-central1 --num-nodes=1 --machine-type=e2-standard-4 --disk-type=pd-standard --disk-size=100 --project=$(PROJECT_ID)
-	gcloud container clusters get-credentials marketplace-test-cluster --region=us-central1
-	kubectl create namespace $(NAMESPACE)
-	kubectl create serviceaccount xtdb-service-account --namespace $(NAMESPACE)
-	gcloud iam service-accounts create xtdb-service-account --display-name="XTDB Service Account" --project=$(PROJECT_ID) || true
-	gcloud projects add-iam-policy-binding $(PROJECT_ID) --member="serviceAccount:xtdb-service-account@$(PROJECT_ID).iam.gserviceaccount.com" --role="roles/storage.admin"
-	gcloud iam service-accounts add-iam-policy-binding xtdb-service-account@$(PROJECT_ID).iam.gserviceaccount.com --role roles/iam.workloadIdentityUser --member "serviceAccount:$(PROJECT_ID).svc.id.goog[$(NAMESPACE)/xtdb-service-account]"
-	kubectl annotate serviceaccount xtdb-service-account --namespace $(NAMESPACE) iam.gke.io/gcp-service-account=xtdb-service-account@$(PROJECT_ID).iam.gserviceaccount.com
-	gcloud storage buckets create gs://xtdb-storage-bucket --location=us-central1 || true
+# =============================================
+# Complete Setup and Cleanup
+# =============================================
 
-# Cleanup test environment
-cleanup-test:
-	kubectl delete namespace $(NAMESPACE) || true
-	gcloud container clusters delete marketplace-test-cluster --region=us-central1 --quiet
-	gcloud storage rm -r gs://xtdb-storage-bucket || true
+# Complete setup (infrastructure + deployment) in chronological order
+setup-all: setup-vpc setup-service-account setup-bucket setup-infra setup-namespace generate-tls update-deps build-deployer push-deployer deploy verify
+
+# Complete cleanup (in reverse order)
+cleanup-all: cleanup-deployment cleanup-infra

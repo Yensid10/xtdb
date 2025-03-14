@@ -1,19 +1,37 @@
 # Kafka configuration
 kafka:
   enabled: true
-  listeners:
-    client:
-      protocol: PLAINTEXT
-    controller:
-      protocol: PLAINTEXT
+  fullnameOverride: kafka
+  # Kafka chart values
+  replicaCount: 3  # 3 Kafka controllers
+  persistence:
+    enabled: true
+    size: 20Gi
+  zookeeper:
+    enabled: true
+    replicaCount: 3  # 3 Zookeeper instances
+    persistence:
+      enabled: true
+      size: 10Gi
+  # Kafka security settings
+  auth:
+    clientProtocol: plaintext
+    interBrokerProtocol: plaintext
+  # Kafka resources
+  resources:
+    requests:
+      memory: 1Gi
+      cpu: 250m
+    limits:
+      memory: 2Gi
+      cpu: 500m
 
 # XTDB configuration
-nodeCount: 3
+nodeCount: 3  # 3 XTDB StatefulSets
 
 image:
-  repository: us-central1-docker.pkg.dev/bcs-test-450214/quickstart-docker-repo/xtdb-image
-  # tag: 2.0.0-beta5
-  tag: latest
+  repository: $imageXtdbRepo
+  tag: $imageXtdbTag
   pullPolicy: IfNotPresent
 
 nodeSelector:
@@ -28,11 +46,11 @@ affinity: {}
 resources:
   limits:
     cpu: "1000m"
-    memory: "10G"
+    memory: "4Gi"
     ephemeral-storage: 100Gi
   requests:
-    cpu: "750m"
-    memory: "10G"
+    cpu: "500m"
+    memory: "2Gi"
     ephemeral-storage: 100Gi
 
 securityContext:
@@ -50,14 +68,20 @@ xtdbConfig:
   gcpBucket: "$gcpBucket"
   kafkaBootstrapServers: "$kafkaBootstrapServers"
   kafkaLogTopic: "$kafkaLogTopic"
-  jdkOptions: "-Xmx3000m -Xms3000m -XX:MaxDirectMemorySize=3000m -XX:MaxMetaspaceSize=500m"
+  adminPassword: "$xtdb.adminPassword"
+  jdkOptions: "-Xmx2000m -Xms2000m -XX:MaxDirectMemorySize=1000m -XX:MaxMetaspaceSize=500m"
   nodeConfig: |-
     server:
       port: 5432
       tls:
-        enabled: true
+        enabled: {{ .Values.tls.enabled }}
         keystore: /var/lib/xtdb/tls/keystore.p12
         keystorePassword: !Env TLS_KEYSTORE_PASSWORD
+      auth:
+        enabled: true
+        users:
+          - username: admin
+            password: !Env XTDB_ADMIN_PASSWORD
 
     log: !Kafka
       bootstrapServers: !Env KAFKA_BOOTSTRAP_SERVERS
@@ -79,7 +103,7 @@ xtdbConfig:
       port: 8080
       host: "127.0.0.1"  # Only accessible within the pod
 
-  # Volume size settings for XTDB Local Disk Cache (uses ephemeral storage)
+  # Volume size settings for XTDB Local Disk Cache
   localDiskCache:
     sizeLimit: "50Gi"
 
@@ -87,7 +111,8 @@ xtdbConfig:
   env:
     # (ENV_VAR_NAME: Value)
     XTDB_LOGGING_LEVEL: "info" # See https://docs.xtdb.com/ops/troubleshooting/overview.html
-    TLS_KEYSTORE_PASSWORD: "password" # Should be generated or provided securely
+    TLS_KEYSTORE_PASSWORD: "$tls.keystorePassword" # Should be generated or provided securely
+    XTDB_ADMIN_PASSWORD: "$xtdb.adminPassword"
 
 startupProbe:
   httpGet:
