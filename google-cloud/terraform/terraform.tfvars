@@ -1,5 +1,5 @@
 # Google Cloud Project
-# project_id = "bcs-test-450214"
+# project_id = "project-id"
 
 # Google Cloud Service Account Name
 service_account_name = "xtdb-service-account"
