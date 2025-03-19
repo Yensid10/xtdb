@@ -247,7 +247,6 @@ setup: check-installs check-project-id-bucket gcloud-init run-terraform deploy-c
 # Main cleanup target
 cleanup: delete-clusters delete-storage-bucket delete-subnets-vpc destroy-terraform
 
-
 # =============================================
 # Help Commands
 # =============================================
@@ -285,5 +284,3 @@ help:
 	@echo ""
 	@echo "For more information, see the documentation at: https://github.com/xtdb/xtdb"
 	@echo "===================================================================="
-
-
