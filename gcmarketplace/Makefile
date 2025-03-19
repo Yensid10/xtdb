@@ -1,10 +1,6 @@
-# Include common makefiles (you may need to create or copy these from the PostgreSQL project)
-
-# If you don't have these files, you can start without them and add later
-# include ../crd.Makefile
-# include ../gcloud.Makefile
-# include ../var.Makefile
-# include ../images.Makefile
+# =============================================
+# Project Variables
+# =============================================
 
 CHART_NAME := xtdb
 APP_ID ?= $(CHART_NAME)
@@ -45,8 +41,8 @@ VPC_SUBNET_NAME ?= xtdb-vpc-public-subnet
 VPC_SUBNET_IP ?= 10.10.10.0/24
 VPC_SUBNET_REGION ?= us-central1
 KUBERNETES_CLUSTER_NAME ?= xtdb-cluster
-KUBERNETES_CLUSTER_REGION ?= us-central1
-KUBERNETES_CLUSTER_ZONE ?= us-central1-a
+# KUBERNETES_CLUSTER_REGION ?= us-central1
+KUBERNETES_CLUSTER_ZONE ?= us-central1
 NODE_MACHINE_TYPE ?= n2-highmem-2
 NODE_DISK_SIZE ?= 50
 NODE_DISK_TYPE ?= pd-standard
@@ -63,18 +59,26 @@ APP_PARAMETERS ?= { \
   "name": "xtdb-kubernetes-deployment", \
   "namespace": "$(NAMESPACE)", \
   "xtdb.serviceAccount": "xtdb-service-account", \
-  "gcpProjectId": "$(PROJECT_ID)", \
-  "gcpBucket": "xtdb-storage-bucket", \
-  "kafka.enabled": true, \
-  "tls.enabled": true, \
-  "tls.keystorePassword": "auto-generate", \
+  "xtdbConfig.gcpProjectId": "$(PROJECT_ID)", \
+  "xtdbConfig.gcpBucket": "$(PROJECT_ID)-xtdb-storage-bucket", \
   "xtdb.adminPassword": "auto-generate", \
-  "nodeCount": 3, \
-  "xtdb.persistence.size": "50Gi" \
+  "xtdb.persistence.size": "50Gi", \
+  "kafka.enabled": true, \
+  "kafka.replicaCount": 3, \
+  "kafka.persistence.size": "20Gi", \
+  "kafka.zookeeper.replicaCount": 3, \
+  "xtdbConfig.kafkaBootstrapServers": "kafka.$(NAMESPACE).svc.cluster.local:9092", \
+  "xtdbConfig.kafkaLogTopic": "xtdb-log" \
 }
 
+  # Commented out for the sake of JSON formatting
+  # "nodeCount": 3, \
+
+  # "tls.enabled": true, \
+  # "tls.keystorePassword": "auto-generate", \
+
 # Build and deployment targets
-.PHONY: setup-vpc setup-service-account setup-bucket setup-infra setup-namespace setup-workload-identity generate-tls build-xtdb-image build-deployer push-deployer update-deps deploy verify clean cleanup-deployment cleanup-infra cleanup-all setup-all post-install-setup
+.PHONY: setup-vpc setup-service-account setup-bucket setup-infra setup-namespace setup-workload-identity generate-tls build-xtdb-image build-deployer push-deployer update-deps deploy verify clean cleanup-deployment cleanup-infra cleanup-all setup-all
 
 # =============================================
 # Infrastructure Setup (in chronological order)
@@ -187,30 +191,46 @@ push-deployer:
 	@echo "Pushing deployer image..."
 	docker push $(REGISTRY)/xtdb/deployer:$(XTDB_TAG)
 
-# 11. Deploy to test environment
-deploy:
+# 11. Setup workload identity
+workload-identity:
+# @echo "Creating image pull secret..."
+# kubectl create secret docker-registry gcr-json-key \
+# 	--docker-server=us-central1-docker.pkg.dev \
+# 	--docker-username=oauth2accesstoken \
+# 	--docker-password="$(shell gcloud auth print-access-token)" \
+# 	--namespace $(NAMESPACE) || true
+
+# @echo "Patching service account..." 
+# kubectl patch serviceaccount xtdb-service-account \
+# 	--namespace $(NAMESPACE) \
+# 	-p '{"imagePullSecrets": [{"name": "gcr-json-key"}]}'
+	
 	@echo "Setting up workload identity before deployment..."
 	gcloud iam service-accounts add-iam-policy-binding \
 		xtdb-service-account@$(PROJECT_ID).iam.gserviceaccount.com \
 		--role roles/iam.workloadIdentityUser \
 		--member "serviceAccount:$(PROJECT_ID).svc.id.goog[$(NAMESPACE)/xtdb-service-account]"
+
+	@echo "Annotating service account..."
 	kubectl annotate serviceaccount xtdb-service-account \
 		--namespace $(NAMESPACE) \
 		iam.gke.io/gcp-service-account=xtdb-service-account@$(PROJECT_ID).iam.gserviceaccount.com \
 		--overwrite || true
-	
+
+# 12. Deploy to test environment
+deploy:
 	@echo "Deploying XTDB..."
 	kubectl apply -f "https://raw.githubusercontent.com/GoogleCloudPlatform/marketplace-k8s-app-tools/master/crd/app-crd.yaml"
 	mpdev install --deployer=$(REGISTRY)/xtdb/deployer:$(XTDB_TAG) \
 		--parameters='$(APP_PARAMETERS)'
 
-# 12. Verify deployment
+# 13. Verify deployment
 verify:
 	@echo "Verifying XTDB deployment..."
 	kubectl get pods -n $(NAMESPACE)
 	kubectl get services -n $(NAMESPACE)
-	@echo "XTDB should be accessible at:"
-	@kubectl get service xtdb-service -n $(NAMESPACE) -o jsonpath="{.status.loadBalancer.ingress[0].ip}:{.spec.ports[0].port}" || echo "Service not available yet"
+# @echo "XTDB should be accessible at:"
+# @kubectl get service xtdb-service -n $(NAMESPACE) -o jsonpath="{.status.loadBalancer.ingress[0].ip}:{.spec.ports[0].port}" || echo "Service not available yet"
 
 # =============================================
 # Cleanup Operations (in reverse order)
@@ -238,8 +258,17 @@ cleanup-infra:
 # Complete Setup and Cleanup
 # =============================================
 
+# Setup initial infrastructure
+setup-initial: setup-vpc setup-service-account setup-bucket setup-infra
+
+# Setup deployment (infrastructure + deployment)
+setup-deployment: setup-namespace generate-tls update-deps build-deployer push-deployer deploy verify
+
 # Complete setup (infrastructure + deployment) in chronological order
-setup-all: setup-vpc setup-service-account setup-bucket setup-infra setup-namespace generate-tls update-deps build-deployer push-deployer deploy verify
+setup-all: setup-initial setup-deployment
+
+# Reboot deployment
+reboot-deployment: cleanup-deployment setup-deployment
 
 # Complete cleanup (in reverse order)
 cleanup-all: cleanup-deployment cleanup-infra

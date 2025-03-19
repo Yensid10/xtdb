@@ -3,6 +3,8 @@ kind: ConfigMap
 metadata:
   name: xtdb-yaml-config
   namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ .Release.Name }}
 data:
   xtdbconfig.yaml: |-
     {{ .Values.xtdbConfig.nodeConfig | nindent 4 }}

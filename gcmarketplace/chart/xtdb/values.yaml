@@ -1,9 +1,17 @@
 nodeCount: 3
 
 image:
-  repository: ghcr.io/xtdb/xtdb-google-cloud
-  # tag: 2.0.0-beta5
+  # These will be populated by marketplace deployment
+  registry: ""
+  repository: ""
+  tag: ""
   pullPolicy: IfNotPresent
+
+# image:
+#   registry: "us-central1-docker.pkg.dev"
+#   repository: "bcs-test-450214/xtdb-repo/xtdb"
+#   tag: "1.0.0"
+#   pullPolicy: IfNotPresent
 
 nodeSelector:
   iam.gke.io/gke-metadata-server-enabled: "true"
@@ -54,13 +62,29 @@ xtdbConfig:
   # We mount and use the below YAML for configuring the XTDB nodes and their modules.
   # The !Env values are set by Environment Variables set on the XTDB statefulset pods.
   # See the XTDB configuration documentation for options: https://docs.xtdb.com/ops/config.html
+
+
+
+
+
+  
+  # nodeConfig: |-
+  #   server:
+  #     port: 5432
+
+  #   # log: !Kafka
+  #   #   bootstrapServers: !Env KAFKA_BOOTSTRAP_SERVERS
+  #   #   topic: !Env KAFKA_LOG_TOPIC
+
+
+
+
+
+
+
   nodeConfig: |-
     server:
       port: 5432
-
-    log: !Kafka
-      bootstrapServers: !Env KAFKA_BOOTSTRAP_SERVERS
-      topic: !Env KAFKA_LOG_TOPIC
 
     storage: !Remote
       objectStore: !GoogleCloud
@@ -118,3 +142,11 @@ xtdbService:
     targetPort: 8080
     # Port exposed by the service
     servicePort: 8080
+
+kafka:
+  enabled: true
+  replicaCount: 3
+  persistence:
+    size: "20Gi"
+  zookeeper:
+    replicaCount: 3

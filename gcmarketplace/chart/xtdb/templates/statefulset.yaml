@@ -5,6 +5,7 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     app: xtdb-statefulset
+    app.kubernetes.io/name: {{ .Release.Name }}
 spec:
   serviceName: xtdb-service
   replicas: {{ .Values.nodeCount }}
@@ -15,9 +16,10 @@ spec:
     metadata:
       labels:
         app: xtdb-statefulset
+        app.kubernetes.io/name: {{ .Release.Name }}
     spec:
       # Requires the service account to be created & federated identity set up
-      serviceAccountName: {{ required (printf "xtdbConfig.serviceAccount is required - ensure you set it up on %s and federate with a Google Cloud IAM service account" .Release.Namespace) .Values.xtdbConfig.serviceAccount }}
+      serviceAccountName: xtdb-service-account
       nodeSelector:
         {{- toYaml .Values.nodeSelector | nindent 8 }}
       tolerations:

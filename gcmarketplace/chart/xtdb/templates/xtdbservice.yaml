@@ -5,6 +5,7 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     app: xtdb-statefulset
+    app.kubernetes.io/name: {{ .Release.Name }}
 spec:
   type: {{ .Values.xtdbService.type }}
   ports:

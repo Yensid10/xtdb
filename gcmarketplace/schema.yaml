@@ -11,15 +11,19 @@ x-google-marketplace:
   images:
     xtdb:
       properties:
-        imageXtdbRepo:
-          type: REPO_WITH_REGISTRY
-        imageXtdbTag:
+        xtdbRegistry:
+          type: REGISTRY
+        xtdbRepository:
+          type: REPO_WITHOUT_REGISTRY
+        xtdbTag:
           type: TAG
     kafka:
       properties:
-        imageKafkaRepo:
-          type: REPO_WITH_REGISTRY
-        imageKafkaTag:
+        kafkaRegistry:
+          type: REGISTRY
+        kafkaRepository:
+          type: REPO_WITHOUT_REGISTRY
+        kafkaTag:
           type: TAG
 
 # Adapted from postgresql's schema.yaml
@@ -32,40 +36,18 @@ properties:
     type: string
     x-google-marketplace:
       type: NAMESPACE
+  # Image properties are now managed by the marketplace
+  # The following properties will be generated automatically by the marketplace
+  # based on the configuration above under x-google-marketplace.images
+  
+  # XTDB specific properties
   xtdb.serviceAccount:
     type: string
     title: XTDB Service Account
-    description: "Service account for XTDB. This service account requires Storage Admin (roles/storage.admin) permissions to read and write data to Google Cloud Storage. After deployment, this service account will be used with Workload Identity to access Google Cloud resources from the Kubernetes cluster."
     x-google-marketplace:
       type: SERVICE_ACCOUNT
       serviceAccount:
-        roles:
-        - type: ClusterRole
-          rulesType: PREDEFINED
-          rulesFromRoleName: edit
-  gcpProjectId:
-    type: string
-    title: GCP Project ID
-    description: "GCP Project ID where your storage bucket is located. You must create this bucket before deployment."
-  gcpBucket:
-    type: string
-    title: GCP Storage Bucket
-    description: "GCP Storage Bucket for XTDB data (must be created beforehand with Storage Admin permissions for the service account)"
-  kafkaBootstrapServers:
-    type: string
-    title: Kafka Bootstrap Servers
-    description: "Kafka bootstrap servers (leave default if using included Kafka)"
-    default: "kafka.{{ .Release.Namespace }}.svc.cluster.local:9092"
-  kafkaLogTopic:
-    type: string
-    title: Kafka Log Topic
-    description: "XTDB log topic on Kafka"
-    default: "xtdb-log"
-  kafka.enabled:
-    type: boolean
-    title: Deploy Kafka
-    description: "Deploy Kafka as part of this installation"
-    default: true
+        description: "Service account for XTDB."
   xtdb.persistence.storageClass:
     type: string
     title: StorageClass
@@ -74,25 +56,14 @@ properties:
       type: STORAGE_CLASS
       storageClass:
         type: SSD
+        annotation:
+          storageclass.kubernetes.io/is-default-class: "false"
   xtdb.persistence.size:
     type: string
     title: Storage size for persistent volumes
     default: "50Gi"
     description: "XTDB local disk cache size. This determines how much local storage is allocated for XTDB's cache."
     pattern: '^[1-9][0-9]*(\.[0-9]+)?[TGM]i?$'
-  tls.keystorePassword:
-    type: string
-    title: TLS Keystore Password
-    description: "Password for the TLS keystore. This is automatically generated."
-    x-google-marketplace:
-      type: GENERATED_PASSWORD
-      generatedPassword:
-        length: 16
-  tls.enabled:
-    type: boolean
-    title: Enable TLS Security
-    description: "Enable TLS secure communication for XTDB"
-    default: true
   xtdb.adminPassword:
     type: string
     title: XTDB Admin Password
@@ -101,11 +72,67 @@ properties:
       type: GENERATED_PASSWORD
       generatedPassword:
         length: 16
+  xtdbConfig.gcpProjectId:
+    type: string
+    title: GCP Project ID
+    description: The Google Cloud project ID where XTDB will run.
+    x-google-marketplace:
+      type: STRING
+  xtdbConfig.gcpBucket:
+    type: string
+    title: GCS Bucket 
+    description: The GCS bucket to be used for XTDB storage.
+    x-google-marketplace:
+      type: STRING
+  # Kafka configuration
+  kafka.enabled:
+    type: boolean
+    default: true
+    title: Enable Kafka
+    description: "Whether to deploy Kafka as part of the application"
+  
+  kafka.replicaCount:
+    type: integer
+    default: 3
+    minimum: 1
+    maximum: 7
+    title: Kafka Replica Count
+    description: "Number of Kafka replicas to deploy"
+  
+  kafka.persistence.size:
+    type: string
+    default: "20Gi"
+    title: Kafka Storage Size
+    description: "Size of persistent storage for each Kafka replica"
+    pattern: '^[1-9][0-9]*(\.[0-9]+)?[TGM]i?$'
+  
+  kafka.zookeeper.replicaCount:
+    type: integer
+    default: 3
+    minimum: 1
+    maximum: 7
+    title: Zookeeper Replica Count
+    description: "Number of Zookeeper replicas to deploy"
+    
+  # XTDB Kafka config
+  xtdbConfig.kafkaBootstrapServers:
+    type: string
+    default: "kafka.xtdb-deployment.svc.cluster.local:9092"
+    title: Kafka Bootstrap Servers
+    description: "The Kafka bootstrap servers connection string"
+    
+  xtdbConfig.kafkaLogTopic:
+    type: string
+    default: "xtdb-log"
+    title: Kafka Log Topic
+    description: "The Kafka topic to use for XTDB log storage"
+
 required:
   - name
   - namespace
   - xtdb.serviceAccount
-  - gcpProjectId
-  - gcpBucket
-  - tls.keystorePassword
+  - xtdbConfig.gcpProjectId
+  - xtdbConfig.gcpBucket
   - xtdb.adminPassword
+  - xtdbConfig.kafkaBootstrapServers
+  - xtdbConfig.kafkaLogTopic
