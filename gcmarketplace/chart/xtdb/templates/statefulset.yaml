@@ -17,6 +17,7 @@ spec:
       labels:
         app: xtdb-statefulset
         app.kubernetes.io/name: {{ .Release.Name }}
+        app.kubernetes.io/component: xtdb
     spec:
       # Requires the service account to be created & federated identity set up
       serviceAccountName: xtdb-service-account
@@ -36,8 +37,8 @@ spec:
           emptyDir:
             sizeLimit: {{ .Values.xtdbConfig.localDiskCache.sizeLimit }}
       containers:
-        - name: xtdb-container
-          image: {{ .Values.image.repository }}:{{ default .Chart.AppVersion .Values.image.tag }}
+        - name: xtdb
+          image: "ghcr.io/xtdb/xtdb:latest"  # The official XTDB image
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: ['-f', '/var/lib/xtdb-config/xtdbconfig.yaml']
           volumeMounts:

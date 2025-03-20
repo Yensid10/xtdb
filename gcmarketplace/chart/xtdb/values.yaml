@@ -1,22 +1,21 @@
 nodeCount: 3
 
-image:
-  # These will be populated by marketplace deployment
-  registry: ""
-  repository: ""
-  tag: ""
-  pullPolicy: IfNotPresent
-
+# Use this one for the marketplace deployment
 # image:
-#   registry: "us-central1-docker.pkg.dev"
-#   repository: "bcs-test-450214/xtdb-repo/xtdb"
-#   tag: "1.0.0"
+#   # These will be populated by marketplace deployment
+#   registry: ""
+#   repository: ""
+#   tag: ""
 #   pullPolicy: IfNotPresent
 
-nodeSelector:
-  iam.gke.io/gke-metadata-server-enabled: "true"
-  cloud.google.com/gke-ephemeral-storage-local-ssd: "true"
-  node_pool: "xtdb-pool"
+# Use this one for local development
+image:
+  registry: "us-central1-docker.pkg.dev"
+  repository: "bcs-test-450214/xtdb-repo/xtdb"
+  tag: "1.0.0"
+  pullPolicy: IfNotPresent
+
+nodeSelector: {}  # Empty map = no restrictions
 
 tolerations: []
 
@@ -24,13 +23,13 @@ affinity: {}
 
 resources:
   limits:
-    cpu: "1000m"
-    memory: "10G"
-    ephemeral-storage: 100Gi
+    cpu: 1000m
+    memory: 10Gi
+    ephemeral-storage: 12Gi
   requests:
-    cpu: "750m"
-    memory: "10G"
-    ephemeral-storage: 100Gi
+    cpu: 750m
+    memory: 10Gi
+    ephemeral-storage: 10Gi
 
 securityContext:
   allowPrivilegeEscalation: false
@@ -63,25 +62,6 @@ xtdbConfig:
   # The !Env values are set by Environment Variables set on the XTDB statefulset pods.
   # See the XTDB configuration documentation for options: https://docs.xtdb.com/ops/config.html
 
-
-
-
-
-  
-  # nodeConfig: |-
-  #   server:
-  #     port: 5432
-
-  #   # log: !Kafka
-  #   #   bootstrapServers: !Env KAFKA_BOOTSTRAP_SERVERS
-  #   #   topic: !Env KAFKA_LOG_TOPIC
-
-
-
-
-
-
-
   nodeConfig: |-
     server:
       port: 5432
@@ -102,7 +82,7 @@ xtdbConfig:
 
   # Volume size settings for XTDB Local Disk Cache (uses ephemeral storage)
   localDiskCache:
-    sizeLimit: "50Gi"
+    sizeLimit: 8Gi  # Keep this below ephemeral-storage request
 
   # Extra Env:
   env:

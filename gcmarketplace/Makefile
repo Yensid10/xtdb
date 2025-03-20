@@ -71,12 +71,6 @@ APP_PARAMETERS ?= { \
   "xtdbConfig.kafkaLogTopic": "xtdb-log" \
 }
 
-  # Commented out for the sake of JSON formatting
-  # "nodeCount": 3, \
-
-  # "tls.enabled": true, \
-  # "tls.keystorePassword": "auto-generate", \
-
 # Build and deployment targets
 .PHONY: setup-vpc setup-service-account setup-bucket setup-infra setup-namespace setup-workload-identity generate-tls build-xtdb-image build-deployer push-deployer update-deps deploy verify clean cleanup-deployment cleanup-infra cleanup-all setup-all
 
@@ -192,19 +186,7 @@ push-deployer:
 	docker push $(REGISTRY)/xtdb/deployer:$(XTDB_TAG)
 
 # 11. Setup workload identity
-workload-identity:
-# @echo "Creating image pull secret..."
-# kubectl create secret docker-registry gcr-json-key \
-# 	--docker-server=us-central1-docker.pkg.dev \
-# 	--docker-username=oauth2accesstoken \
-# 	--docker-password="$(shell gcloud auth print-access-token)" \
-# 	--namespace $(NAMESPACE) || true
-
-# @echo "Patching service account..." 
-# kubectl patch serviceaccount xtdb-service-account \
-# 	--namespace $(NAMESPACE) \
-# 	-p '{"imagePullSecrets": [{"name": "gcr-json-key"}]}'
-	
+workload-identity:	
 	@echo "Setting up workload identity before deployment..."
 	gcloud iam service-accounts add-iam-policy-binding \
 		xtdb-service-account@$(PROJECT_ID).iam.gserviceaccount.com \
@@ -222,7 +204,9 @@ deploy:
 	@echo "Deploying XTDB..."
 	kubectl apply -f "https://raw.githubusercontent.com/GoogleCloudPlatform/marketplace-k8s-app-tools/master/crd/app-crd.yaml"
 	mpdev install --deployer=$(REGISTRY)/xtdb/deployer:$(XTDB_TAG) \
-		--parameters='$(APP_PARAMETERS)'
+		--parameters='$(APP_PARAMETERS)' 
+	@echo "Waiting for 30 seconds to allow XTDB to initialise..."
+	@sleep 30
 
 # 13. Verify deployment
 verify:
@@ -262,7 +246,7 @@ cleanup-infra:
 setup-initial: setup-vpc setup-service-account setup-bucket setup-infra
 
 # Setup deployment (infrastructure + deployment)
-setup-deployment: setup-namespace generate-tls update-deps build-deployer push-deployer deploy verify
+setup-deployment: setup-namespace generate-tls update-deps build-deployer push-deployer workload-identity deploy verify
 
 # Complete setup (infrastructure + deployment) in chronological order
 setup-all: setup-initial setup-deployment

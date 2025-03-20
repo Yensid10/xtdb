@@ -180,7 +180,7 @@ install-xtdb:
 	@export PROJECT_ID=$$(cat .project_id); \
 	export STORAGE_BUCKET=$$(cat .storage_bucket); \
 	helm install xtdb-google-cloud $(HELM_CHART_PATH) --version $(HELM_CHART_VERSION) --namespace $(NAMESPACE) --set xtdbConfig.serviceAccount=$(SERVICE_ACCOUNT) --set xtdbConfig.gcpProjectId=$$PROJECT_ID --set xtdbConfig.gcpBucket=$$STORAGE_BUCKET
-	@echo "Waiting for 1 minute to allow XTDB to initialize..."
+	@echo "Waiting for 1 minute to allow XTDB to initialise..."
 	@sleep 90
 
 #	6. Remove temporary files
