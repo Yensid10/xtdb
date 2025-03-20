@@ -38,7 +38,7 @@ spec:
             sizeLimit: {{ .Values.xtdbConfig.localDiskCache.sizeLimit }}
       containers:
         - name: xtdb
-          image: "ghcr.io/xtdb/xtdb:latest"  # The official XTDB image
+          image: "ghcr.io/xtdb/xtdb-google-cloud:latest"  # Changed from xtdb to xtdb-google-cloud
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: ['-f', '/var/lib/xtdb-config/xtdbconfig.yaml']
           volumeMounts:
@@ -59,7 +59,7 @@ spec:
                 fieldRef:
                   fieldPath: metadata.name
             - name: KAFKA_BOOTSTRAP_SERVERS
-              value: {{ required "xtdbConfig.kafkaBootstrapServers is required." .Values.xtdbConfig.kafkaBootstrapServers }}
+              value: "xtdb-kubernetes-deployment-kafka.xtdb-deployment.svc.cluster.local:9092"
             - name: KAFKA_LOG_TOPIC
               value: {{ required "xtdbConfig.kafkaLogTopic is required." .Values.xtdbConfig.kafkaLogTopic }}
             - name: GCP_PROJECT_ID

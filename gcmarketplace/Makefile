@@ -60,14 +60,14 @@ APP_PARAMETERS ?= { \
   "namespace": "$(NAMESPACE)", \
   "xtdb.serviceAccount": "xtdb-service-account", \
   "xtdbConfig.gcpProjectId": "$(PROJECT_ID)", \
-  "xtdbConfig.gcpBucket": "$(PROJECT_ID)-xtdb-storage-bucket", \
+	"xtdbConfig.gcpBucket": "xtdb-storage-$(PROJECT_ID)", \
   "xtdb.adminPassword": "auto-generate", \
   "xtdb.persistence.size": "50Gi", \
   "kafka.enabled": true, \
   "kafka.replicaCount": 3, \
   "kafka.persistence.size": "20Gi", \
   "kafka.zookeeper.replicaCount": 3, \
-  "xtdbConfig.kafkaBootstrapServers": "kafka.$(NAMESPACE).svc.cluster.local:9092", \
+  "xtdbConfig.kafkaBootstrapServers": "xtdb-kubernetes-deployment-kafka.$(NAMESPACE).svc.cluster.local:9092", \
   "xtdbConfig.kafkaLogTopic": "xtdb-log" \
 }
 
@@ -212,9 +212,18 @@ deploy:
 verify:
 	@echo "Verifying XTDB deployment..."
 	kubectl get pods -n $(NAMESPACE)
-	kubectl get services -n $(NAMESPACE)
-# @echo "XTDB should be accessible at:"
-# @kubectl get service xtdb-service -n $(NAMESPACE) -o jsonpath="{.status.loadBalancer.ingress[0].ip}:{.spec.ports[0].port}" || echo "Service not available yet"
+	kubectl get svc xtdb-service -n xtdb-deployment
+
+connect:
+	@echo "Connecting to XTDB..."
+	@XTDB_IP=$$(kubectl get svc xtdb-service --namespace $(NAMESPACE) -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "pending"); \
+	if [ "$$XTDB_IP" = "pending" ]; then \
+		echo "XTDB service IP is still pending. Please try again later."; \
+	else \
+		echo "XTDB is available at: $$XTDB_IP:5432"; \
+		echo "Connection string: psql \"host=$$XTDB_IP port=5432 user=xtdb\""; \
+		psql "host=$$XTDB_IP port=5432 user=xtdb"; \
+	fi
 
 # =============================================
 # Cleanup Operations (in reverse order)
