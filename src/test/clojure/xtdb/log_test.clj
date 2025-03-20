@@ -76,17 +76,6 @@
 (t/deftest can-write-tx-to-arrow-ipc-streaming-format
   (test-serialize-tx-ops (io/resource "xtdb/tx-log-test/can-write-tx.json") devices-docs))
 
-(t/deftest can-write-put-fns
-  (test-serialize-tx-ops (io/resource "xtdb/tx-log-test/can-write-put-fns.json")
-                         [[:put-fn :foo '(fn [id] [[:put-docs :foo {:xt/id id}]])]
-                          [:put-fn {:fn-id :bar, :valid-from #inst "2020"}
-                           '(fn [id] [[:put-docs :bar {:xt/id id}]])]]))
-
-(t/deftest can-write-tx-fn-calls
-  (test-serialize-tx-ops (io/resource "xtdb/tx-log-test/can-write-tx-fn-calls.json")
-                         [[:call :foo 12 nil :bar]
-                          [:call :foo2 "hello" "world"]]))
-
 (t/deftest can-write-docs-with-different-keys
   (test-serialize-tx-ops (io/resource "xtdb/tx-log-test/docs-with-different-keys.json")
                          [[:put-docs :foo {:xt/id :a, :a 1}]
@@ -106,16 +95,6 @@
 
                           [:sql "DELETE FROM foo FOR PORTION OF VALID_TIME FROM DATE '2023-01-01' TO DATE '2025-01-01' WHERE _id = ?"
                            [1]]]))
-
-(t/deftest can-write-xtql
-  (test-serialize-tx-ops (io/resource "xtdb/tx-log-test/can-write-xtdml.json")
-                         [[:update '{:table :users
-                                     :bind [{:xt/id $uid, :version v}]
-                                     :set {:v (inc v)}}
-                           {:uid :jms}]
-
-                          [:delete '{:from :users, :bind [{:xt/id $uid}]}
-                           {:uid :jms}]]))
 
 (t/deftest can-write-opts
   (test-serialize-tx-ops (io/resource "xtdb/tx-log-test/can-write-opts.json")

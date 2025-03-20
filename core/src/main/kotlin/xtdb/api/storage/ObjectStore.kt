@@ -1,5 +1,6 @@
 package xtdb.api.storage
 
+import xtdb.api.storage.Storage.STORAGE_ROOT
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
 import java.nio.file.Path
@@ -13,8 +14,8 @@ interface ObjectStore : AutoCloseable {
         fun throwMissingKey(k: Path): Nothing = error("Object '$k' doesn't exist")
     }
 
-    fun interface Factory {
-        fun openObjectStore(): ObjectStore
+    interface Factory {
+        fun openObjectStore(storageRoot: Path = STORAGE_ROOT): ObjectStore
     }
 
     data class StoredObject(val key: Path, val size: Long)

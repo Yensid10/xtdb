@@ -33,22 +33,18 @@ fun FieldType.copy(
     dictionary: DictionaryEncoding? = this.dictionary
 ) = FieldType(nullable, type, dictionary)
 
+@Suppress("UNCHECKED_CAST")
 sealed class Vector : VectorReader, VectorWriter {
 
     abstract override var name: String
-
-    final override var nullable
-        get() = fieldType.isNullable
-        set(value) {
-            fieldType = fieldType.copy(nullable = value)
-        }
-
-    abstract override var fieldType: FieldType; internal set
+    abstract override var nullable: Boolean
+    abstract val type: ArrowType
     abstract val children: Iterable<Vector>
 
+    final override val fieldType: FieldType get() = FieldType(nullable, type, null)
     final override val field: Field get() = Field(name, fieldType, children.map { it.field })
 
-    override var valueCount: Int = 0; internal set
+    abstract override var valueCount: Int; internal set
 
     internal abstract fun getObject0(idx: Int, keyFn: IKeyFn<*>): Any
     override fun getObject(idx: Int, keyFn: IKeyFn<*>) = if (isNull(idx)) null else getObject0(idx, keyFn)
@@ -67,6 +63,8 @@ sealed class Vector : VectorReader, VectorWriter {
     final override fun hashCode(idx: Int, hasher: Hasher) =
         if (isNull(idx)) ArrowBufPointer.NULL_HASH_CODE else hashCode0(idx, hasher)
 
+    abstract fun openSlice(al: BufferAllocator): Vector
+
     internal abstract fun unloadPage(nodes: MutableList<ArrowFieldNode>, buffers: MutableList<ArrowBuf>)
     internal abstract fun loadPage(nodes: MutableList<ArrowFieldNode>, buffers: MutableList<ArrowBuf>)
     internal abstract fun loadFromArrow(vec: ValueVector)
@@ -74,6 +72,12 @@ sealed class Vector : VectorReader, VectorWriter {
     override val asList get() = (0 until valueCount).map { getObject(it) }
 
     override fun toString() = VectorReader.toString(this)
+
+    fun <T, S> fold(init: T, op: (T, S) -> T): T {
+        var acc: T =  init
+        for (i in 0 until valueCount) acc = op(acc, getObject(i) as S)
+        return acc
+    }
 
     companion object {
         @JvmStatic
@@ -108,7 +112,7 @@ sealed class Vector : VectorReader, VectorWriter {
 
                 override fun visit(type: Union) = when (type.mode!!) {
                     UnionMode.Sparse -> TODO("Not yet implemented")
-                    UnionMode.Dense -> DenseUnionVector(al, name, field.children.map { fromField(al, it) })
+                    UnionMode.Dense -> DenseUnionVector(al, name, field.children.map { fromField(al, it) }, 0)
                 }
 
                 override fun visit(type: ArrowType.Map): MapVector {

@@ -1,13 +1,17 @@
 (ns xtdb.compactor-test
   (:require [clojure.java.io :as io]
+            [clojure.string :as str]
             [clojure.test :as t]
             [xtdb.api :as xt]
             [xtdb.compactor :as c]
             [xtdb.metadata :as meta]
             [xtdb.node :as xtn]
             [xtdb.object-store :as os]
+            [xtdb.table-catalog :as table-cat]
+            [xtdb.table-catalog-test :as table-test]
             [xtdb.test-json :as tj]
             [xtdb.test-util :as tu]
+            [xtdb.time :as time]
             [xtdb.trie :as trie]
             [xtdb.trie-catalog :as cat]
             [xtdb.util :as util])
@@ -15,6 +19,7 @@
            (xtdb BufferPool)
            xtdb.api.storage.Storage
            (xtdb.arrow RelationReader)
+           [xtdb.block.proto TableBlock]
            (xtdb.trie DataRel Trie)))
 
 (t/use-fixtures :each tu/with-allocator tu/with-node)
@@ -35,7 +40,8 @@
         (->> (into #{} (map (fn [job]
                               (-> job
                                   (update :part vec)
-                                  (dissoc :table-name)))))))))
+                                  (update :out-trie-key str)
+                                  (dissoc :table-name :partitioned-by-recency?)))))))))
 
 (t/deftest test-l0->l1-compaction-jobs
   (binding [cat/*file-size-target* 16]
@@ -147,7 +153,21 @@
                         ;; to mark the historical ones 'live'
                         ["l01-rc-b00" 0] ["l01-rc-b01" 0] ["l01-rc-b02" 0] ["l01-rc-b03" 0]))
 
-          "fewer than 4 L1H files take us over the limit, so we compact early")))
+          "fewer than 4 L1H files take us over the limit, so we compact early")
+
+    (t/is (= #{(job "l02-r20200102-b03" ["l02-r20200102-b00" "l01-r20200102-b01" "l01-r20200102-b02" "l01-r20200102-b03"] [])}
+             (calc-jobs ["l02-r20200101-b00" 3] ["l01-r20200101-b01" 3] ["l01-r20200101-b02" 3]
+                        ["l02-r20200102-b00" 3] ["l01-r20200102-b01" 3] ["l01-r20200102-b02" 3] ["l01-r20200102-b03" 3]
+                        ;; to mark the historical ones 'live'
+                        ["l01-rc-b00" 0] ["l01-rc-b01" 0] ["l01-rc-b02" 0] ["l01-rc-b03" 0]))
+          "include existing L2H")
+
+    (t/is (= #{(job "l02-r20200101-b02" ["l02-r20200101-b01" "l01-r20200101-b02"] [])}
+             (calc-jobs ["l02-r20200101-b01" 12] ["l01-r20200101-b02" 6] ["l01-r20200101-b03" 5]
+                        ;; to mark the historical ones 'live'
+                        ["l01-rc-b02" 0] ["l01-rc-b03" 0]))
+
+          "L2H + L1H take us over the limit, compact early")))
 
 (t/deftest test-l2+-compaction-jobs
   (binding [cat/*file-size-target* 16]
@@ -203,10 +223,10 @@
                             ["l03-r20200101-p1-b03"] ["l03-r20200101-p1-b07"] ["l03-r20200101-p1-b0b"]
 
                             ;; N.B. different recency in the first one
-                            ["l03-r20200102-p2-b03"] ["l03-r20200101-p2-b07"] ["l03-r20200101-p2-b0b"] ["l03-r20200101-p2-b0f"]
-                            )))))))
+                            ["l03-r20200102-p2-b03"] ["l03-r20200101-p2-b07"] ["l03-r20200101-p2-b0b"] ["l03-r20200101-p2-b0f"])))))))
 
-(defn tables-key ^String [table] (str "objects/" Storage/version "/tables/" table))
+
+(defn tables-key ^String [table] (str "objects/" Storage/STORAGE_ROOT "/tables/" table))
 
 (t/deftest test-l1-compaction
   (let [node-dir (util/->path "target/compactor/test-l1-compaction")]
@@ -249,6 +269,57 @@
           (tj/check-json (.toPath (io/as-file (io/resource "xtdb/compactor-test/test-l1-compaction")))
                          (.resolve node-dir (tables-key "public$foo")) #"l01-rc-(.+)\.arrow"))))))
 
+(t/deftest test-l1-compaction-by-recency
+  (let [node-dir (util/->path "target/compactor/test-l1-compaction-by-recency")]
+    (util/delete-dir node-dir)
+
+    (binding [c/*page-size* 32
+              cat/*file-size-target* (* 1024 16)
+              c/*ignore-signal-block?* true]
+      (util/with-open [node (tu/->local-node {:node-dir node-dir})]
+        (xt/execute-tx node [(into [:put-docs {:into :readings, :valid-from #inst "2020-01-01", :valid-to #inst "2020-01-05"}]
+                                   (for [x (range 100)]
+                                     {:xt/id x, :reading 8.3}))
+
+                             (into [:put-docs :prices]
+                                   (for [x (range 100)]
+                                     {:xt/id x, :price 12.4}))])
+
+        (t/is (= [{:row-count 100}] (xt/q node "SELECT COUNT(*) row_count FROM readings FOR ALL VALID_TIME")))
+        (t/is (= [{:row-count 100}] (xt/q node "SELECT COUNT(*) row_count FROM prices")))
+        (t/is (= [{:row-count 100}] (xt/q node "SELECT COUNT(*) row_count FROM prices FOR ALL VALID_TIME")))
+
+        (tu/finish-block! node)
+        (c/compact-all! node #xt/duration "PT1S")
+
+        (t/is (= [{:row-count 100}] (xt/q node "SELECT COUNT(*) row_count FROM readings FOR ALL VALID_TIME")))
+        (t/is (= [{:row-count 100}] (xt/q node "SELECT COUNT(*) row_count FROM prices")))
+        (t/is (= [{:row-count 100}] (xt/q node "SELECT COUNT(*) row_count FROM prices FOR ALL VALID_TIME")))
+
+        (xt/execute-tx node [(into [:put-docs {:into :readings, :valid-from #inst "2020-01-05", :valid-to #inst "2020-01-09"}]
+                                   (for [x (range 100)]
+                                     {:xt/id x, :reading 19.0}))
+
+                             (into [:put-docs :prices]
+                                   (for [x (range 100)]
+                                     {:xt/id x, :price 6.2}))])
+
+        (t/is (= [{:row-count 200}] (xt/q node "SELECT COUNT(*) row_count FROM readings FOR ALL VALID_TIME")))
+        (t/is (= [{:row-count 100}] (xt/q node "SELECT COUNT(*) row_count FROM prices")))
+        (t/is (= [{:row-count 200}] (xt/q node "SELECT COUNT(*) row_count FROM prices FOR ALL VALID_TIME")))
+
+        (tu/finish-block! node)
+        (c/compact-all! node #xt/duration "PT1S")
+
+        (t/is (= [{:row-count 200}] (xt/q node "SELECT COUNT(*) row_count FROM readings FOR ALL VALID_TIME")))
+        (t/is (= [{:row-count 200}] (xt/q node "SELECT COUNT(*) row_count FROM prices FOR ALL VALID_TIME")))
+
+        (tj/check-json (.toPath (io/as-file (io/resource "xtdb/compactor-test/test-l1-compaction-by-recency/readings")))
+                       (.resolve node-dir (tables-key "public$readings")) #"l01-(.+)\.arrow")
+
+        (tj/check-json (.toPath (io/as-file (io/resource "xtdb/compactor-test/test-l1-compaction-by-recency/prices")))
+                       (.resolve node-dir (tables-key "public$prices")) #"l01-(.+)\.arrow")))))
+
 (t/deftest test-l2+-compaction
   (let [node-dir (util/->path "target/compactor/test-l2+-compaction")]
     (util/delete-dir node-dir)
@@ -289,6 +360,36 @@
 
           (tj/check-json (.toPath (io/as-file (io/resource "xtdb/compactor-test/test-l2+-compaction")))
                          (.resolve node-dir (tables-key "public$foo")) #"l(?!00|01)\d\d-(.+)\.arrow"))))))
+
+(t/deftest test-l2+-compaction-by-recency
+  (let [node-dir (util/->path "target/compactor/test-l2+-compaction-by-recency")]
+    (util/delete-dir node-dir)
+
+    (binding [c/*page-size* 32
+              cat/*file-size-target* (* 1024 16)
+              c/*ignore-signal-block?* true]
+      (util/with-open [node (tu/->local-node {:node-dir node-dir, :rows-per-block 120})]
+        (doseq [tick (range 25)
+                batch (->> (range 100)
+                           (partition-all 64))
+                :let [tick-at (-> (time/->zdt #inst "2020-01-01") (.plusHours (* tick 12)))]]
+          (xt/execute-tx node [(into [:put-docs {:into :readings, :valid-from tick-at, :valid-to (.plusHours tick-at 12)}]
+                                     (for [x batch]
+                                       {:xt/id x, :reading tick}))
+
+                               (into [:put-docs {:into :prices, :valid-from tick-at}]
+                                     (for [x batch]
+                                       {:xt/id x, :price tick}))]
+
+                         {:system-time tick-at}))
+
+        (c/compact-all! node #xt/duration "PT1S")
+
+        (tj/check-json (.toPath (io/as-file (io/resource "xtdb/compactor-test/test-l2+-compaction-by-recency/readings")))
+                       (.resolve node-dir (tables-key "public$readings")) #"l(?!00|01)(.+)\.arrow")
+
+        (tj/check-json (.toPath (io/as-file (io/resource "xtdb/compactor-test/test-l2+-compaction-by-recency/prices")))
+                       (.resolve node-dir (tables-key "public$prices")) #"l(?!00|01)(.+)\.arrow")))))
 
 (t/deftest test-no-empty-pages-3580
   (let [node-dir (util/->path "target/compactor/test-badly-distributed")]
@@ -423,7 +524,7 @@
         (tu/finish-block! node)
         (c/compact-all! node #xt/duration "PT0.5S")
 
-        (xt/execute-tx node [[:erase {:from :foo :bind [{:xt/id id}]}]])
+        (xt/execute-tx node [["ERASE FROM foo WHERE _id = ?" id]])
         (tu/finish-block! node)
         (c/compact-all! node #xt/duration "PT0.5S")
 
@@ -433,7 +534,7 @@
         (xt/execute-tx node [[:put-docs :foo {:xt/id id}]])
 
         (t/testing "an id where there is no previous data shouldn't show up in the compacted files"
-          (xt/execute-tx node [[:erase {:from :foo :bind [{:xt/id #uuid "20000000-0000-0000-0000-000000000000"}]}]]))
+          (xt/execute-tx node [["ERASE FROM foo WHERE _id = ?" #uuid "20000000-0000-0000-0000-000000000000"]]))
 
         (tu/finish-block! node)
         (c/compact-all! node #xt/duration "PT0.5S")
@@ -444,3 +545,58 @@
       (tj/check-json (.toPath (io/as-file (io/resource "xtdb/compactor-test/compaction-with-erase")))
                      (.resolve node-dir (tables-key "public$foo")) #"l01-rc-(.+)\.arrow"))))
 
+(t/deftest compactor-trie-metadata
+  (let [node-dir (util/->path "target/compactor/compactor-metadata-test")]
+    (util/delete-dir node-dir)
+
+    (with-open [node (tu/->local-node {:node-dir node-dir, :compactor-threads 1})]
+      (let [^BufferPool bp (tu/component node :xtdb/buffer-pool)]
+        (xt/execute-tx node [[:put-docs {:into :foo
+                                         :valid-from #xt/instant "2010-01-01T00:00:00Z"
+                                         :valid-to #xt/instant "2011-01-01T00:00:00Z"}
+                              {:xt/id 1}]])
+        (tu/finish-block! node)
+
+        (xt/execute-tx node [[:put-docs {:into :foo
+                                         :valid-from #xt/instant "2015-01-01T00:00:00Z"
+                                         :valid-to #xt/instant "2016-01-01T00:00:00Z"}
+                              {:xt/id 2}]])
+        (tu/finish-block! node)
+
+        (c/compact-all! node)
+        ;; to artifically create a new table block
+        (tu/finish-block! node)
+
+
+        (t/is (= (os/->StoredObject "tables/public$foo/blocks/b02.binpb" 4858)
+                 (last (.listAllObjects bp (table-cat/->table-block-dir "public/foo")))))
+
+        (let [current-tries (->> (.getByteArray bp (util/->path "tables/public$foo/blocks/b02.binpb"))
+                                 TableBlock/parseFrom
+                                 table-cat/<-table-block
+                                 :current-tries
+                                 (into #{} (map table-test/trie-details->edn)))]
+          (t/is (= #{"l00-rc-b00" "l01-r20110103-b00" "l01-rc-b00" "l00-rc-b01" "l01-r20160104-b01" "l01-rc-b01"}
+                   (into #{} (map :trie-key) current-tries)))
+
+          (t/is (= {"l01-rc-b00" nil,
+                    "l01-r20110103-b00" {:min-valid-from #xt/instant "2010-01-01T00:00:00Z",
+                                         :max-valid-from #xt/instant "2010-01-01T00:00:00Z",
+                                         :min-valid-to #xt/instant "2011-01-01T00:00:00Z",
+                                         :max-valid-to #xt/instant "2011-01-01T00:00:00Z",
+                                         :min-system-from #xt/instant "2020-01-01T00:00:00Z",
+                                         :max-system-from #xt/instant "2020-01-01T00:00:00Z",
+                                         :row-count 1},
+                    "l01-rc-b01" nil,
+                    "l01-r20160104-b01" {:min-valid-from #xt/instant "2015-01-01T00:00:00Z",
+                                         :max-valid-from #xt/instant "2015-01-01T00:00:00Z",
+                                         :min-valid-to #xt/instant "2016-01-01T00:00:00Z",
+                                         :max-valid-to #xt/instant "2016-01-01T00:00:00Z",
+                                         :min-system-from #xt/instant "2020-01-02T00:00:00Z",
+                                         :max-system-from #xt/instant "2020-01-02T00:00:00Z",
+                                         :row-count 1}}
+                   (->> current-tries
+                        (filter #(str/starts-with? (:trie-key %) "l01"))
+                        (into {} (map (juxt :trie-key
+                                            (fn [{:keys [trie-metadata]}]
+                                              (dissoc trie-metadata :iid-bloom)))))))))))))

@@ -4,7 +4,6 @@ import clojure.lang.Keyword
 import org.apache.arrow.memory.ArrowBuf
 import org.apache.arrow.memory.BufferAllocator
 import org.apache.arrow.memory.util.ByteFunctionHelpers
-import org.apache.arrow.memory.util.hash.ArrowBufHasher
 import org.apache.arrow.vector.BitVectorHelper.getValidityBufferSize
 import org.apache.arrow.vector.ValueVector
 import org.apache.arrow.vector.complex.NonNullableStructVector
@@ -23,18 +22,12 @@ internal val STRUCT_TYPE = ArrowType.Struct.INSTANCE
 
 class StructVector(
     private val allocator: BufferAllocator,
-    override var name: String,
-    override var fieldType: FieldType,
-    private val childWriters: SequencedMap<String, Vector>,
+    override var name: String, override var nullable: Boolean,
+    private val childWriters: SequencedMap<String, Vector> = LinkedHashMap(),
+    override var valueCount: Int = 0,
 ) : Vector() {
 
-    constructor(
-        allocator: BufferAllocator,
-        name: String,
-        nullable: Boolean,
-        childrenByKey: SequencedMap<String, Vector> = LinkedHashMap()
-    )
-            : this(allocator, name, FieldType(nullable, STRUCT_TYPE, null), childrenByKey)
+    override val type: ArrowType = STRUCT_TYPE
 
     override val children: Iterable<Vector> get() = childWriters.sequencedValues()
 
@@ -170,6 +163,13 @@ class StructVector(
 
         valueCount = valCount
     }
+
+    override fun openSlice(al: BufferAllocator) =
+        StructVector(
+            al, name, nullable,
+            childWriters.entries.associateTo(LinkedHashMap()) { it.key to it.value.openSlice(al) },
+            valueCount
+        )
 
     override fun clear() {
         validityBuffer.clear()

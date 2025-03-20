@@ -20,6 +20,7 @@
            (org.apache.arrow.memory BufferAllocator)
            (xtdb.api IndexerConfig TransactionKey)
            (xtdb.api.log Log Log$Message$TriesAdded)
+           xtdb.api.storage.Storage
            xtdb.BufferPool
            xtdb.catalog.BlockCatalog
            (xtdb.indexer LiveIndex$Tx LiveIndex$Watermark LiveTable LiveTable$Tx LiveTable$Watermark Watermark)
@@ -152,7 +153,9 @@
                                               [table-name {:fields (.getFields finished-block)
                                                            :trie-key (.getTrieKey finished-block)
                                                            :row-count (.getRowCount finished-block)
-                                                           :data-file-size (.getDataFileSize finished-block)}])
+                                                           :data-file-size (.getDataFileSize finished-block)
+                                                           :trie-metadata (.getTrieMetadata finished-block)
+                                                           :hlls (.getHllDeltas finished-block)}])
                                             (catch InterruptedException e
                                               (throw e))
                                             (catch Exception e
@@ -166,19 +169,19 @@
                                                           (catch Exception _
                                                             (throw (.exception ^StructuredTaskScope$Subtask %)))))))
                                    (util/rethrowing-cause))]
-            (let [added-tries (for [[table-name {:keys [trie-key data-file-size]}] table-metadata]
-                                (trie/->trie-details table-name trie-key data-file-size))]
+            (let [added-tries (for [[table-name {:keys [trie-key data-file-size trie-metadata]}] table-metadata]
+                                (trie/->trie-details table-name trie-key data-file-size trie-metadata))]
               (.addTries trie-cat added-tries)
-              @(.appendMessage log (Log$Message$TriesAdded. added-tries)))
+              (.appendMessage log (Log$Message$TriesAdded. Storage/VERSION added-tries)))
 
             (let [all-tables (set (concat (keys table-metadata) (.getAllTableNames block-cat)))
-                  table->current-tries (->> all-tables
-                                            (map (fn [table-name]
-                                                   (MapEntry/create table-name (->> (trie-cat/trie-state trie-cat table-name)
-                                                                                    trie-cat/all-tries))))
-                                            (into {}))
+                  table->all-tries (->> all-tables
+                                        (map (fn [table-name]
+                                               (MapEntry/create table-name (->> (trie-cat/trie-state trie-cat table-name)
+                                                                                trie-cat/all-tries))))
+                                        (into {}))
                   table-block-paths (table-cat/finish-block! table-cat block-idx table-metadata
-                                                             table->current-tries)]
+                                                             table->all-tries)]
               (.finishBlock block-cat block-idx latest-completed-tx table-block-paths)))))
 
       (.nextBlock row-counter)
@@ -209,15 +212,14 @@
         (defonce -log-skip-txs-once
           (log/info "All XTDB_SKIP_TXS have been skipped and block has been finished - it is safe to remove the XTDB_SKIP_TXS environment variable.")))))
 
-  (forceFlush [this record msg]
+  (forceFlush [this msg msg-id msg-timestamp]
     (let [expected-last-block-tx-id (.getExpectedBlockTxId msg)
           latest-block-tx-id (some-> latest-completed-block-tx (.getTxId))]
       (when (= (or latest-block-tx-id -1) expected-last-block-tx-id)
         (.finishBlock this)))
 
     (set! (.latest-completed-tx this)
-          (serde/->TxKey (.getLogOffset record)
-                         (.getLogTimestamp record))))
+          (serde/->TxKey msg-id msg-timestamp)))
 
   AutoCloseable
   (close [_]
@@ -249,7 +251,7 @@
                      latest-completed-tx latest-completed-tx
                      tables
 
-                     (Watermark. nil (open-live-idx-wm tables) (->schema nil table-cat))
+                     (Watermark. latest-completed-tx (open-live-idx-wm tables) (->schema nil table-cat))
                      (StampedLock.)
                      (RefCounter.)
 

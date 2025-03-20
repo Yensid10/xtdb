@@ -5,11 +5,11 @@ import org.apache.arrow.memory.BufferAllocator
 import org.apache.arrow.vector.VectorSchemaRoot
 import org.apache.arrow.vector.types.pojo.Field
 import org.apache.arrow.vector.types.pojo.Schema
+import xtdb.arrow.Relation
 import xtdb.types.Fields
 import xtdb.types.NamelessField
 import xtdb.types.NamelessField.Companion.nullable
 import xtdb.types.Schema
-import xtdb.types.asPair
 import xtdb.util.StringUtil.asLexHex
 import xtdb.util.StringUtil.fromLexHex
 import xtdb.util.asPath
@@ -29,7 +29,7 @@ typealias ColumnName = String
 typealias TrieKey = String
 
 object Trie {
-    private val RECENCY_FMT = DateTimeFormatterBuilder().appendPattern("yyyyMMdd").toFormatter()
+    internal val RECENCY_FMT = DateTimeFormatterBuilder().appendPattern("yyyyMMdd").toFormatter()
 
     data class Key(val level: Level, val recency: LocalDate?, val part: ByteArrayList?, val blockIndex: BlockIndex) {
         override fun toString() = buildString {
@@ -103,10 +103,6 @@ object Trie {
         "nodes" to Fields.Union(
             "nil" to Fields.NULL,
             "branch-iid" to Fields.List(nullable(Fields.I32)),
-            "branch-recency" to Fields.Map(
-                "recency" to Fields.TEMPORAL,
-                "idx" to nullable(Fields.I32),
-            ),
             "leaf" to Fields.Struct(
                 "data-page-idx" to Fields.I32,
                 "columns" to metadataField

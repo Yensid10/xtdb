@@ -5,27 +5,26 @@ import org.apache.arrow.vector.types.pojo.ArrowType
 import org.apache.arrow.vector.types.pojo.Field
 import xtdb.BufferPool
 import xtdb.api.TransactionKey
+import xtdb.arrow.VectorReader
+import xtdb.indexer.LiveTable.LiveTrieFactory
+import xtdb.log.proto.TrieMetadata
 import xtdb.time.InstantUtil.asMicros
 import xtdb.trie.*
 import xtdb.types.Fields
-import xtdb.util.RowCounter
-import xtdb.util.closeAllOnCatch
-import xtdb.util.openSlice
-import xtdb.util.useAll
+import xtdb.util.*
 import xtdb.vector.*
 import java.nio.ByteBuffer
 import kotlin.Long.Companion.MAX_VALUE as MAX_LONG
 import kotlin.Long.Companion.MIN_VALUE as MIN_LONG
 
 class LiveTable
-@JvmOverloads constructor(
+@JvmOverloads
+constructor(
     al: BufferAllocator, bp: BufferPool,
     private val tableName: TableName,
     private val rowCounter: RowCounter,
     liveTrieFactory: LiveTrieFactory = LiveTrieFactory { MemoryHashTrie.emptyTrie(it) }
 ) : AutoCloseable {
-
-    private val trieWriter = TrieWriter(al, bp, false)
 
     @FunctionalInterface
     fun interface LiveTrieFactory {
@@ -39,12 +38,21 @@ class LiveTable
     private val validFromWtr = liveRelation.colWriter("_valid_from")
     private val validToWtr = liveRelation.colWriter("_valid_to")
 
+    var liveTrie: MemoryHashTrie = liveTrieFactory(iidWtr.vector.asReader)
+
+    private val iidRdr = iidWtr.asReader
+
     private val opWtr = liveRelation.colWriter("op")
     private val putWtr = opWtr.legWriter("put")
     private val deleteWtr = opWtr.legWriter("delete")
     private val eraseWtr = opWtr.legWriter("erase")
 
-    var liveTrie: MemoryHashTrie = liveTrieFactory(iidWtr.vector.asReader)
+    private val trieWriter = TrieWriter(al, bp, false)
+    private val trieMetadataCalculator = TrieMetadataCalculator(
+        VectorReader.from(iidRdr), validFromWtr.asReader, validToWtr.asReader, systemFromWtr.asReader
+    )
+
+    private val hllCalculator = HllCalculator()
 
     class Watermark(
         val columnFields: Map<String, Field>,
@@ -68,6 +76,8 @@ class LiveTable
         fun openWatermark(): Watermark = openWatermark(transientTrie)
         val docWriter: IVectorWriter = putWtr
         val liveRelation: IRelationWriter = this@LiveTable.liveRelation
+
+        private val startPos = liveRelation.writerPosition().position
 
         fun logPut(iid: ByteBuffer, validFrom: Long, validTo: Long, writeDocFun: Runnable) {
             val pos = liveRelation.writerPosition().position
@@ -113,7 +123,15 @@ class LiveTable
             rowCounter.addRows(1)
         }
 
-        fun commit() = this@LiveTable.also { it.liveTrie = transientTrie }
+        fun commit(): LiveTable {
+            val pos = liveRelation.writerPosition().position
+            trieMetadataCalculator.update(startPos, pos)
+            hllCalculator.update(putWtr.asReader, startPos, pos)
+
+            liveTrie = transientTrie
+
+            return this@LiveTable
+        }
 
         fun abort() {
             if (newLiveTable) this@LiveTable.close()
@@ -151,10 +169,12 @@ class LiveTable
     fun openWatermark() = openWatermark(liveTrie)
 
     data class FinishedBlock(
-        val fields: Map<String, Field>,
+        val fields: Map<ColumnName, Field>,
         val trieKey: TrieKey,
         val dataFileSize: FileSize,
-        val rowCount: Int
+        val rowCount: Int,
+        val trieMetadata: TrieMetadata,
+        val hllDeltas: Map<ColumnName, HLL>
     )
 
     fun finishBlock(blockIdx: BlockIndex): FinishedBlock? {
@@ -165,7 +185,10 @@ class LiveTable
 
         return liveRelation.openAsRelation().useAll { dataRel ->
             val dataFileSize = trieWriter.writeLiveTrie(tableName, trieKey, liveTrie, dataRel)
-            FinishedBlock(liveRelation.fields, trieKey, dataFileSize, rowCount)
+            FinishedBlock(
+                liveRelation.fields, trieKey, dataFileSize, rowCount,
+                trieMetadataCalculator.build(), hllCalculator.build()
+            )
         }
     }
 

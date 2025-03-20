@@ -1,6 +1,7 @@
 package xtdb.arrow
 
 import org.apache.arrow.memory.ArrowBuf
+import org.apache.arrow.memory.BufferAllocator
 import org.apache.arrow.vector.ValueVector
 import org.apache.arrow.vector.ipc.message.ArrowFieldNode
 import org.apache.arrow.vector.types.pojo.ArrowType
@@ -16,10 +17,12 @@ class MapVector(private val listVector: ListVector, private val keysSorted: Bool
             listVector.name = value
         }
 
-    override var fieldType: FieldType
-        get() = listVector.fieldType.copy(type = ArrowType.Map(keysSorted))
+    override val type = ArrowType.Map(keysSorted)
+
+    override var nullable: Boolean
+        get() = listVector.nullable
         set(value) {
-            listVector.fieldType = value.copy(type = listVector.fieldType.type)
+            listVector.nullable = value
         }
 
     override val children get() = listVector.children
@@ -100,6 +103,8 @@ class MapVector(private val listVector: ListVector, private val keysSorted: Bool
         listVector.loadPage(nodes, buffers)
 
     override fun loadFromArrow(vec: ValueVector) = listVector.loadFromArrow(vec)
+
+    override fun openSlice(al: BufferAllocator) = MapVector(listVector.openSlice(al), keysSorted)
 
     override fun clear() = listVector.clear()
     override fun close() = listVector.close()

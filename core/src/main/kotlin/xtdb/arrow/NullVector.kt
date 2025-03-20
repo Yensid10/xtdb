@@ -1,19 +1,24 @@
 package xtdb.arrow
 
 import org.apache.arrow.memory.ArrowBuf
+import org.apache.arrow.memory.BufferAllocator
 import org.apache.arrow.vector.ValueVector
 import org.apache.arrow.vector.ipc.message.ArrowFieldNode
 import org.apache.arrow.vector.types.pojo.ArrowType
-import org.apache.arrow.vector.types.pojo.FieldType
 import xtdb.api.query.IKeyFn
 import xtdb.util.Hasher
 import org.apache.arrow.vector.NullVector as ArrowNullVector
 
 internal val NULL_TYPE = ArrowType.Null.INSTANCE
 
-class NullVector(override var name: String) : Vector() {
-    override var fieldType: FieldType = FieldType.nullable(NULL_TYPE)
+class NullVector(override var name: String, override var valueCount: Int = 0) : Vector() {
     override val children = emptyList<Vector>()
+
+    override var nullable: Boolean
+        get() = true
+        set(_) {}
+
+    override val type: ArrowType = NULL_TYPE
 
     override fun isNull(idx: Int) = true
 
@@ -67,4 +72,5 @@ class NullVector(override var name: String) : Vector() {
     override fun close() {
     }
 
+    override fun openSlice(al: BufferAllocator) = NullVector(name)
 }

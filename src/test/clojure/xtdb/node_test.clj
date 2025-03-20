@@ -4,6 +4,7 @@
             [clojure.test :as t :refer [deftest]]
             [next.jdbc :as jdbc]
             [xtdb.api :as xt]
+            [xtdb.compactor :as c]
             [xtdb.logging :as logging]
             [xtdb.node :as xtn]
             [xtdb.node.impl] ;;TODO probably move internal methods to main node interface
@@ -383,13 +384,8 @@ VALUES(1, OBJECT (foo: OBJECT(bibble: true), bar: OBJECT(baz: 1001)))"]])
              (xt/execute-tx tu/*node* [[:put-docs :docs {:xt/id :bar}]])))
 
     (t/is (= (serde/->tx-aborted 3 #xt/instant "2020-01-04T00:00:00Z"
-                                 #xt/runtime-err [:xtdb.call/error-evaluating-tx-fn
-                                                  "Runtime error: 'xtdb.call/error-evaluating-tx-fn'"
-                                                  {:fn-id :tx-fn-fail, :args []}])
-             (-> (xt/execute-tx tu/*node* [[:put-fn :tx-fn-fail
-                                            '(fn []
-                                               (throw (Exception. "boom")))]
-                                           [:call :tx-fn-fail]])
+                                 #xt/runtime-err [:xtdb/assert-failed "Assert failed" {}])
+             (-> (xt/execute-tx tu/*node* ["ASSERT 1 = 2"])
 
                  ;; can't compare `:cause`, because Exceptions are identity-equal
                  (update :error (comp read-string pr-str)))))
@@ -408,7 +404,7 @@ VALUES(1, OBJECT (foo: OBJECT(bibble: true), bar: OBJECT(baz: 1001)))"]])
 
     (t/is (thrown-with-msg?
            RuntimeException
-           #"xtdb\.call/error-evaluating-tx-fn"
+           #"Assert failed"
 
            (throw (-> (xt/q tu/*node*
                             '(from :xt/txs [{:xt/id $tx-id, :error err}])
@@ -679,31 +675,6 @@ VALUES(1, OBJECT (foo: OBJECT(bibble: true), bar: OBJECT(baz: 1001)))"]])
         (t/is (= [{:e :foo, :inst (time/->zdt #inst "2021")}]
                  (xt/q node '(from :docs [{:xt/id e} inst]))))))))
 
-(deftest assert-exists-on-empty-tables-3061
-  (t/is (= (serde/->tx-aborted 0 #xt/instant "2020-01-01T00:00:00Z"
-                                 #xt/runtime-err [:xtdb/assert-failed "Assert failed" {}])
-           (xt/execute-tx tu/*node* [[:assert-exists '(from :users [{:xt/id :john}])]])))
-
-  (t/is (= [{:xt/id 0, :committed? false,
-             :error #xt/runtime-err [:xtdb/assert-failed "Assert failed" {}]}]
-           (xt/q tu/*node*
-                 '(from :xt/txs [xt/id {:committed committed?} error])))
-
-        "assert fails on empty table")
-
-  (t/is (= (serde/->tx-aborted 1 #xt/instant "2020-01-02T00:00:00Z"
-                               #xt/runtime-err [:xtdb/assert-failed "Assert failed" {}])
-
-           (xt/execute-tx tu/*node* [[:put-docs :users {:xt/id :not-john}]
-                                     [:assert-exists '(from :users [{:xt/id :john}])]])))
-
-  (t/is (= [{:xt/id 1,
-             :committed? false,
-             :error #xt/runtime-err [:xtdb/assert-failed "Assert failed" {}]}]
-           (xt/q tu/*node*
-                 '(from :xt/txs [{:xt/id 1, :committed committed?} xt/id error])))
-        "when the table has an (non-matching) entry the assert also fails"))
-
 (defn- random-maps [n]
   (let [nb-ks 5
         ks [:foo :bar :baz :toto :fufu]]
@@ -961,6 +932,48 @@ VALUES(1, OBJECT (foo: OBJECT(bibble: true), bar: OBJECT(baz: 1001)))"]])
             (t/is (= (set [{:xt/id :foo} {:xt/id :baz}])
                      (set (xt/q node "SELECT * from xt_docs"))))))))))
 
+
+(t/deftest test-skip-txes-latest-submitted-tx-id
+  (let [!skiptxid (atom nil)]
+    (util/with-tmp-dirs #{path}
+      (t/testing "node with no txes skipped:"
+        (with-open [node (xtn/start-node {:log [:local {:path (str path "/log")}]
+                                          :storage [:local {:path (str path "/storage")}]})]
+          (t/testing "Send two transactions"
+            (xt/execute-tx node [[:put-docs :xt_docs {:xt/id :foo}]])
+            (let [{:keys [tx-id]} (xt/execute-tx node [[:put-docs :xt_docs {:xt/id :bar}]])]
+              (reset! !skiptxid tx-id)))
+
+          (t/is (= @!skiptxid (:latest-submitted-tx-id (xt/status node))))
+          (t/is (= @!skiptxid (:tx-id (:latest-completed-tx (xt/status node)))))))
+
+      (t/testing "node with txs to skip"
+        (with-open [node (xtn/start-node {:log [:local {:path (str path "/log")}]
+                                          :storage [:local {:path (str path "/storage")}]
+                                          :indexer {:skip-txs [@!skiptxid]}
+                                          :compactor {:threads 0}})]
+          (t/testing "Can query one back out - skipped one"
+            (t/is (= (set [{:xt/id :foo}]) (set (xt/q node "SELECT * from xt_docs")))))
+          
+          (t/testing "Latest submitted tx id should be the one that was skipped" 
+            (t/is (= @!skiptxid (:tx-id (:latest-completed-tx (xt/status node))))))
+
+          ;; Call finish-block! to write files
+          (tu/finish-block! node)))
+
+      (t/testing "node can remove 'txs to skip' after block finished"
+        (with-open [node (xtn/start-node {:log [:local {:path (str path "/log")}]
+                                          :storage [:local {:path (str path "/storage")}]
+                                          :compactor {:threads 0}})]
+          
+          (t/testing "Latest submitted tx id should still be the one that was skipped" 
+            (t/is (= @!skiptxid (:tx-id (:latest-completed-tx (xt/status node))))))
+          
+          (t/testing "Can send a new transaction after skipping one"
+            (xt/execute-tx node [[:put-docs :xt_docs {:xt/id :baz}]])
+            (t/is (= (set [{:xt/id :foo} {:xt/id :baz}])
+                     (set (xt/q node "SELECT * from xt_docs"))))))))))
+
 (t/deftest null-to-duv-promotion-halts-ingestion-4153
   (xt/submit-tx tu/*node* ["INSERT INTO docs RECORDS {_id: 1, a: 1, b: 1.5}"])
   (xt/execute-tx tu/*node* ["INSERT INTO docs RECORDS {_id: 2, a: 2, b: 1}"])
@@ -1009,3 +1022,85 @@ VALUES(1, OBJECT (foo: OBJECT(bibble: true), bar: OBJECT(baz: 1001)))"]])
             {:xt/id 1, :a 1, :xt/valid-from (time/->zdt #inst "2025-01-01")}
             {:xt/id 2, :xt/valid-from (time/->zdt #inst "2000-01-01"), :xt/valid-to (time/->zdt #inst "2000-01-02")}]
            (xt/q tu/*node* "SELECT *, _valid_from, _valid_to FROM docs2 FOR ALL VALID_TIME ORDER BY _id, _valid_from"))))
+
+(t/deftest test-finish-block-bug
+  (util/with-tmp-dirs #{path}
+    (with-open [node (xtn/start-node {:log [:local {:path (.resolve path "log")}]
+                                      :storage [:local {:path (.resolve path "objects")}]
+                                      :compactor {:threads 0}})]
+      (xt/execute-tx node [[:put-docs :docs {:xt/id :foo}]])
+      (xt/execute-tx node [[:put-docs :docs {:xt/id :foo}]])
+      (xt/execute-tx node [[:put-docs :docs {:xt/id :foo}]])
+      (tu/finish-block! node)
+
+      (t/is (= [{:xt/id :foo}]
+               (xt/q node "SELECT * FROM docs"))))
+
+    (with-open [node (xtn/start-node {:log [:local {:path (.resolve path "log")}]
+                                      :storage [:local {:path (.resolve path "objects")}]
+                                      :compactor {:threads 0}})]
+
+      ;; FAILED - returned {:xt/id :foo} three times
+      (t/is (= [{:xt/id :foo}]
+               (xt/q node "SELECT * FROM docs")))
+
+      (xt/execute-tx node [[:put-docs :docs {:xt/id :foo}]])
+
+      ;; SUCCEEDED - returned {:xt/id :foo} once
+      (t/is (= [{:xt/id :foo}]
+               (xt/q node "SELECT * FROM docs"))))))
+
+(t/deftest ingestion-stopped-on-null-col-ref-4259
+  (t/is (false? (:committed? (xt/execute-tx tu/*node* ["INSERT INTO docs RECORDS {_id: \"1\"}"])))))
+
+(t/deftest test-field-mismatch-4271
+  (xt/execute-tx tu/*node* ["INSERT INTO docs RECORDS {_id: 1, a: 1.5}"])
+
+  (tu/finish-block! tu/*node*)
+
+  (xt/execute-tx tu/*node* ["INSERT INTO docs RECORDS {_id: 2, a: 3, b: [2, 3, 4], c: {d: 1}}"])
+
+  (xt/execute-tx tu/*node* ["UPDATE docs SET a = 'hello' WHERE _id = 1"])
+
+  (t/is (= [{:xt/id 1, :a 1.5,
+             :xt/valid-from (time/->zdt #inst "2020-01-01")
+             :xt/valid-to (time/->zdt #inst "2020-01-03")}
+            {:xt/id 1, :a "hello",
+             :xt/valid-from (time/->zdt #inst "2020-01-03")}
+            {:xt/id 2, :a 3, :b [2 3 4], :c {:d 1}
+             :xt/valid-from (time/->zdt #inst "2020-01-02")}]
+
+           (xt/q tu/*node* ["SELECT *, _valid_from, _valid_to
+                             FROM docs FOR ALL VALID_TIME
+                             ORDER BY _id, _valid_from"]))))
+
+(t/deftest pushdown-bloom-col-renaming-at-cursor-build-time-4279
+  (with-open [node (xtn/start-node)]
+    (xt/execute-tx node ["INSERT INTO foo (_id) VALUES ('foo1')"
+                         "INSERT INTO bar (_id, foo) VALUES ('bar1', 'foo1')"])
+    (tu/finish-block! node)
+
+    (c/compact-all! node)
+
+    (t/is (= [{:foo "foo1", :bar "bar1"}]
+             (tu/query-ra '[:project [{bar _id} {foo foo/_id}]
+                            [:semi-join [{_id vals/_column_1}]
+                             [:rename {bar/_id _id}
+                              [:join [{foo/_id bar/foo}]
+                               [:rename foo [:scan {:table public/foo} [_id]]]
+                               [:rename bar [:scan {:table public/bar} [_id foo]]]]]
+                             [:rename vals
+                              [:table [_column_1]
+                               [{:_column_1 "bar1"}]]]]]
+                          {:node node})))
+
+    (t/is (= [{:xt/id "bar1"}]
+             (xt/q node "FROM foo
+                         JOIN bar ON bar.foo = foo._id
+                         SELECT bar._id AS _id,
+                         WHERE _id IN ('bar1')")))))
+
+(t/deftest ^:integration log-backpressure-doesnt-halt-indexer-4285
+  (doseq [batch (partition-all 1000 (range 400000))]
+    (xt/submit-tx tu/*node* [(into [:put-docs :docs] (map (fn [idx] {:xt/id idx})) batch)]))
+  (t/is (= [{:v 1 }] (xt/q tu/*node* "SELECT 1 AS v"))))

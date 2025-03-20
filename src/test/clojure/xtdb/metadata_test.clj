@@ -14,8 +14,7 @@
             [xtdb.vector.writer :as vw])
   (:import (clojure.lang MapEntry)
            xtdb.api.storage.Storage
-           xtdb.trie.Trie
-           (xtdb.util TemporalBounds TemporalDimension)))
+           xtdb.trie.Trie))
 
 (t/use-fixtures :each tu/with-mock-clock tu/with-node)
 (t/use-fixtures :once tu/with-allocator)
@@ -170,9 +169,8 @@
         meta-file-path (Trie/metaFilePath "public$xt_docs" (trie/->l0-trie-key 0))]
     (util/with-open [page-metadata (.openPageMetadata metadata-mgr meta-file-path)]
       (let [sys-time-micros (time/instant->micros #xt/instant "2020-01-01T00:00:00.000000Z")
-            temporal-dimension (TemporalDimension. sys-time-micros Long/MAX_VALUE)
-            metadata-bounds (TemporalBounds. temporal-dimension temporal-dimension sys-time-micros)]
-        (t/is (= metadata-bounds (.temporalBounds page-metadata 0)))))))
+            temporal-metadata (tu/->temporal-metadata sys-time-micros Long/MAX_VALUE sys-time-micros sys-time-micros)]
+        (t/is (= temporal-metadata (.temporalMetadata page-metadata 0)))))))
 
 (t/deftest test-boolean-metadata
   (xt/submit-tx tu/*node* [[:put-docs :xt_docs {:xt/id 1 :boolean-or-int true}]])
@@ -217,7 +215,7 @@
             (util/with-open [page-metadata (.openPageMetadata metadata-mgr meta-file-path)]
               (tj/check-json (.toPath (io/as-file (io/resource "xtdb/metadata-test/set")))
 
-                             (.resolve node-dir (str "objects/" Storage/version "/tables/")))
+                             (.resolve node-dir (str "objects/" Storage/STORAGE_ROOT "/tables/")))
 
               (t/is (= #{"_iid" "_system_from" "_valid_from" "_valid_to"}
                        (.getColumnNames page-metadata))))))
@@ -227,7 +225,7 @@
             (util/with-open [page-metadata (.openPageMetadata metadata-mgr meta-file-path)]
               (tj/check-json (.toPath (io/as-file (io/resource "xtdb/metadata-test/set")))
 
-                             (.resolve node-dir (str "objects/" Storage/version "/tables/")))
+                             (.resolve node-dir (str "objects/" Storage/STORAGE_ROOT "/tables/")))
 
               (t/is (= #{"_iid" "_id" "_system_from" "_valid_from" "_valid_to" "colours" "utf8"}
                        (.getColumnNames page-metadata))))))))))
@@ -249,7 +247,7 @@
             meta-file-path (Trie/metaFilePath "public$xt_docs" (trie/->l1-trie-key nil 0))]
         (util/with-open [page-metadata (.openPageMetadata metadata-mgr meta-file-path)]
           (tj/check-json (.toPath (io/as-file (io/resource "xtdb/metadata-test/duration")))
-                         (.resolve node-dir (str "objects/" Storage/version "/tables/"))
+                         (.resolve node-dir (str "objects/" Storage/STORAGE_ROOT "/tables/"))
                          #"l01.*")
 
           (t/is (= #{"_iid" "_id" "_system_from" "_valid_from" "_valid_to" "duration"}

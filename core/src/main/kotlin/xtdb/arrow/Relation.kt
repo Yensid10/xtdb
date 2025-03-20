@@ -2,10 +2,12 @@ package xtdb.arrow
 
 import clojure.lang.PersistentHashMap
 import org.apache.arrow.flatbuf.Footer.getRootAsFooter
+import org.apache.arrow.flatbuf.MessageHeader
 import org.apache.arrow.memory.ArrowBuf
 import org.apache.arrow.memory.BufferAllocator
 import org.apache.arrow.vector.VectorLoader
 import org.apache.arrow.vector.VectorSchemaRoot
+import org.apache.arrow.vector.ipc.ReadChannel
 import org.apache.arrow.vector.ipc.SeekableReadChannel
 import org.apache.arrow.vector.ipc.WriteChannel
 import org.apache.arrow.vector.ipc.message.*
@@ -19,12 +21,10 @@ import xtdb.arrow.Relation.UnloadMode.FILE
 import xtdb.arrow.Relation.UnloadMode.STREAM
 import xtdb.arrow.Vector.Companion.fromField
 import xtdb.trie.FileSize
+import xtdb.types.NamelessField
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
-import java.nio.channels.Channels
-import java.nio.channels.ClosedByInterruptException
-import java.nio.channels.SeekableByteChannel
-import java.nio.channels.WritableByteChannel
+import java.nio.channels.*
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardOpenOption.READ
@@ -33,7 +33,7 @@ import xtdb.vector.RelationReader as OldRelationReader
 
 private val MAGIC = "ARROW1".toByteArray()
 
-class Relation(val vectors: SequencedMap<String, Vector>, override var rowCount: Int = 0) : RelationReader {
+class Relation(val vectors: SequencedMap<String, Vector>, override var rowCount: Int = 0) : RelationWriter<Vector> {
 
     override val schema get() = Schema(vectors.sequencedValues().map { it.field })
 
@@ -49,7 +49,13 @@ class Relation(val vectors: SequencedMap<String, Vector>, override var rowCount:
     constructor(allocator: BufferAllocator, fields: List<Field>, rowCount: Int = 0)
             : this(fields.map { fromField(allocator, it) }, rowCount)
 
-    fun endRow() =
+    @JvmOverloads
+    constructor(allocator: BufferAllocator, fields: SequencedMap<String, NamelessField>, rowCount: Int = 0)
+            : this(allocator, fields.map { (name, field) -> field.toArrowField(name) }, rowCount)
+
+    override operator fun get(colName: String): Vector = vectors[colName] ?: error("missing column: $colName")
+
+    override fun endRow() =
         (++rowCount).also { rowCount ->
             vectors.forEach { (_, vec) ->
                 repeat(rowCount - vec.valueCount) { vec.writeNull() }
@@ -58,18 +64,13 @@ class Relation(val vectors: SequencedMap<String, Vector>, override var rowCount:
 
     override fun iterator() = vectors.values.iterator()
 
-    fun rowCopier(rel: RelationReader): RowCopier {
+    override fun rowCopier(rel: RelationReader<*>): RowCopier {
         val copiers = rel.map { it.rowCopier(vectors[it.name] ?: error("missing ${it.name} vector")) }
 
         return RowCopier { srcIdx ->
             copiers.forEach { it.copyRow(srcIdx) }
             endRow()
         }
-    }
-
-    fun append(rel: RelationReader) {
-        val copier = rowCopier(rel)
-        repeat(rel.rowCount) { copier.copyRow(it) }
     }
 
     fun loadFromArrow(root: VectorSchemaRoot) {
@@ -171,6 +172,7 @@ class Relation(val vectors: SequencedMap<String, Vector>, override var rowCount:
             val baos = ByteArrayOutputStream()
             startUnload(Channels.newChannel(baos), STREAM).use { unl ->
                 unl.writePage()
+                unl.end()
             }
 
             return ByteBuffer.wrap(baos.toByteArray())
@@ -180,11 +182,39 @@ class Relation(val vectors: SequencedMap<String, Vector>, override var rowCount:
         val nodes = recordBatch.nodes.toMutableList()
         val buffers = recordBatch.buffers.toMutableList()
         vectors.values.forEach { it.loadPage(nodes, buffers) }
-
         require(nodes.isEmpty()) { "Unconsumed nodes: $nodes" }
         require(buffers.isEmpty()) { "Unconsumed buffers: $buffers" }
 
         rowCount = recordBatch.length
+    }
+
+    class StreamLoader(al: BufferAllocator, ch: ReadableByteChannel) : AutoCloseable {
+
+        private val reader = MessageChannelReader(ReadChannel(ch), al)
+
+        val schema: Schema
+
+        init {
+            val schemaMessage = (reader.readNext() ?: error("empty stream")).message
+            check(schemaMessage.headerType() == MessageHeader.Schema) { "expected schema message" }
+
+            schema = MessageSerializer.deserializeSchema(schemaMessage)
+        }
+
+        fun loadNextPage(rel: Relation): Boolean {
+            val msg = reader.readNext() ?: return false
+
+            msg.message.headerType().let {
+                check(it == MessageHeader.RecordBatch) { "unexpected Arrow message type: $it" }
+            }
+
+            MessageSerializer.deserializeRecordBatch(msg.message, msg.bodyBuffer)
+                .use { rel.load(it) }
+
+            return true
+        }
+
+        override fun close() = reader.close()
     }
 
     sealed class Loader : AutoCloseable {
@@ -247,7 +277,8 @@ class Relation(val vectors: SequencedMap<String, Vector>, override var rowCount:
 
             override fun load(rel: Relation) {
                 buf.arrowBufToRecordBatch(
-                    arrowBlock.offset, arrowBlock.metadataLength, arrowBlock.bodyLength, "Failed to deserialize record batch $idx, offset ${arrowBlock.offset}"
+                    arrowBlock.offset, arrowBlock.metadataLength, arrowBlock.bodyLength,
+                    "Failed to deserialize record batch $idx, offset ${arrowBlock.offset}"
                 ).use { rel.load(it) }
             }
         }
@@ -345,7 +376,7 @@ class Relation(val vectors: SequencedMap<String, Vector>, override var rowCount:
     /**
      * Resets the row count and all vectors, leaving the buffers allocated.
      */
-    fun clear() {
+    override fun clear() {
         vectors.forEach { (_, vec) -> vec.clear() }
         rowCount = 0
     }
@@ -353,28 +384,4 @@ class Relation(val vectors: SequencedMap<String, Vector>, override var rowCount:
     override fun close() {
         vectors.forEach { (_, vec) -> vec.close() }
     }
-
-    override operator fun get(colName: String) = vectors[colName]
-
-    @Suppress("unused")
-    @JvmOverloads
-    fun toTuples(keyFn: IKeyFn<*> = KEBAB_CASE_KEYWORD) =
-        (0..<rowCount).map { idx -> vectors.map { it.value.getObject(idx, keyFn) } }
-
-    @Suppress("unused")
-    @JvmOverloads
-    fun toMaps(keyFn: IKeyFn<*> = KEBAB_CASE_KEYWORD) =
-        (0..<rowCount).map { idx ->
-            PersistentHashMap.create(
-                vectors.entries.associate {
-                    Pair(
-                        keyFn.denormalize(it.key),
-                        it.value.getObject(idx, keyFn)
-                    )
-                }
-            ) as Map<*, *>
-        }
-
-    val oldRelReader: OldRelationReader
-        get() = OldRelationReader.from(vectors.sequencedValues().map(VectorReader.Companion::NewToOldAdapter), rowCount)
 }

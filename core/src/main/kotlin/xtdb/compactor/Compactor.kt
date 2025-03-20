@@ -11,9 +11,11 @@ import org.apache.arrow.memory.BufferAllocator
 import xtdb.BufferPool
 import xtdb.api.log.Log
 import xtdb.api.log.Log.Message.TriesAdded
+import xtdb.api.storage.Storage
 import xtdb.arrow.Relation
 import xtdb.compactor.PageTree.Companion.asTree
 import xtdb.log.proto.TrieDetails
+import xtdb.log.proto.TrieMetadata
 import xtdb.metadata.PageMetadata
 import xtdb.trie.*
 import xtdb.trie.ISegment.Segment
@@ -31,7 +33,8 @@ interface Compactor : AutoCloseable {
         val tableName: String
         val trieKeys: Set<TrieKey>
         val part: ByteArray
-        val outputTrieKey: TrieKey
+        val outputTrieKey: Trie.Key
+        val partitionedByRecency: Boolean
     }
 
     interface JobCalculator {
@@ -59,10 +62,11 @@ interface Compactor : AutoCloseable {
 
         }
 
-        private fun Job.trieDetails(dataFileSize: FileSize) =
+        private fun Job.trieDetails(trieKey: TrieKey, dataFileSize: FileSize, trieMetadata: TrieMetadata) =
             TrieDetails.newBuilder()
-                .setTableName(tableName).setTrieKey(outputTrieKey)
+                .setTableName(tableName).setTrieKey(trieKey)
                 .setDataFileSize(dataFileSize)
+                .setTrieMetadata(trieMetadata)
                 .build()
 
         private fun Job.execute(): List<TrieDetails> =
@@ -78,22 +82,31 @@ interface Compactor : AutoCloseable {
                         val segments = (pageMetadatas zip dataRels)
                             .map { (pageMetadata, dataRel) -> Segment(pageMetadata.trie, dataRel) }
 
-                        segMerge.mergeSegments(segments, part).use { mergeRes ->
-                            mergeRes.openForRead().use { mergeReadCh ->
-                                Relation.loader(al, mergeReadCh).use { loader ->
-                                    val dataFileSize =
-                                        trieWriter.writePageTree(
-                                            tableName, outputTrieKey,
-                                            loader, mergeRes.leaves.asTree,
-                                            pageSize
-                                        )
+                        val recencyPartitioning =
+                            if (partitionedByRecency) SegmentMerge.RecencyPartitioning.Partition
+                            else SegmentMerge.RecencyPartitioning.Preserve(outputTrieKey.recency)
 
-                                    LOGGER.debug("compacted '$tableName' -> '$outputTrieKey'")
+                        segMerge.mergeSegments(segments, part, recencyPartitioning)
+                            .useAll { mergeRes ->
+                                mergeRes.map {
+                                    it.openForRead().use { mergeReadCh ->
+                                        Relation.loader(al, mergeReadCh).use { loader ->
+                                            val trieKey = outputTrieKey.copy(recency = it.recency).toString()
 
-                                    listOf(trieDetails(dataFileSize))
+                                            val (dataFileSize, trieMetadata) =
+                                                trieWriter.writePageTree(
+                                                    tableName, trieKey,
+                                                    loader, it.leaves.asTree,
+                                                    pageSize
+                                                )
+
+                                            LOGGER.debug("compacted '$tableName' -> '$outputTrieKey'")
+
+                                            trieDetails(trieKey, dataFileSize, trieMetadata)
+                                        }
+                                    }
                                 }
                             }
-                        }
                     }
                 }
             } catch (e: ClosedByInterruptException) {
@@ -126,7 +139,8 @@ interface Compactor : AutoCloseable {
                 val doneCh = Channel<JobKey>()
 
                 while (true) {
-                    availableJobs = jobCalculator.availableJobs().associateBy { JobKey(it.tableName, it.outputTrieKey) }
+                    availableJobs =
+                        jobCalculator.availableJobs().associateBy { JobKey(it.tableName, it.outputTrieKey.toString()) }
 
                     if (availableJobs.isEmpty() && queuedJobs.isEmpty()) {
                         LOGGER.trace("sending idle")
@@ -144,7 +158,7 @@ interface Compactor : AutoCloseable {
                                     // add the trie to the catalog eagerly so that it's present
                                     // next time we run `availableJobs` (it's idempotent)
                                     trieCatalog.addTries(addedTries)
-                                    log.appendMessage(TriesAdded(addedTries)).await()
+                                    log.appendMessage(TriesAdded(Storage.VERSION, addedTries)).await()
                                 }
 
                                 doneCh.send(jobKey)

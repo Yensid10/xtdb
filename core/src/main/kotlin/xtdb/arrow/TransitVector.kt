@@ -2,6 +2,7 @@ package xtdb.arrow
 
 import clojure.lang.IFn
 import com.cognitect.transit.Reader
+import org.apache.arrow.memory.BufferAllocator
 import xtdb.api.query.IKeyFn
 import xtdb.types.ClojureForm
 import xtdb.util.requiringResolve
@@ -10,7 +11,9 @@ import java.io.ByteArrayInputStream
 
 private val TRANSIT_MSGPACK_READER: IFn = requiringResolve("xtdb.serde/transit-msgpack-reader")
 
-class TransitVector(override val inner: VarBinaryVector) : ExtensionVector(TransitType) {
+class TransitVector(override val inner: VarBinaryVector) : ExtensionVector() {
+
+    override val type = TransitType
 
     private fun transitReader(v: ByteArray): Reader = TRANSIT_MSGPACK_READER.invoke(ByteArrayInputStream(v)) as Reader
 
@@ -23,5 +26,7 @@ class TransitVector(override val inner: VarBinaryVector) : ExtensionVector(Trans
 
             else -> throw InvalidWriteObjectException(fieldType, value)
         }
+
+    override fun openSlice(al: BufferAllocator) = TransitVector(inner.openSlice(al))
 
 }

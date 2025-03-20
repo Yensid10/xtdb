@@ -2806,3 +2806,13 @@ UNION ALL
          IllegalArgumentException
          #"Duplicate column projection: a"
          (plan-sql "SELECT 1 AS a, 2 AS a" {}))))
+
+(t/deftest test-hashcode-for-tstzrange-4263
+  (t/is (= [{:p #xt/tstz-range [#xt/zoned-date-time "2024-01-01T00:00Z" #xt/zoned-date-time "2024-01-02T00:00Z"]}]
+           (xt/q tu/*node* "SELECT DISTINCT PERIOD(TIMESTAMP '2024-01-01Z', TIMESTAMP '2024-01-02Z') AS p;"))))
+
+(t/deftest patch-uuid-literal-id-4284
+  (xt/execute-tx tu/*node* ["PATCH INTO foo RECORDS {_id: UUID '2f64d726-b528-4897-b3b1-db41cd9e887b'}"])
+
+  (t/is (= [{:xt/id #uuid "2f64d726-b528-4897-b3b1-db41cd9e887b"}]
+           (xt/q tu/*node* "SELECT * FROM foo"))))

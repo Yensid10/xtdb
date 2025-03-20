@@ -16,12 +16,18 @@ internal fun TimeUnit.toDuration(value: Long): Duration = when (this) {
     NANOSECOND -> Duration.ofNanos(value)
 }
 
-class DurationVector(
-    allocator: BufferAllocator,
-    override var name: String,
-    nullable: Boolean,
-    val unit: TimeUnit = MICROSECOND
-) : FixedWidthVector(allocator, nullable, ArrowType.Duration(unit), Long.SIZE_BYTES) {
+class DurationVector private constructor(
+    override var name: String, override var nullable: Boolean, override var valueCount: Int,
+    val unit: TimeUnit = MICROSECOND,
+    override val validityBuffer: ExtensibleBuffer, override val dataBuffer: ExtensibleBuffer
+) : FixedWidthVector() {
+
+    override val byteWidth = Long.SIZE_BYTES
+    override val type = ArrowType.Duration(unit)
+
+    constructor(
+        al: BufferAllocator, name: String, nullable: Boolean, unit: TimeUnit
+    ) : this(name, nullable, 0, unit, ExtensibleBuffer(al), ExtensibleBuffer(al))
 
     override fun getLong(idx: Int) = getLong0(idx)
     override fun writeLong(value: Long) = writeLong0(value)
@@ -34,4 +40,7 @@ class DurationVector(
     }
 
     override fun hashCode0(idx: Int, hasher: Hasher) = hasher.hash(getLong(idx))
+
+    override fun openSlice(al: BufferAllocator) =
+        DurationVector(name, nullable, valueCount, unit, validityBuffer.openSlice(al), dataBuffer.openSlice(al))
 }

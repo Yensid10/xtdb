@@ -6,9 +6,7 @@
   (:import [java.io Writer]
            [java.nio ByteBuffer]
            [java.util List]
-           (xtdb.api.query Binding)
            (xtdb.api.tx TxOp TxOps)
-           xtdb.types.ClojureForm
            xtdb.util.NormalForm))
 
 (defmulti parse-tx-op
@@ -87,65 +85,8 @@
   (unparse-tx-op [_]
     (into [:erase-docs table-name] doc-ids)))
 
-(defrecord XtqlAndArgs [op arg-rows]
-  TxOp
-  Unparse
-  (unparse-tx-op [_]
-    (into (unparse-tx-op op) arg-rows)))
-
-(defrecord Insert [table query]
-  TxOp
-  Unparse
-  (unparse-tx-op [_]
-    [:insert-into table (xtql/unparse-query query)]))
-
-(defrecord Update [table for-valid-time bind-specs set-specs unify-clauses]
-  TxOp
-  Unparse
-  (unparse-tx-op [_]
-    [:update (cond-> {:table table
-                      :set (into {} (map xtql/unparse-col-spec) set-specs)}
-               for-valid-time (assoc :for-valid-time (xtql/unparse for-valid-time))
-               bind-specs (assoc :bind (mapv xtql/unparse-out-spec bind-specs))
-               unify-clauses (assoc :unify (mapv xtql/unparse-unify-clause unify-clauses)))]))
-
-(defrecord Delete [table for-valid-time bind-specs unify-clauses]
-  TxOp
-  Unparse
-  (unparse-tx-op [_]
-    [:delete (cond-> {:from table}
-               for-valid-time (assoc :for-valid-time (xtql/unparse for-valid-time))
-               bind-specs (assoc :bind (mapv xtql/unparse-out-spec bind-specs))
-               unify-clauses (assoc :unify (mapv xtql/unparse-unify-clause unify-clauses)))]))
-
-(defrecord Erase [table bind-specs unify-clauses]
-  TxOp
-  Unparse
-  (unparse-tx-op [_]
-    [:erase (cond-> {:from table}
-              bind-specs (assoc :bind (mapv xtql/unparse-out-spec bind-specs))
-              unify-clauses (assoc :unify (mapv xtql/unparse-unify-clause unify-clauses)))]))
-
-(defrecord AssertExists [query]
-  TxOp
-  Unparse
-  (unparse-tx-op [_]
-    [:assert-exists (xtql/unparse-query query)]))
-
-(defrecord AssertNotExists [query]
-  TxOp
-  Unparse
-  (unparse-tx-op [_]
-    [:assert-not-exists (xtql/unparse-query query)]) )
-
 (defrecord SqlByteArgs [sql ^ByteBuffer arg-bytes]
   TxOp)
-
-(defrecord Call [fn-id args]
-  TxOp
-  Unparse
-  (unparse-tx-op [_]
-    (into [:call fn-id] args)))
 
 (defrecord Abort []
   TxOp
@@ -204,24 +145,11 @@
                (some-> valid-from time/expect-instant)
                (some-> valid-to time/expect-instant))))
 
-(defn- expect-fn-id [fn-id]
-  (if-not (eid? fn-id)
-    (throw (err/illegal-arg :xtdb.tx/invalid-fn-id {::err/message "expected fn-id", :fn-id fn-id}))
-    fn-id))
-
-(defn- expect-tx-fn [tx-fn]
-  (or tx-fn
-      (throw (err/illegal-arg :xtdb.tx/invalid-tx-fn {::err/message "expected tx-fn", :tx-fn tx-fn}))))
-
-(defmethod parse-tx-op :put-fn [[_ id-or-opts tx-fn]]
-  (let [{:keys [fn-id valid-from valid-to]} (if (map? id-or-opts)
-                                              id-or-opts
-                                              {:fn-id id-or-opts})]
-    (->PutDocs "xt/tx_fns"
-               [{"_id" (expect-fn-id fn-id)
-                 "fn" (ClojureForm. (expect-tx-fn tx-fn))}]
-               (some-> valid-from time/expect-instant)
-               (some-> valid-to time/expect-instant))))
+(defmethod parse-tx-op :put-fn [_]
+  (throw (err/illegal-arg :xtdb/tx-fns-removed
+                          {::err/message (str/join ["tx-fns are no longer supported, as of 2.0.0-beta7. "
+                                                    "Please use ASSERTs and SQL DML statements instead - "
+                                                    "see the release notes for more information."])})))
 
 (defmethod parse-tx-op :patch-docs [[_ table-or-opts & docs]]
   (let [{table :into, :keys [valid-from valid-to]} (cond
@@ -235,47 +163,23 @@
                  (some-> valid-from time/expect-instant)
                  (some-> valid-to time/expect-instant))))
 
-(defmethod parse-tx-op :insert-into [[_ table query & arg-rows]]
-  (cond-> (->Insert (expect-table-name table)
-                    (xtql/parse-query query))
-    (seq arg-rows) (->XtqlAndArgs arg-rows)))
+(defmethod parse-tx-op :insert-into [_]
+  (throw (err/illegal-arg :xtdb/xtql-dml-removed
+                          {::err/message (str/join ["XTQL DML is no longer supported, as of 2.0.0-beta7. "
+                                                    "Please use SQL DML statements instead - "
+                                                    "see the release notes for more information."])})))
 
-(defmethod parse-tx-op :update [[_ opts & arg-rows :as this]]
-  (when-not (map? opts)
-    (throw (err/illegal-arg :xtql/malformed-opts
-                            {::err/message "expected map", :opts opts, :update this})))
+(defmethod parse-tx-op :update [_]
+  (throw (err/illegal-arg :xtdb/xtql-dml-removed
+                          {::err/message (str/join ["XTQL DML is no longer supported, as of 2.0.0-beta7. "
+                                                    "Please use SQL DML statements instead - "
+                                                    "see the release notes for more information."])})))
 
-  (let [{:keys [table for-valid-time bind unify], set-specs :set} opts]
-    (when-not (map? set-specs)
-      (throw (err/illegal-arg :xtql/malformed-set
-                              {:err/message "expected map", :set set-specs, :update this})))
-
-    (when-not (or (nil? bind) (vector? bind))
-      (throw (err/illegal-arg :xtql/malformed-bind
-                              {::err/message "expected nil or vector", :bind bind, :update this})))
-
-    (let [set-specs (xtql/parse-col-specs set-specs this)]
-      (when-let [forbidden-cols (not-empty (set (for [^Binding binding set-specs
-                                                      :let [binding-name (.getBinding binding)]
-                                                      :when (str/starts-with? (NormalForm/normalForm binding-name) "_")]
-                                                  binding-name)))]
-        (throw (err/illegal-arg :xtql/forbidden-set-cols
-                                {::err/message "Invalid set columns for update"
-                                 :cols forbidden-cols})))
-
-      (cond-> (->Update (expect-table-name table)
-                        (some-> for-valid-time (xtql/parse-temporal-filter :for-valid-time this))
-                        (some-> bind (xtql/parse-out-specs this))
-                        set-specs
-                        (some->> unify (mapv xtql/parse-unify-clause)))
-        (seq arg-rows) (->XtqlAndArgs arg-rows)))))
-
-(defmethod parse-tx-op :delete [[_ {table :from, :keys [for-valid-time bind unify]} & arg-rows :as this]]
-  (cond-> (->Delete (expect-table-name table)
-                    (some-> for-valid-time (xtql/parse-temporal-filter :for-valid-time this))
-                    (some-> bind (xtql/parse-out-specs this))
-                    (some->> unify (mapv xtql/parse-unify-clause)))
-    (seq arg-rows) (->XtqlAndArgs arg-rows)))
+(defmethod parse-tx-op :delete [_]
+  (throw (err/illegal-arg :xtdb/xtql-dml-removed
+                          {::err/message (str/join ["XTQL DML is no longer supported, as of 2.0.0-beta7. "
+                                                    "Please use SQL DML statements instead - "
+                                                    "see the release notes for more information."])})))
 
 (defmethod parse-tx-op :delete-docs [[_ table-or-opts & doc-ids]]
   (let [{table :from, :keys [valid-from valid-to]} (cond
@@ -285,25 +189,32 @@
                   (some-> valid-from time/expect-instant)
                   (some-> valid-to time/expect-instant))))
 
-(defmethod parse-tx-op :erase [[_ {table :from, :keys [bind unify]} & arg-rows :as this]]
-  (cond-> (->Erase (expect-table-name table)
-                   (some-> bind (xtql/parse-out-specs this))
-                   (some->> unify (mapv xtql/parse-unify-clause)))
-    (seq arg-rows) (->XtqlAndArgs arg-rows)))
+(defmethod parse-tx-op :erase [_]
+  (throw (err/illegal-arg :xtdb/xtql-dml-removed
+                          {::err/message (str/join ["XTQL DML is no longer supported, as of 2.0.0-beta7. "
+                                                    "Please use SQL DML statements instead - "
+                                                    "see the release notes for more information."])})))
 
 (defmethod parse-tx-op :erase-docs [[_ table & doc-ids]]
   (->EraseDocs (expect-table-name table) (mapv expect-eid doc-ids)))
 
-(defmethod parse-tx-op :assert-exists [[_ query & arg-rows]]
-  (cond-> (->AssertExists (xtql/parse-query query))
-    (seq arg-rows) (->XtqlAndArgs arg-rows)))
+(defmethod parse-tx-op :assert-exists [_]
+  (throw (err/illegal-arg :xtdb/xtql-dml-removed
+                          {::err/message (str/join ["XTQL DML is no longer supported, as of 2.0.0-beta7. "
+                                                    "Please use SQL DML statements instead - "
+                                                    "see the release notes for more information."])})))
 
-(defmethod parse-tx-op :assert-not-exists [[_ query & arg-rows]]
-  (cond-> (->AssertNotExists (xtql/parse-query query))
-    (seq arg-rows) (->XtqlAndArgs arg-rows)))
+(defmethod parse-tx-op :assert-not-exists [_]
+  (throw (err/illegal-arg :xtdb/xtql-dml-removed
+                          {::err/message (str/join ["XTQL DML is no longer supported, as of 2.0.0-beta7. "
+                                                    "Please use SQL DML statements instead - "
+                                                    "see the release notes for more information."])})))
 
-(defmethod parse-tx-op :call [[_ f & args]]
-  (->Call (expect-fn-id f) (or args [])))
+(defmethod parse-tx-op :call [_]
+  (throw (err/illegal-arg :xtdb/tx-fns-removed
+                          {::err/message (str/join ["tx-fns are no longer supported, as of 2.0.0-beta7. "
+                                                    "Please use ASSERTs and SQL DML statements instead - "
+                                                    "see the release notes for more information."])})))
 
 (defmethod parse-tx-op :abort [_] abort)
 

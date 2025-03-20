@@ -50,7 +50,8 @@
            (xtdb.trie Trie)
            xtdb.types.ZonedDateTimeRange
            (xtdb.util RefCounter RowCounter TemporalBounds TemporalDimension)
-           (xtdb.vector IVectorReader RelationReader)))
+           (xtdb.vector IVectorReader RelationReader)
+           (xtdb.log.proto TemporalMetadata TemporalMetadata$Builder)))
 
 #_{:clj-kondo/ignore [:uninitialized-var]}
 (def ^:dynamic ^org.apache.arrow.memory.BufferAllocator *allocator*)
@@ -351,15 +352,26 @@
            ~@body)))
     `(do ~@body)))
 
-(defn ->min-max-page-bounds
-  ([min max] (->min-max-page-bounds min max min))
-  ([vf-min vt-max sf-min] (->min-max-page-bounds vf-min vt-max sf-min Long/MAX_VALUE sf-min))
-  ([vf-min vt-max sf-min st-max] (TemporalBounds. (TemporalDimension. vf-min vt-max) (TemporalDimension. sf-min st-max)))
-  ([vf-min vt-max sf-min st-max max-valid-from]
-   (TemporalBounds. (TemporalDimension. vf-min vt-max) (TemporalDimension. sf-min st-max) max-valid-from)))
+(defn ->temporal-bounds
+  ([min max] (->temporal-bounds min max min))
+  ([vf-min vt-max sf-min] (->temporal-bounds vf-min vt-max sf-min Long/MAX_VALUE))
+  ([vf-min vt-max sf-min st-max] (TemporalBounds. (TemporalDimension. vf-min vt-max) (TemporalDimension. sf-min st-max))))
 
-(defn ->page-bounds-fn [page-idx-pred->bounds]
-  (let [page-idx-pred->bounds (update-vals page-idx-pred->bounds #(apply ->min-max-page-bounds %))]
+(defn ->temporal-metadata
+  ([min max] (->temporal-metadata min max min))
+  ([vf-min vt-max sf-min] (->temporal-metadata vf-min vt-max sf-min sf-min))
+  ([vf-min vt-max sf-min sf-max]
+   (let [^TemporalMetadata$Builder builder (TemporalMetadata/newBuilder)]
+     (.setMinValidFrom builder vf-min)
+     (.setMaxValidFrom builder vf-min)
+     (.setMinValidTo builder vt-max)
+     (.setMaxValidTo builder vt-max)
+     (.setMinSystemFrom builder sf-min)
+     (.setMaxSystemFrom builder sf-max)
+     (.build builder))))
+
+(defn ->temporal-metadata-fn [page-idx-pred->bounds]
+  (let [page-idx-pred->bounds (update-vals page-idx-pred->bounds #(apply ->temporal-metadata %))]
     (fn page-bounds-fn [page-idx]
       (if-let [bounds (reduce-kv (fn [_ page-idx-pred bounds]
                                    (when (page-idx-pred page-idx)
@@ -375,10 +387,6 @@
           nil-wtr (.legWriter nodes-wtr "nil")
           iid-branch-wtr (.legWriter nodes-wtr "branch-iid")
           iid-branch-el-wtr (.elementWriter iid-branch-wtr)
-          recency-branch-wtr (.legWriter nodes-wtr "branch-recency")
-          recency-branch-el-wtr (.elementWriter recency-branch-wtr)
-          recency-wtr (.keyWriter recency-branch-el-wtr "recency")
-          recency-idx-wtr (.keyWriter recency-branch-el-wtr "idx")
 
           data-wtr (.legWriter nodes-wtr "leaf")
           data-page-idx-wtr (.keyWriter data-wtr "data-page-idx")
@@ -405,19 +413,7 @@
                                                   (if (= idx -1)
                                                     (.writeNull iid-branch-el-wtr)
                                                     (.writeInt iid-branch-el-wtr idx)))))
-                                    (.endList iid-branch-wtr))
-
-                  (map? paths) (let [!page-idxs (TreeMap.)]
-                                 (doseq [[recency child] paths]
-                                   (write-paths child)
-                                   (.put !page-idxs recency (dec (.getRowCount meta-rel))))
-
-                                 (doseq [[^long recency, ^long idx] !page-idxs]
-                                   (.writeLong recency-wtr recency)
-                                   (.writeInt recency-idx-wtr idx)
-                                   (.endStruct recency-branch-el-wtr))
-
-                                 (.endList recency-branch-wtr)))
+                                    (.endList iid-branch-wtr)))
 
                 (.endRow meta-rel))]
         (write-paths paths)))

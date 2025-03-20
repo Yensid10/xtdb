@@ -2,6 +2,9 @@ package xtdb.aws
 
 import org.junit.jupiter.api.Tag
 import xtdb.api.storage.ObjectStoreTest
+import xtdb.api.storage.Storage.STORAGE_ROOT
+import xtdb.api.storage.Storage.VERSION
+import xtdb.api.storage.Storage.storageRoot
 import xtdb.aws.S3.Companion.s3
 import java.lang.System.getProperty
 import java.nio.file.Path
@@ -14,5 +17,6 @@ open class S3Test : ObjectStoreTest() {
         protected val bucket: String = getProperty("xtdb.aws.s3-test.bucket") ?: "xtdb-object-store-iam-test"
     }
 
-    override fun openObjectStore(prefix: Path) = s3(bucket) { prefix(prefix) }.openObjectStore()
+    override fun openObjectStore(prefix: Path) =
+        s3(bucket).prefix(prefix).openObjectStore(STORAGE_ROOT)
 }

@@ -1,5 +1,6 @@
 package xtdb.arrow
 
+import org.apache.arrow.memory.BufferAllocator
 import org.apache.arrow.vector.types.TimeUnit.MICROSECOND
 import org.apache.arrow.vector.types.pojo.ArrowType.Timestamp
 import org.apache.arrow.vector.types.pojo.FieldType
@@ -8,7 +9,9 @@ import xtdb.types.ZonedDateTimeRange
 import xtdb.vector.extensions.TsTzRangeType
 import java.time.ZonedDateTime
 
-class TsTzRangeVector(override val inner: FixedSizeListVector) : ExtensionVector(TsTzRangeType) {
+class TsTzRangeVector(override val inner: FixedSizeListVector) : ExtensionVector() {
+    override val type = TsTzRangeType
+
     override fun getObject0(idx: Int, keyFn: IKeyFn<*>) =
         inner.elementReader().let {
             ZonedDateTimeRange(
@@ -28,4 +31,6 @@ class TsTzRangeVector(override val inner: FixedSizeListVector) : ExtensionVector
 
         else -> throw InvalidWriteObjectException(fieldType, value)
     }
+
+    override fun openSlice(al: BufferAllocator) = TsTzRangeVector(inner.openSlice(al))
 }

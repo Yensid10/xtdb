@@ -19,9 +19,15 @@ internal val UNION_TYPE = ArrowType.Union(Dense, null)
 
 class DenseUnionVector(
     private val allocator: BufferAllocator,
-    override var name: String,
-    legVectors: List<Vector>
+    override var name: String, legVectors: List<Vector>,
+    override var valueCount: Int = 0
 ) : Vector() {
+
+    override var nullable: Boolean
+        get() = false
+        set(_) { error("can't set DUV nullable") }
+
+    override val type = UNION_TYPE
 
     companion object {
         internal fun promote(al: BufferAllocator, vector: Vector, target: FieldType) =
@@ -29,7 +35,7 @@ class DenseUnionVector(
                 fromField(al, Field(vector.name, target, emptyList()))
                     .also { newVec -> repeat(vector.valueCount) { newVec.writeNull() } }
             else
-                DenseUnionVector(al, vector.name, listOf(vector))
+                DenseUnionVector(al, vector.name, listOf(vector), 0)
                     .apply {
                         vector.name = vector.fieldType.type.toLeg()
 
@@ -42,10 +48,6 @@ class DenseUnionVector(
     }
 
     private val legVectors = legVectors.toMutableList()
-
-    private val fieldType0 get() = FieldType(false, UNION_TYPE, null)
-
-    override var fieldType = fieldType0
 
     override val children: Iterable<Vector> get() = legVectors
 
@@ -202,7 +204,6 @@ class DenseUnionVector(
 
         val typeId = legVectors.size.toByte()
         val legVec = fromField(allocator, Field(name, fieldType, emptyList())).also { legVectors.add(it) }
-        this.fieldType = fieldType0
         return LegWriter(typeId, legVec)
     }
 
@@ -303,6 +304,9 @@ class DenseUnionVector(
 
         valueCount = vc
     }
+
+    override fun openSlice(al: BufferAllocator) =
+        DenseUnionVector(al, name, legVectors.map { it.openSlice(al) }, valueCount)
 
     override fun clear() {
         typeBuffer.clear()

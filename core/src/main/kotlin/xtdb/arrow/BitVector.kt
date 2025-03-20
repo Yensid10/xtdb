@@ -1,12 +1,22 @@
 package xtdb.arrow
 
 import org.apache.arrow.memory.BufferAllocator
+import org.apache.arrow.vector.types.pojo.ArrowType
 import xtdb.api.query.IKeyFn
 import xtdb.util.Hasher
 import org.apache.arrow.vector.types.pojo.ArrowType.Bool.INSTANCE as BIT_TYPE
 
-class BitVector(al: BufferAllocator, override var name: String, nullable: Boolean) :
-    FixedWidthVector(al, nullable, BIT_TYPE, 0) {
+class BitVector private constructor(
+    override var name: String, override var nullable: Boolean, override var valueCount: Int,
+    override val validityBuffer: ExtensibleBuffer, override val dataBuffer: ExtensibleBuffer
+) : FixedWidthVector() {
+
+    constructor(
+        al: BufferAllocator, name: String, nullable: Boolean
+    ) : this(name, nullable, 0, ExtensibleBuffer(al), ExtensibleBuffer(al))
+
+    override val byteWidth = 0
+    override val type: ArrowType = BIT_TYPE
 
     override fun getBoolean(idx: Int) = getBoolean0(idx)
     override fun writeBoolean(value: Boolean) = writeBoolean0(value)
@@ -25,4 +35,7 @@ class BitVector(al: BufferAllocator, override var name: String, nullable: Boolea
             if (src.nullable && !nullable) nullable = true
             valueCount.apply { if (src.isNull(srcIdx)) writeNull() else writeBoolean(src.getBoolean(srcIdx)) }
         }
+
+    override fun openSlice(al: BufferAllocator) =
+        BitVector(name, nullable, valueCount, validityBuffer.openSlice(al), dataBuffer.openSlice(al))
 }

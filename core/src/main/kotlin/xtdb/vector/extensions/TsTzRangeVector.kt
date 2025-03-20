@@ -24,9 +24,15 @@ class TsTzRangeVector(name: String, allocator: BufferAllocator, fieldType: Field
         )
     ) {
 
+    init {
+        require(fieldType.type is TsTzRangeType)
+    }
+
     companion object {
         private val elField =
             Field("\$data\$", FieldType.notNullable(Timestamp(MICROSECOND, "UTC")), null)
+
+        val tsTzRangeField = Field("tsTzRange", FieldType.nullable(TsTzRangeType), listOf(elField))
     }
 
     private fun Long.toZdt(): ZonedDateTime = EPOCH.plus(this, MICROS).atZone(UTC)

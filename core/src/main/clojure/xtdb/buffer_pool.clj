@@ -42,11 +42,6 @@
                      max-disk-cache-bytes (.maxDiskCacheBytes max-disk-cache-bytes)
                      max-disk-cache-percentage (.maxDiskCachePercentage max-disk-cache-percentage))))
 
-(defn open-vsr ^VectorSchemaRoot [^BufferPool bp ^Path path allocator]
-  (let [footer (.getFooter bp path)
-        schema (.getSchema footer)]
-    (VectorSchemaRoot/create schema allocator)))
-
 (defmethod xtn/apply-config! ::storage [config _ [tag opts]]
   (xtn/apply-config! config
                      (case tag
@@ -61,7 +56,7 @@
    :metrics-registry (ig/ref :xtdb.metrics/registry)})
 
 (defmethod ig/init-key :xtdb/buffer-pool [_ {:keys [allocator ^Storage$Factory factory, metrics-registry]}]
-  (.open factory allocator metrics-registry))
+  (.open factory allocator metrics-registry Storage/VERSION))
 
 (defmethod ig/halt-key! :xtdb/buffer-pool [_ ^BufferPool buffer-pool]
   (util/close buffer-pool))

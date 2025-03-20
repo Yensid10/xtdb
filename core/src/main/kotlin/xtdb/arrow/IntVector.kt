@@ -2,16 +2,22 @@ package xtdb.arrow
 
 import org.apache.arrow.memory.BufferAllocator
 import org.apache.arrow.vector.types.Types.MinorType
+import org.apache.arrow.vector.types.pojo.ArrowType
 import xtdb.api.query.IKeyFn
 import xtdb.util.Hasher
 
 internal val I32_TYPE = MinorType.INT.type
 
-class IntVector(
-    allocator: BufferAllocator,
-    override var name: String,
-    nullable: Boolean
-) : FixedWidthVector(allocator, nullable, I32_TYPE, Int.SIZE_BYTES) {
+class IntVector private constructor(
+    override var name: String, override var nullable: Boolean, override var valueCount: Int,
+    override val validityBuffer: ExtensibleBuffer, override val dataBuffer: ExtensibleBuffer
+) : FixedWidthVector() {
+
+    override val type: ArrowType = I32_TYPE
+    override val byteWidth = Int.SIZE_BYTES
+
+    constructor(al: BufferAllocator, name: String, nullable: Boolean)
+            : this(name, nullable, 0, ExtensibleBuffer(al), ExtensibleBuffer(al))
 
     override fun getInt(idx: Int) = getInt0(idx)
     override fun writeInt(value: Int) = writeInt0(value)
@@ -23,4 +29,7 @@ class IntVector(
     }
 
     override fun hashCode0(idx: Int, hasher: Hasher) = hasher.hash(getInt(idx).toDouble())
+
+    override fun openSlice(al: BufferAllocator) =
+        IntVector(name, nullable, valueCount, validityBuffer.openSlice(al), dataBuffer.openSlice(al))
 }

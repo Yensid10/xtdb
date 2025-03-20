@@ -5,9 +5,6 @@ import org.apache.arrow.vector.types.TimeUnit
 import org.apache.arrow.vector.types.TimeUnit.*
 import org.apache.arrow.vector.types.pojo.ArrowType
 import xtdb.api.query.IKeyFn
-import xtdb.time.microsToNanos
-import xtdb.time.millisToNanos
-import xtdb.time.secondsToNanos
 import xtdb.util.Hasher
 import java.time.*
 import java.time.ZoneOffset.UTC
@@ -21,12 +18,17 @@ private fun TimeUnit.toInstant(value: Long) = when (this) {
     NANOSECOND -> Instant.EPOCH.plusNanos(value)
 }
 
-class TimestampLocalVector(
-    al: BufferAllocator,
-    override var name: String,
-    nullable: Boolean,
-    val unit: TimeUnit = MICROSECOND,
-) : FixedWidthVector(al, nullable, ArrowType.Timestamp(unit, null), Long.SIZE_BYTES) {
+class TimestampLocalVector private constructor(
+    override var name: String, override var nullable: Boolean, val unit: TimeUnit = MICROSECOND,
+    override val validityBuffer: ExtensibleBuffer, override val dataBuffer: ExtensibleBuffer,
+    override var valueCount: Int
+) : FixedWidthVector() {
+
+    override val type = ArrowType.Timestamp(unit, null)
+    override val byteWidth = Long.SIZE_BYTES
+
+    constructor(al: BufferAllocator, name: String, nullable: Boolean, unit: TimeUnit) :
+            this(name, nullable, unit, ExtensibleBuffer(al), ExtensibleBuffer(al), 0)
 
     override fun getLong(idx: Int) = getLong0(idx)
     override fun writeLong(value: Long) = writeLong0(value)
@@ -42,21 +44,31 @@ class TimestampLocalVector(
     )
 
     override fun hashCode0(idx: Int, hasher: Hasher) =
-        hasher.hash(when (unit) {
-            SECOND -> getLong(idx) * 1_000_000_000L
-            MILLISECOND -> getLong(idx) * 1_000_000L
-            MICROSECOND ->  getLong(idx) * 1_000L
-            NANOSECOND -> getLong(idx)
-        })
+        hasher.hash(
+            when (unit) {
+                SECOND -> getLong(idx) * 1_000_000_000L
+                MILLISECOND -> getLong(idx) * 1_000_000L
+                MICROSECOND -> getLong(idx) * 1_000L
+                NANOSECOND -> getLong(idx)
+            }
+        )
+
+    override fun openSlice(al: BufferAllocator) =
+        TimestampLocalVector(name, nullable, unit, validityBuffer.openSlice(al), dataBuffer.openSlice(al), valueCount)
 }
 
-class TimestampTzVector(
-    al: BufferAllocator,
-    override var name: String,
-    nullable: Boolean,
-    val unit: TimeUnit = MICROSECOND,
-    val zone: ZoneId = UTC
-) : FixedWidthVector(al, nullable, ArrowType.Timestamp(unit, zone.toString()), Long.SIZE_BYTES) {
+class TimestampTzVector private constructor(
+    override var name: String, override var nullable: Boolean,
+    val unit: TimeUnit = MICROSECOND, val zone: ZoneId = UTC,
+    override val validityBuffer: ExtensibleBuffer, override val dataBuffer: ExtensibleBuffer,
+    override var valueCount: Int
+) : FixedWidthVector() {
+
+    override val type = ArrowType.Timestamp(unit, zone.toString())
+    override val byteWidth = Long.SIZE_BYTES
+
+    constructor(al: BufferAllocator, name: String, nullable: Boolean, unit: TimeUnit, zone: ZoneId)
+            : this(name, nullable, unit, zone, ExtensibleBuffer(al), ExtensibleBuffer(al), 0)
 
     override fun getLong(idx: Int) = getLong0(idx)
     override fun writeLong(value: Long) = writeLong0(value)
@@ -70,9 +82,11 @@ class TimestampTzVector(
             is ZonedDateTime ->
                 if (value.zone == zone) value.toInstant()
                 else throw InvalidWriteObjectException(fieldType, value)
+
             is OffsetDateTime ->
                 if (value.offset == zone) value.toInstant()
                 else throw InvalidWriteObjectException(fieldType, value)
+
             is Date -> value.toInstant()
             else -> throw InvalidWriteObjectException(fieldType, value)
         }.let {
@@ -80,10 +94,18 @@ class TimestampTzVector(
         }
 
     override fun hashCode0(idx: Int, hasher: Hasher) =
-        hasher.hash(when (unit) {
-            SECOND -> getLong(idx) * 1_000_000_000L
-            MILLISECOND -> getLong(idx) * 1_000_000L
-            MICROSECOND ->  getLong(idx) * 1_000L
-            NANOSECOND -> getLong(idx)
-        })
+        hasher.hash(
+            when (unit) {
+                SECOND -> getLong(idx) * 1_000_000_000L
+                MILLISECOND -> getLong(idx) * 1_000_000L
+                MICROSECOND -> getLong(idx) * 1_000L
+                NANOSECOND -> getLong(idx)
+            }
+        )
+
+    override fun openSlice(al: BufferAllocator) =
+        TimestampTzVector(
+            name, nullable, unit, zone, validityBuffer.openSlice(al),
+            dataBuffer.openSlice(al), valueCount
+        )
 }

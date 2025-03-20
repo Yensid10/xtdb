@@ -2,11 +2,21 @@ package xtdb.arrow
 
 import org.apache.arrow.memory.BufferAllocator
 import org.apache.arrow.vector.types.Types.MinorType
+import org.apache.arrow.vector.types.pojo.ArrowType
 import xtdb.api.query.IKeyFn
 import xtdb.util.Hasher
 
-class ByteVector(allocator: BufferAllocator, override var name: String, nullable: Boolean) :
-    FixedWidthVector(allocator, nullable, MinorType.TINYINT.type, Byte.SIZE_BYTES) {
+class ByteVector private constructor(
+    override var name: String, override var nullable: Boolean, override var valueCount: Int,
+    override val validityBuffer: ExtensibleBuffer, override val dataBuffer: ExtensibleBuffer
+) : FixedWidthVector() {
+
+    constructor(
+        al: BufferAllocator, name: String, nullable: Boolean
+    ) : this(name, nullable, 0, ExtensibleBuffer(al), ExtensibleBuffer(al))
+
+    override val byteWidth = Byte.SIZE_BYTES
+    override val type: ArrowType = MinorType.TINYINT.type
 
     override fun getByte(idx: Int) = getByte0(idx)
     override fun writeByte(value: Byte) = writeByte0(value)
@@ -27,4 +37,7 @@ class ByteVector(allocator: BufferAllocator, override var name: String, nullable
         }
 
     override fun hashCode0(idx: Int, hasher: Hasher) = hasher.hash(getByte(idx).toDouble())
+
+    override fun openSlice(al: BufferAllocator) =
+        ByteVector(name, nullable, valueCount, validityBuffer.openSlice(al), dataBuffer.openSlice(al))
 }
