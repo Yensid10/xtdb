@@ -36,11 +36,6 @@ properties:
     type: string
     x-google-marketplace:
       type: NAMESPACE
-  # Image properties are now managed by the marketplace
-  # The following properties will be generated automatically by the marketplace
-  # based on the configuration above under x-google-marketplace.images
-  
-  # XTDB specific properties
   xtdb.serviceAccount:
     type: string
     title: XTDB Service Account
@@ -48,22 +43,6 @@ properties:
       type: SERVICE_ACCOUNT
       serviceAccount:
         description: "Service account for XTDB."
-  xtdb.persistence.storageClass:
-    type: string
-    title: StorageClass
-    description: "StorageClass for XTDB persistent volumes. This determines the type of disk used for XTDB's local storage."
-    x-google-marketplace:
-      type: STORAGE_CLASS
-      storageClass:
-        type: SSD
-        annotation:
-          storageclass.kubernetes.io/is-default-class: "false"
-  xtdb.persistence.size:
-    type: string
-    title: Storage size for persistent volumes
-    default: "50Gi"
-    description: "XTDB local disk cache size. This determines how much local storage is allocated for XTDB's cache."
-    pattern: '^[1-9][0-9]*(\.[0-9]+)?[TGM]i?$'
   xtdb.adminPassword:
     type: string
     title: XTDB Admin Password
@@ -84,48 +63,6 @@ properties:
     description: The GCS bucket to be used for XTDB storage.
     x-google-marketplace:
       type: STRING
-  # Kafka configuration
-  kafka.enabled:
-    type: boolean
-    default: true
-    title: Enable Kafka
-    description: "Whether to deploy Kafka as part of the application"
-  
-  kafka.replicaCount:
-    type: integer
-    default: 3
-    minimum: 1
-    maximum: 7
-    title: Kafka Replica Count
-    description: "Number of Kafka replicas to deploy"
-  
-  kafka.persistence.size:
-    type: string
-    default: "20Gi"
-    title: Kafka Storage Size
-    description: "Size of persistent storage for each Kafka replica"
-    pattern: '^[1-9][0-9]*(\.[0-9]+)?[TGM]i?$'
-  
-  kafka.zookeeper.replicaCount:
-    type: integer
-    default: 3
-    minimum: 1
-    maximum: 7
-    title: Zookeeper Replica Count
-    description: "Number of Zookeeper replicas to deploy"
-    
-  # XTDB Kafka config
-  xtdbConfig.kafkaBootstrapServers:
-    type: string
-    default: "kafka.xtdb-deployment.svc.cluster.local:9092"
-    title: Kafka Bootstrap Servers
-    description: "The Kafka bootstrap servers connection string"
-    
-  xtdbConfig.kafkaLogTopic:
-    type: string
-    default: "xtdb-log"
-    title: Kafka Log Topic
-    description: "The Kafka topic to use for XTDB log storage"
 
 required:
   - name
@@ -134,5 +71,3 @@ required:
   - xtdbConfig.gcpProjectId
   - xtdbConfig.gcpBucket
   - xtdb.adminPassword
-  - xtdbConfig.kafkaBootstrapServers
-  - xtdbConfig.kafkaLogTopic
