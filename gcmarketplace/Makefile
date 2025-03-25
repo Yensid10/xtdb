@@ -2,21 +2,17 @@
 # Project Variables
 # =============================================
 
-CHART_NAME := xtdb
-APP_ID ?= $(CHART_NAME)
-
-TRACK ?= 1.0.0
 MARKETPLACE_TOOLS_TAG ?= 0.11.1
 
 # Define image tags
-XTDB_TAG ?= $(TRACK)
-KAFKA_TAG ?= 31.3.1
+XTDB_TAG ?=  1.0.0
+# KAFKA_TAG ?= 31.3.1
 
 # Define image sources
 PROJECT_ID ?= $(shell gcloud config get-value project)
 REGISTRY ?= us-central1-docker.pkg.dev/$(PROJECT_ID)/xtdb-repo
-IMAGE_XTDB ?= $(REGISTRY)/xtdb:$(XTDB_TAG)
-IMAGE_KAFKA ?= docker.io/bitnami/kafka:$(KAFKA_TAG)
+# IMAGE_XTDB ?= $(REGISTRY)/xtdb:$(XTDB_TAG)
+# IMAGE_KAFKA ?= docker.io/bitnami/kafka:$(KAFKA_TAG)
 
 # Deployment namespace
 NAMESPACE ?= xtdb-deployment
@@ -45,7 +41,7 @@ APP_PARAMETERS ?= { \
 }
 
 # Build and deployment targets
-.PHONY: setup-vpc setup-service-account setup-bucket setup-infra setup-namespace generate-tls update-deps build-deployer push-deployer workload-identity deploy verify connect cleanup-deployment cleanup-infra setup-initial setup-deployment setup-all reboot-deployment cleanup-all help
+.PHONY: setup-vpc setup-service-account setup-bucket setup-infra setup-namespace generate-tls update-deps build-deployer push-deployer workload-identity deploy verify mpdev-verify connect cleanup-deployment cleanup-infra setup-initial setup-deployment setup-all reboot-deployment cleanup-all help
 
 # =============================================
 # Infrastructure Setup (in chronological order)
@@ -258,6 +254,7 @@ help:
 	@echo "  push-deployer            Push the deployer image to registry"
 	@echo "  deploy                   Deploy XTDB to Kubernetes"
 	@echo "  verify                   Verify XTDB deployment status"
+	@echo "  mpdev-verify             Verify deployer using mpdev tools"
 	@echo "  connect                  Connect to XTDB instance via psql"
 	@echo "  setup-deployment         Run all deployment commands in sequence"
 	@echo ""
