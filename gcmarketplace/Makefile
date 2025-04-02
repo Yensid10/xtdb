@@ -6,13 +6,10 @@ MARKETPLACE_TOOLS_TAG ?= 0.11.1
 
 # Define image tags
 XTDB_TAG ?=  1.0.0
-# KAFKA_TAG ?= 31.3.1
 
 # Define image sources
 PROJECT_ID ?= $(shell gcloud config get-value project)
 REGISTRY ?= us-central1-docker.pkg.dev/$(PROJECT_ID)/xtdb-repo
-# IMAGE_XTDB ?= $(REGISTRY)/xtdb:$(XTDB_TAG)
-# IMAGE_KAFKA ?= docker.io/bitnami/kafka:$(KAFKA_TAG)
 
 # Deployment namespace
 NAMESPACE ?= xtdb-deployment
@@ -36,8 +33,7 @@ APP_PARAMETERS ?= { \
   "namespace": "$(NAMESPACE)", \
   "xtdb.serviceAccount": "xtdb-service-account", \
   "xtdbConfig.gcpProjectId": "$(PROJECT_ID)", \
-	"xtdbConfig.gcpBucket": "xtdb-storage-$(PROJECT_ID)", \
-  "xtdb.adminPassword": "auto-generate" \
+	"xtdbConfig.gcpBucket": "xtdb-storage-$(PROJECT_ID)" \
 }
 
 # Build and deployment targets
@@ -119,11 +115,6 @@ setup-namespace:
 # Application Build and Deployment
 # =============================================
 
-# 6. Generate TLS certificates if needed
-generate-tls:
-	@echo "Generating TLS certificates..."
-	# Add your TLS generation commands here if needed
-
 # 7. Update Helm dependencies
 update-deps:
 	@echo "Updating Helm dependencies..."
@@ -183,12 +174,6 @@ connect:
 		echo "Connection string: psql \"host=$$XTDB_IP port=5432 user=xtdb\""; \
 		psql "host=$$XTDB_IP port=5432 user=xtdb"; \
 	fi
-  
-# 14. mpdev verify
-mpdev-verify: build-deployer push-deployer
-	@echo "Verifying XTDB deployment status..."
-	mpdev verify --deployer=$(REGISTRY)/xtdb/deployer:$(XTDB_TAG) \
-		--parameters='$(APP_PARAMETERS)'
 
 # =============================================
 # Cleanup Operations (in reverse order)
@@ -221,6 +206,7 @@ setup-initial: setup-vpc setup-service-account setup-bucket setup-infra
 
 # Setup deployment (infrastructure + deployment)
 setup-deployment: setup-namespace generate-tls update-deps build-deployer push-deployer workload-identity deploy verify
+# 
 
 # Complete setup (infrastructure + deployment) in chronological order
 setup-all: setup-initial setup-deployment
@@ -248,7 +234,6 @@ help:
 	@echo "  setup-initial            Run all infrastructure setup commands in sequence"
 	@echo ""
 	@echo "Application Commands:"
-# @echo "  generate-tls             Generate TLS certificates if needed"
 	@echo "  update-deps              Update Helm dependencies"
 	@echo "  build-deployer           Build the XTDB deployer image"
 	@echo "  push-deployer            Push the deployer image to registry"
