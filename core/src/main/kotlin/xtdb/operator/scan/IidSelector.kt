@@ -4,7 +4,7 @@ import org.apache.arrow.memory.BufferAllocator
 import org.apache.arrow.memory.util.ArrowBufPointer
 import xtdb.arrow.ArrowUtil.openArrowBufView
 import xtdb.operator.SelectionSpec
-import xtdb.vector.RelationReader
+import xtdb.arrow.RelationReader
 import java.nio.ByteBuffer
 import java.util.stream.IntStream
 
@@ -19,8 +19,8 @@ class IidSelector(private val iid: ByteBuffer) : SelectionSpec {
         iid.openArrowBufView(allocator).use { iidBuf ->
             val iidPtr = ArrowBufPointer(iidBuf, 0, iid.capacity().toLong())
             val ptr = ArrowBufPointer()
-            val iidReader = readRelation.readerForName("_iid")
-            val valueCount = iidReader.valueCount()
+            val iidReader = readRelation["_iid"]
+            val valueCount = iidReader.valueCount
             if (valueCount == 0) return@use IntArray(0)
 
             var left = 0

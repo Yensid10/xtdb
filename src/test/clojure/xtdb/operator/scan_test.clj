@@ -11,7 +11,9 @@
             [xtdb.types :as types]
             [xtdb.util :as util]
             [xtdb.vector.writer :as vw])
-  (:import (java.util.function IntPredicate)
+  (:import java.util.Date
+           (java.util.function IntPredicate)
+           (xtdb.compactor RecencyPartition)
            xtdb.vector.RelationReader))
 
 (t/use-fixtures :each tu/with-mock-clock tu/with-allocator tu/with-node)
@@ -50,7 +52,7 @@
       (xt/execute-tx node
                      (for [i batch]
                        [:put-docs :xt_docs {:xt/id i}]))
-      (c/compact-all! node))
+      (c/compact-all! node #xt/duration "PT1S"))
 
     (t/is (= (set (for [i (range 110)] {:xt/id i}))
              (set (tu/query-ra '[:scan {:table public/xt_docs} [_id]]
@@ -547,7 +549,7 @@
                             [:put-docs :xt_docs {:xt/id uuid}]))
       (tu/finish-block! node)
 
-      (c/compact-all! node)
+      (c/compact-all! node #xt/duration "PT1S")
 
       (t/is (= [{:xt/id search-uuid}]
                (tu/query-ra [:scan '{:table public/xt_docs} [{'_id (list '= '_id search-uuid)}]]
@@ -568,7 +570,7 @@
   (xt/execute-tx tu/*node* [[:put-docs :xt-docs {:xt/id :toto, :col "toto"}]])
   (tu/finish-block! tu/*node*)
 
-  (c/compact-all! tu/*node*)
+  (c/compact-all! tu/*node* #xt/duration "PT1S")
 
   (let [!page-idxs-cnt (atom 0)
         old-filter-trie-match scan/filter-pushdown-bloom-page-idx-pred]
@@ -818,3 +820,78 @@
                            (tu/query-ra '[:scan {:table public/docs :for-valid-time [:between #inst "2026" #inst "2027"]}
                                           [_id _valid_from _valid_to]]
                                         (assoc query-opts :snapshot-time (:system-time tx-key3))))))))))))))
+
+(t/deftest ^:integration test-page-filtering
+  (doseq [bucketing  [RecencyPartition/WEEK RecencyPartition/YEAR]
+          clock-step [:second :year]]
+    (binding [c/*recency-partition* bucketing]
+      (util/with-open [n1 (xtn/start-node {:log [:in-memory {:instant-src (tu/->mock-clock (tu/->instants clock-step))}]})
+                       n2 (xtn/start-node {:log [:in-memory {:instant-src (tu/->mock-clock (tu/->instants clock-step))}]})]
+        (let [intervals (vec (for [dir [:normal :inverse]
+
+                                   ;; could add in some end-of-times here
+                                   [interval range1 range2] [["precedes" [#inst "2020" #inst "2021"] [#inst "2022" #inst "2023"]]
+                                                             ["meets" [#inst "2020" #inst "2021"], [#inst "2021" #inst "2022"]]
+                                                             ["overlaps" [#inst "2020" #inst "2022"], [#inst "2021" #inst "2023"]]
+                                                             ["starts" [#inst "2020" #inst "2022"], [#inst "2020" #inst "2023"]]
+                                                             ["during" [#inst "2020" #inst "2023"], [#inst "2021" #inst "2022"]]
+                                                             ["finishes" [#inst "2020" #inst "2022"], [#inst "2021" #inst "2022"]]
+                                                             ["equals" [#inst "2020" #inst "2022"], [#inst "2020" #inst "2022"]]]
+
+                                   :let [[range1 range2] (case dir
+                                                           :normal [range1 range2]
+                                                           :inverse [range2 range1])]]
+                               {:interval interval, :dir dir
+                                :range1 range1, :range2 range2}))
+
+              tx1 [(into [:put-docs :foo]
+                         (map-indexed (fn [idx {[vf vt] :range1}]
+                                        {:xt/id idx, :version 1
+                                         :xt/valid-from vf, :xt/valid-to vt}))
+                         intervals)]
+
+              tx2 [(into [:put-docs :foo]
+                         (map-indexed (fn [idx {[vf vt] :range2}]
+                                        {:xt/id idx, :version 2,
+                                         :xt/valid-from vf, :xt/valid-to vt}))
+                         intervals)]]
+
+          (xt/execute-tx n1 tx1)
+          (xt/execute-tx n2 tx1)
+          (tu/finish-block! n2)
+          (c/compact-all! n2 #xt/duration "PT2S")
+          (xt/execute-tx n1 tx2)
+          (xt/execute-tx n2 tx2)
+          (tu/finish-block! n2)
+          (c/compact-all! n2 #xt/duration "PT2S")
+
+          (doseq [[idx {:keys [interval dir range1 range2]}] (map-indexed vector intervals)]
+            (t/testing (format "%s interval: '%s'" (name dir) interval)
+              (let [dates (vec (into #{(Date. Long/MIN_VALUE) (Date. Long/MAX_VALUE)}
+                                     (comp cat
+                                           (mapcat (fn [^Date date]
+                                                     (for [^long delta (range -2 3)]
+                                                       (Date. (+ (.getTime date) delta))))))
+                                     [range1 range2]))]
+                (doseq [date dates]
+                  (t/testing (format "date: '%s'" (pr-str date))
+                    (doseq [q ["SELECT * FROM foo FOR VALID_TIME AS OF ? WHERE _id = ?"
+                               "SELECT *, _valid_from, _valid_to FROM foo FOR VALID_TIME AS OF ? WHERE _id = ?"
+                               "SELECT *, _valid_from, _valid_to, _system_from, _system_to
+                                FROM foo FOR VALID_TIME AS OF ? FOR SYSTEM_TIME ALL WHERE _id = ?"]]
+                      (t/testing (format "query: '%s'" q)
+                        ;; params the wrong way around - see #4305
+                        (t/is (= (xt/q n1 [q idx date])
+                                 (xt/q n2 [q idx date])))))))
+
+                (doseq [to-i (range (count dates))
+                        from-i (range to-i)
+                        :let [from-date (nth dates from-i)
+                              to-date (nth dates to-i)]]
+                  (let [q "SELECT *, _valid_from, _valid_to
+                           FROM foo FOR VALID_TIME BETWEEN ? AND ? FOR SYSTEM_TIME BETWEEN ? AND ?
+                           WHERE _id = ?"]
+                    (t/testing (format "query: '%s', vt-" q)
+                      ;; params the wrong way around - see #4305
+                      (t/is (= (xt/q n1 [q idx from-date to-date from-date to-date])
+                               (xt/q n2 [q idx from-date to-date from-date to-date]))))))))))))))

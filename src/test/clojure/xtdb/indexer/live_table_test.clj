@@ -15,7 +15,6 @@
            (java.util Arrays HashMap)
            (java.util.concurrent.locks StampedLock)
            (org.apache.arrow.memory RootAllocator)
-           xtdb.arrow.VectorPosition
            xtdb.BufferPool
            xtdb.compactor.Compactor
            (xtdb.indexer LiveIndex LiveTable LiveTable$Watermark)
@@ -47,14 +46,11 @@
 
           (let [live-table-tx (.startTx live-table (serde/->TxKey 0 (.toInstant #inst "2000")) false)
                 doc-wtr (.getDocWriter live-table-tx)]
-            (let [wp (VectorPosition/build)]
-              (dotimes [_n n]
-                (.logPut live-table-tx (ByteBuffer/wrap (util/uuid->bytes uuid))
-                         0 0
-                         (fn []
-                           (.getPositionAndIncrement wp)
-                           (.startStruct doc-wtr)
-                           (.endStruct doc-wtr)))))
+            (dotimes [_n n]
+              (.logPut live-table-tx (ByteBuffer/wrap (util/uuid->bytes uuid))
+                       0 0
+                       (fn []
+                         (.endStruct doc-wtr))))
 
             (.commit live-table-tx)
 
@@ -85,13 +81,10 @@
           (let [live-table-tx (.startTx live-table (serde/->TxKey 0 (.toInstant #inst "2000")) false)
                 doc-wtr (.getDocWriter live-table-tx)]
 
-            (let [wp (VectorPosition/build)]
-              (dotimes [_n n]
-                (.logPut live-table-tx (ByteBuffer/wrap (util/uuid->bytes uuid)) 0 0
-                         (fn []
-                           (.getPositionAndIncrement wp)
-                           (.startStruct doc-wtr)
-                           (.endStruct doc-wtr)))))
+            (dotimes [_n n]
+              (.logPut live-table-tx (ByteBuffer/wrap (util/uuid->bytes uuid)) 0 0
+                       (fn []
+                         (.endStruct doc-wtr))))
 
             (.commit live-table-tx)
 
@@ -135,13 +128,10 @@
       (let [live-table-tx (.startTx live-table (serde/->TxKey 0 (.toInstant #inst "2000")) false)
             doc-wtr (.getDocWriter live-table-tx)]
 
-        (let [wp (VectorPosition/build)]
-          (doseq [uuid uuids]
-            (.logPut live-table-tx (ByteBuffer/wrap (util/uuid->bytes uuid)) 0 0
-                     (fn []
-                       (.getPositionAndIncrement wp)
-                       (.startStruct doc-wtr)
-                       (.endStruct doc-wtr)))))
+        (doseq [uuid uuids]
+          (.logPut live-table-tx (ByteBuffer/wrap (util/uuid->bytes uuid)) 0 0
+                   (fn []
+                     (.endStruct doc-wtr))))
 
         (.commit live-table-tx)
 
@@ -183,13 +173,10 @@
                 live-table-tx (.liveTable live-index-tx table-name)
                 doc-wtr (.getDocWriter live-table-tx)]
 
-            (let [wp (VectorPosition/build)]
-              (doseq [uuid uuids]
-                (.logPut live-table-tx (ByteBuffer/wrap (util/uuid->bytes uuid)) 0 0
-                         (fn []
-                           (.getPositionAndIncrement wp)
-                           (.startStruct doc-wtr)
-                           (.endStruct doc-wtr)))))
+            (doseq [uuid uuids]
+              (.logPut live-table-tx (ByteBuffer/wrap (util/uuid->bytes uuid)) 0 0
+                       (fn []
+                         (.endStruct doc-wtr))))
 
             (.commit live-index-tx)
 

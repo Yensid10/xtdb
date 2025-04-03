@@ -68,11 +68,10 @@
 
                                          {:ks ks
                                           :write-row! (fn write-param-row! [{:keys [^RelationReader args]}, ^IRelationWriter out-rel]
-                                                        (let [param-rdr (.readerForName args (str row-arg))]
-                                                          (.startRow out-rel)
+                                                        (let [param-rdr (.vectorForOrNull args (str row-arg))]
                                                           (doseq [k ks
                                                                   :let [k (str k)]]
-                                                            (.writeValue (.colWriter out-rel k)
+                                                            (.writeValue (.vectorFor out-rel k)
                                                                          (-> (.structKeyReader param-rdr k)
                                                                              (.valueReader (VectorPosition/build 0)))))
                                                           (.endRow out-rel)))})
@@ -93,7 +92,7 @@
                                                                                   (.add field-set (get param-fields param))
                                                                                   (MapEntry/create k (fn write-param! [{:keys [^RelationReader args]} ^IVectorWriter out-col]
                                                                                                        (.writeValue out-col
-                                                                                                                    (-> (.readerForName args (str param))
+                                                                                                                    (-> (.vectorForOrNull args (str param))
                                                                                                                         (.valueReader (VectorPosition/build 0)))))))
 
                                                                          ;; HACK: this is quite heavyweight to calculate a single value -
@@ -101,16 +100,15 @@
                                                                          (let [input-types (assoc opts :param-types param-types)
                                                                                expr (expr/form->expr v input-types)
                                                                                projection-spec (expr/->expression-projection-spec "_scalar" expr input-types)]
-                                                                           (.add field-set (types/col-type->field (.getColumnType projection-spec)))
+                                                                           (.add field-set (.getField projection-spec))
                                                                            (MapEntry/create k (fn write-expr! [{:keys [allocator args]} ^IVectorWriter out-col]
                                                                                                 (util/with-open [out-vec (.project projection-spec allocator (vr/rel-reader [] 1) schema args)]
                                                                                                   (.writeValue out-col (.valueReader out-vec (VectorPosition/build 0)))))))))))))]
 
                                        {:ks (set (keys out-row))
                                         :write-row! (fn write-row! [opts ^IRelationWriter out-rel]
-                                                      (.startRow out-rel)
                                                       (doseq [[k write-val!] out-row]
-                                                        (write-val! opts (.colWriter out-rel (str k))))
+                                                        (write-val! opts (.vectorFor out-rel (str k))))
                                                       (.endRow out-rel))})))))
 
         key-freqs (->> (into [] (mapcat :ks) out-rows)
@@ -142,7 +140,7 @@
         expr (expr/form->expr v (assoc opts :param-types param-types))
         input-types (assoc opts :param-types param-types)
         projection-spec (expr/->expression-projection-spec out-col expr input-types)
-        field (-> (types/col-type->field (.getColumnType projection-spec))
+        field (-> (.getField projection-spec)
                   (types/unnest-field)
                   (types/field-with-name (str out-col)))]
 
@@ -157,11 +155,11 @@
                                      (instance? ArrowType$Union list-rdr-type) (.legReader list-rdr "list")
                                      :else list-rdr)]
 
-                      (util/with-close-on-catch [el-rdr (.copy (or (some-> list-rdr .listElementReader (.withName (str out-col)))
+                      (util/with-close-on-catch [el-rdr (.copy (or (some-> list-rdr .getListElements (.withName (str out-col)))
                                                                    (vr/vec->reader (ZeroVector. (str out-col))))
                                                                allocator)]
 
-                        (vr/rel-reader [el-rdr] (.valueCount el-rdr))))))}))
+                        (vr/rel-reader [el-rdr] (.getValueCount el-rdr))))))}))
 
 (defn- emit-arg-table [param table-expr {:keys [param-fields]}]
   (let [fields (-> (into {} (for [^Field field (-> (or (get param-fields param)
@@ -187,17 +185,17 @@
 
     {:fields fields
      :->out-rel (fn [{:keys [^RelationReader args]}]
-                  (let [vec-rdr (.readerForName args (str (symbol param)))
+                  (let [vec-rdr (.vectorForOrNull args (str (symbol param)))
                         list-rdr (cond-> vec-rdr
                                    (instance? ArrowType$Union (.getType (.getField vec-rdr))) (.legReader "list"))
-                        el-rdr (some-> list-rdr .listElementReader)
+                        el-rdr (some-> list-rdr (.getListElements))
                         el-struct-rdr (cond-> el-rdr
                                         (instance? ArrowType$Union (.getType (.getField el-rdr))) (.legReader "struct"))]
 
-                    (vr/rel-reader (for [k (some-> el-struct-rdr .structKeys)
-                                         :when (contains? fields (symbol k)) ]
+                    (vr/rel-reader (for [k (some-> el-struct-rdr .getKeyNames)
+                                         :when (contains? fields (symbol k))]
                                      (.structKeyReader el-struct-rdr k))
-                                   (.valueCount el-rdr))))}))
+                                   (.getValueCount el-rdr))))}))
 
 (defmethod lp/emit-expr :table [{:keys [table] :as table-expr} opts]
   (let [[{:keys [fields ->out-rel]} param?] (zmatch table

@@ -25,7 +25,7 @@ class MapVector(private val listVector: ListVector, private val keysSorted: Bool
             listVector.nullable = value
         }
 
-    override val children get() = listVector.children
+    override val vectors: Iterable<Vector> get() = listVector.vectors
 
     override var valueCount: Int
         get() = listVector.valueCount
@@ -54,9 +54,9 @@ class MapVector(private val listVector: ListVector, private val keysSorted: Bool
         val startIdx = listVector.getListStartIndex(idx)
         val entryCount = listVector.getListCount(idx)
 
-        val elReader = listVector.elementReader()
-        val keyReader = elReader.mapKeyReader()
-        val valueReader = elReader.mapValueReader()
+        val elReader = listVector.listElements
+        val keyReader = elReader.mapKeys
+        val valueReader = elReader.mapValues
 
         return (0 until entryCount).associate { elIdx ->
             (startIdx + elIdx).let { entryIdx ->
@@ -67,9 +67,9 @@ class MapVector(private val listVector: ListVector, private val keysSorted: Bool
 
     override fun writeObject0(value: Any) = when (value) {
         is Map<*, *> -> {
-            val elWriter = listVector.elementWriter()
-            val keyWriter = elWriter.mapKeyWriter()
-            val valueWriter = elWriter.mapValueWriter()
+            val elWriter = listVector.listElements
+            val keyWriter = elWriter.mapKeys
+            val valueWriter = elWriter.mapValues
 
             value.forEach { k, v ->
                 keyWriter.writeObject(k)
@@ -83,18 +83,15 @@ class MapVector(private val listVector: ListVector, private val keysSorted: Bool
         else -> throw InvalidWriteObjectException(fieldType, value)
     }
 
-    override fun elementReader() = listVector.elementReader()
-    override fun elementWriter() = listVector.elementWriter()
-    override fun elementWriter(fieldType: FieldType) = listVector.elementWriter(fieldType)
+    override val listElements get() = listVector.listElements
+    override fun getListElements(fieldType: FieldType) = listVector.getListElements(fieldType)
 
     override fun endList() = listVector.endList()
 
-    override fun mapKeyReader() = elementReader().mapKeyReader()
-    override fun mapValueReader() = elementReader().mapValueReader()
-    override fun mapKeyWriter() = elementWriter().mapKeyWriter()
-    override fun mapKeyWriter(fieldType: FieldType) = elementWriter().mapKeyWriter(fieldType)
-    override fun mapValueWriter() = elementWriter().mapValueWriter()
-    override fun mapValueWriter(fieldType: FieldType) = elementWriter().mapValueWriter(fieldType)
+    override val mapKeys get() = listElements.mapKeys
+    override fun getMapKeys(fieldType: FieldType) = listElements.getMapKeys(fieldType)
+    override val mapValues get() = listElements.mapValues
+    override fun getMapValues(fieldType: FieldType) = listElements.getMapValues(fieldType)
 
     override fun unloadPage(nodes: MutableList<ArrowFieldNode>, buffers: MutableList<ArrowBuf>) =
         listVector.unloadPage(nodes, buffers)

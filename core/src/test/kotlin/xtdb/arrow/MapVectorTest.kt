@@ -37,7 +37,7 @@ class MapVectorTest {
         val m2 = mapOf(12 to "world")
         val m3 = mapOf(3 to "!")
 
-        val children = linkedMapOf(
+        val children = linkedMapOf<String, Vector>(
             "key" to IntVector(allocator, "key", false),
             "value" to Utf8Vector(allocator, "value", true)
         )
@@ -49,7 +49,7 @@ class MapVectorTest {
             mapVec.writeObject(m2)
             mapVec.writeObject(m3)
 
-            assertEquals(listOf(m1, m2, m3), mapVec.asList)
+            assertEquals(listOf(m1, m2, m3), mapVec.toList())
         }
     }
 
@@ -59,7 +59,7 @@ class MapVectorTest {
         val m2 = mapOf(12 to "world")
         val m3 = mapOf(3 to "!")
 
-        val children = linkedMapOf(
+        val children = linkedMapOf<String, Vector>(
             "key" to IntVector(allocator, "key", false),
             "value" to Utf8Vector(allocator, "value", true)
         )
@@ -98,17 +98,17 @@ class MapVectorTest {
                 loader.loadPage(0, rel)
 
                 assertEquals(2, rel.rowCount)
-                assertEquals(listOf(m1, m2), mapVec.asList)
+                assertEquals(listOf(m1, m2), mapVec.toList())
 
                 loader.loadPage(1, rel)
 
                 assertEquals(1, rel.rowCount)
-                assertEquals(listOf(m3), mapVec.asList)
+                assertEquals(listOf(m3), mapVec.toList())
 
                 loader.loadPage(0, rel)
 
                 assertEquals(2, rel.rowCount)
-                assertEquals(listOf(m1, m2), mapVec.asList)
+                assertEquals(listOf(m1, m2), mapVec.toList())
             }
         }
 

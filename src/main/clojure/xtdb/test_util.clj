@@ -32,9 +32,9 @@
            (java.nio.file Files Path)
            java.nio.file.attribute.FileAttribute
            (java.sql PreparedStatement Types)
-           (java.time Instant InstantSource LocalTime Period YearMonth ZoneId ZoneOffset)
+           (java.time Duration Instant InstantSource LocalTime Period YearMonth ZoneId ZoneOffset)
            (java.time.temporal ChronoUnit)
-           (java.util LinkedList TreeMap)
+           (java.util LinkedList)
            (java.util.function Consumer IntConsumer)
            (java.util.stream IntStream)
            (org.apache.arrow.memory BufferAllocator RootAllocator)
@@ -46,12 +46,12 @@
            xtdb.api.query.IKeyFn
            xtdb.arrow.Relation
            (xtdb.indexer LiveTable Watermark Watermark$Source)
+           (xtdb.log.proto TemporalMetadata TemporalMetadata$Builder)
            (xtdb.query IQuerySource PreparedQuery)
-           (xtdb.trie Trie)
+           (xtdb.trie MetadataFileWriter Trie)
            xtdb.types.ZonedDateTimeRange
            (xtdb.util RefCounter RowCounter TemporalBounds TemporalDimension)
-           (xtdb.vector IVectorReader RelationReader)
-           (xtdb.log.proto TemporalMetadata TemporalMetadata$Builder)))
+           (xtdb.vector IVectorReader RelationReader)))
 
 #_{:clj-kondo/ignore [:uninitialized-var]}
 (def ^:dynamic ^org.apache.arrow.memory.BufferAllocator *allocator*)
@@ -177,8 +177,9 @@
                (->> (iterate #(.plus ^YearMonth % len unit) (YearMonth/of year month))
                     (map #(Instant/ofEpochSecond (.toEpochSecond (.atDay ^YearMonth % 1) LocalTime/MIDNIGHT ZoneOffset/UTC)))))]
        (case u
-         :second (iterate #(.plusMillis ^Instant % (* 1000 len)) inst)
-         :minute (iterate #(.plusMillis ^Instant % (* 1000 60 len)) inst)
+         :second (iterate #(.plus ^Instant % (Duration/ofSeconds len)) inst)
+         :minute (iterate #(.plus ^Instant % (Duration/ofMinutes len)) inst)
+         :hour (iterate #(.plus ^Instant % (Duration/ofHours len)) inst)
          :day (iterate #(.plus ^Instant % (Period/ofDays len)) inst)
          :month (to-seq ChronoUnit/MONTHS)
          :quarter (->> (iterate #(.plusMonths ^YearMonth % (* 3 len)) (YearMonth/of year month))
@@ -252,7 +253,8 @@
          :pages vector?))
 
 (defmethod lp/emit-expr ::pages [{:keys [col-types pages stats]} _args]
-  (let [fields (or (some-> col-types (update-vals types/col-type->field))
+  (let [fields (or (some->> col-types (into {} (map (fn [[col-name col-type]]
+                                                      [col-name (types/col-type->field col-name col-type)]))))
                    (vw/rows->fields (into [] cat pages)))
         ^Schema schema (Schema. (for [[col-name field] fields]
                                   (types/field-with-name field (str col-name))))]
@@ -266,7 +268,7 @@
   ([^IVectorReader col ^IKeyFn key-fn]
    (mapv (fn [idx]
            (.getObject col idx key-fn))
-         (range (.valueCount col)))))
+         (range (.getValueCount col)))))
 
 (defn <-cursor
   ([^ICursor cursor] (<-cursor cursor #xt/key-fn :kebab-case-keyword))
@@ -382,15 +384,15 @@
         (throw (IllegalStateException. (str "No bounds found for page " page-idx "!")))))))
 
 (defn open-arrow-hash-trie-rel ^xtdb.arrow.Relation [^BufferAllocator al, paths]
-  (util/with-close-on-catch [meta-rel (Relation. al (Trie/getMetaRelSchema))]
-    (let [nodes-wtr (.get meta-rel "nodes")
-          nil-wtr (.legWriter nodes-wtr "nil")
-          iid-branch-wtr (.legWriter nodes-wtr "branch-iid")
-          iid-branch-el-wtr (.elementWriter iid-branch-wtr)
+  (util/with-close-on-catch [meta-rel (Relation. al MetadataFileWriter/metaRelSchema)]
+    (let [nodes-wtr (.vectorFor meta-rel "nodes")
+          nil-wtr (.vectorFor nodes-wtr "nil")
+          iid-branch-wtr (.vectorFor nodes-wtr "branch-iid")
+          iid-branch-el-wtr (.getListElements iid-branch-wtr)
 
-          data-wtr (.legWriter nodes-wtr "leaf")
-          data-page-idx-wtr (.keyWriter data-wtr "data-page-idx")
-          metadata-wtr (.keyWriter data-wtr "columns")]
+          data-wtr (.vectorFor nodes-wtr "leaf")
+          data-page-idx-wtr (.vectorFor data-wtr "data-page-idx")
+          metadata-wtr (.vectorFor data-wtr "columns")]
       (letfn [(write-paths [paths]
                 (cond
                   (nil? paths) (.writeNull nil-wtr)
@@ -460,12 +462,12 @@
                        aw (ArrowFileWriter. data-vsr nil write-ch)]
         (.start aw)
         (let [!last-iid (atom nil)
-              iid-wtr (.colWriter data-wtr "_iid")
-              system-from-wtr (.colWriter data-wtr "_system_from")
-              valid-from-wtr (.colWriter data-wtr "_valid_from")
-              valid-to-wtr (.colWriter data-wtr "_valid_to")
-              op-wtr (.colWriter data-wtr "op")
-              put-wtr (.legWriter op-wtr "put")
+              iid-wtr (.vectorFor data-wtr "_iid")
+              system-from-wtr (.vectorFor data-wtr "_system_from")
+              valid-from-wtr (.vectorFor data-wtr "_valid_from")
+              valid-to-wtr (.vectorFor data-wtr "_valid_to")
+              op-wtr (.vectorFor data-wtr "op")
+              put-wtr (.vectorFor op-wtr "put")
               max-page-id (-> (keys page-idx->documents) sort last)]
           (doseq [i (range (inc max-page-id))]
             (doseq [[op doc] (get page-idx->documents i)]
@@ -473,7 +475,6 @@
                 :put (let [iid-bytes (util/->iid (:xt/id doc))]
                        (when (and @!last-iid (> (util/compare-nio-buffers-unsigned @!last-iid iid-bytes) 0))
                          (log/error "IID's not in required order!" (:xt/id doc)))
-                       (.startRow data-wtr)
                        (.writeObject iid-wtr iid-bytes)
                        (.writeLong system-from-wtr (or (:xt/system-from doc) 0))
                        (.writeLong valid-from-wtr (or (:xt/valid-from doc) 0))
@@ -532,7 +533,7 @@
 (defn vec->vals
   ([^IVectorReader rdr] (vec->vals rdr #xt/key-fn :kebab-case-keyword))
   ([^IVectorReader rdr ^IKeyFn key-fn]
-   (->> (for [i (range (.valueCount rdr))]
+   (->> (for [i (range (.getValueCount rdr))]
           (.getObject rdr i key-fn))
         (into []))))
 

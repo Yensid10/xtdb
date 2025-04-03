@@ -58,6 +58,7 @@ class IndirectMultiVectorReaderTest {
         val rdr1 = ValueVectorReader.intVector(intVec1)
         val rdr2 = ValueVectorReader.intVector(intVec2)
         val indirectRdr = IndirectMultiVectorReader(
+            "foo",
             listOf(rdr1, rdr2),
             selection(intArrayOf(0, 1, 0, 1)),
             selection(intArrayOf(0, 0, 1, 1))
@@ -111,6 +112,7 @@ class IndirectMultiVectorReaderTest {
         val rdr1 = ValueVectorReader.structVector(structVec1)
         val rdr2 = ValueVectorReader.structVector(structVec2)
         val indirectRdr = IndirectMultiVectorReader(
+            "foo",
             listOf(rdr1, rdr2),
             selection(intArrayOf(0, 1, 0, 1)),
             selection(intArrayOf(0, 0, 1, 1))
@@ -151,6 +153,7 @@ class IndirectMultiVectorReaderTest {
         val rdr1 = ValueVectorReader.intVector(intVec)
         val rdr2 = ValueVectorReader.varCharVector(stringVec)
         val indirectRdr = IndirectMultiVectorReader(
+            "foo",
             listOf(rdr1, rdr2),
             selection(intArrayOf(0, 1, 0, 1)),
             selection(intArrayOf(0, 0, 1, 1))
@@ -202,6 +205,7 @@ class IndirectMultiVectorReaderTest {
         val rdr2 = ValueVectorReader.varCharVector(stringVec)
         val rdr3 = ValueVectorReader.denseUnionVector(duvVec)
         val indirectRdr = IndirectMultiVectorReader(
+            "foo",
             listOf(rdr1, rdr2, rdr3),
             selection(intArrayOf(0, 1, 2, 0, 1, 2)),
             selection(intArrayOf(0, 0, 0, 1, 1, 1))
@@ -246,6 +250,7 @@ class IndirectMultiVectorReaderTest {
         val rdr1 = ValueVectorReader.denseUnionVector(duvVec1)
         val rdr2 = ValueVectorReader.denseUnionVector(duvVec2)
         val indirectRdr = IndirectMultiVectorReader(
+            "foo",
             listOf(rdr1, rdr2),
             selection(intArrayOf(0, 1, 0, 1, 0, 1)),
             selection(intArrayOf(0, 0, 1, 1, 2, 2))
@@ -291,6 +296,7 @@ class IndirectMultiVectorReaderTest {
 
         val rdr1 = ValueVectorReader.denseUnionVector(duvVec1)
         val indirectRdr = IndirectMultiVectorReader(
+            "foo",
             listOf(rdr1),
             selection(intArrayOf(0, 0)),
             selection(intArrayOf(0, 1))
@@ -313,7 +319,7 @@ class IndirectMultiVectorReaderTest {
 
 
     @Test
-    fun testListElementReader () {
+    fun testListElements () {
         val listField = Field("my-list", FieldType(false, LIST_TYPE, null), listOf(Field("\$data\$", I32, null)))
         val listVec1 = listField.createVector(alloc) as ListVector
         val listVec2 = listField.createVector(alloc) as ListVector
@@ -331,6 +337,7 @@ class IndirectMultiVectorReaderTest {
 
         // This represents the vector [[0, 1, 2], [6, 7], [3, 4, 5], [8, 9]]
         val indirectRdr = IndirectMultiVectorReader(
+            "foo",
             listOf(rdr1, rdr2),
 
             selection(intArrayOf(0, 1, 0, 1)),
@@ -347,7 +354,7 @@ class IndirectMultiVectorReaderTest {
         assertEquals(2, indirectRdr.getListCount(1))
 
         // The elementRdr should contain [0, 1, 2, 6, 7, 3, 4, 5, 8, 9]a
-        val listElementRdr = indirectRdr.listElementReader()
+        val listElementRdr = indirectRdr.listElements
 
         val r = 0..9
         assertEquals(listOf(0, 1, 2, 6, 7, 3, 4, 5, 8, 9) , r.map { listElementRdr.getInt(it) }.toList())
@@ -358,7 +365,7 @@ class IndirectMultiVectorReaderTest {
     }
 
     @Test
-    fun testListElementReaderWithPolymophicUnderlyingVectors () {
+    fun testListElementsWithPolymophicUnderlyingVectors () {
         val listField = Field("my-list", FieldType(false, LIST_TYPE, null), listOf(Field("\$data\$", I32, null)))
         val listVec = listField.createVector(alloc) as ListVector
         val intVec = IntVector("my-int", alloc)
@@ -377,6 +384,7 @@ class IndirectMultiVectorReaderTest {
 
         // This represents the vector [[0, 1, 2], 0, [3, 4, 5], 1]
         val indirectRdr = IndirectMultiVectorReader(
+            "foo",
             listOf(rdr1, rdr2),
 
             selection(intArrayOf(0, 1, 0, 1)),
@@ -391,9 +399,9 @@ class IndirectMultiVectorReaderTest {
         assertEquals(0, listRdr.getListStartIndex(0))
         assertEquals(3, listRdr.getListStartIndex(1))
 
-        val listElementRdr = listRdr.listElementReader()
+        val listElementRdr = listRdr.listElements
 
-        val r = 0 until listElementRdr.valueCount()
+        val r = 0 until listElementRdr.valueCount
         assertEquals(listOf(0, 1, 2, 3, 4, 5) , r.map { listElementRdr.getInt(it) }.toList())
 
         indirectRdr.close()

@@ -161,7 +161,7 @@
 
 (defn ->nil-rel
   "Returns a single row relation where all columns are nil. (Useful for outer joins)."
-  [col-names]
+  ^xtdb.vector.RelationReader [col-names]
   (vr/rel-reader (for [col-name col-names]
                    (vr/vec->reader (doto (NullVector. (str col-name))
                                      (.setValueCount 1))))))
@@ -192,7 +192,7 @@
           (doto (.rowCopier rel-writer (->nil-rel (keys build-fields)))
             (.copyRow 0)))
 
-        (let [build-key-cols (mapv #(vw/vec-wtr->rdr (.colWriter rel-writer (str %))) build-key-col-names)]
+        (let [build-key-cols (mapv #(vw/vec-wtr->rdr (.vectorFor rel-writer (str %))) build-key-col-names)]
           (letfn [(compute-hash-bitmap [^long row-hash]
                     (or (.get hash->bitmap row-hash)
                         (let [bitmap (RoaringBitmap.)]
@@ -209,10 +209,10 @@
                 (let [in-rel (if store-full-build-rel?
                                in-rel
                                (->> (set build-key-col-names)
-                                    (mapv #(.readerForName in-rel (str %)))
+                                    (mapv #(.vectorForOrNull in-rel (str %)))
                                     vr/rel-reader))
 
-                      in-key-cols (mapv #(.readerForName in-rel (str %))
+                      in-key-cols (mapv #(.vectorForOrNull in-rel (str %))
                                         build-key-col-names)
 
                       ;; NOTE: we might not need to compute `comparator` if the caller never requires `addIfNotPresent` (e.g. joins)
@@ -247,7 +247,7 @@
 
               (probeFromRelation [this probe-rel]
                 (let [build-rel (.getBuiltRelation this)
-                      probe-key-cols (mapv #(.readerForName probe-rel (str %))
+                      probe-key-cols (mapv #(.vectorForOrNull probe-rel (str %))
                                            probe-key-col-names)
 
                       ^IntBinaryOperator
@@ -284,7 +284,7 @@
                       ;; TODO: this doesn't use the hashmaps, still a nested loop join
                       (let [acc (int-array [-1])]
                         (loop [build-idx 0]
-                          (if (= build-idx (.rowCount build-rel))
+                          (if (= build-idx (.getRowCount build-rel))
                             (aget acc 0)
                             (let [res (.applyAsInt comparator probe-idx build-idx)]
                               (if (= 1 res)

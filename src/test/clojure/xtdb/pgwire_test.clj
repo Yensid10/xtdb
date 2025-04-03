@@ -273,6 +273,7 @@
 
      {:sql "INTERVAL '1' YEAR", :clj "P12M"}
      {:sql "INTERVAL '1' MONTH", :clj "P1M"}
+     {:sql "INTERVAL 'P1DT1H1M1.123456S'" :clj "P1DT1H1M1.123456S"}
 
      {:sql "DATE '2021-12-24' - DATE '2021-12-23'", :clj 1}
 
@@ -2041,13 +2042,17 @@ ORDER BY t.oid DESC LIMIT 1"
 (deftest test-interval-encoding-3697
   (with-open [conn (jdbc-conn)]
     (t/is (= [{:i (PGInterval. "P1DT1H1M1.111111S")}]
-             (jdbc/execute! conn ["SELECT INTERVAL 'P1DT1H1M1.111111111S' AS i"])))
+             (jdbc/execute! conn ["SELECT INTERVAL 'P1DT1H1M1.111111S' AS i"])))
 
     (t/is (= [{:i (PGInterval. "P12MT0S")}]
              (jdbc/execute! conn ["SELECT INTERVAL 'P12MT0S' AS i"])))
 
     (t/is (= [{:i (PGInterval. "P-22MT0S")}]
-             (jdbc/execute! conn ["SELECT INTERVAL 'P-22MT0S' AS i"])))))
+             (jdbc/execute! conn ["SELECT INTERVAL 'P-22MT0S' AS i"])))
+
+    (t/testing "mdn implicitly truncated and returned with micro precision"
+      (t/is (= [{:i (PGInterval. "PT10M10.123456S")}]
+               (jdbc/execute! conn ["SELECT INTERVAL '10:10.123456789' MINUTE TO SECOND(9) i"]))))))
 
 (deftest test-playground
   (with-open [srv (pgwire/open-playground)]
@@ -2285,13 +2290,14 @@ ORDER BY t.oid DESC LIMIT 1"
              (jdbc/execute! conn ["SELECT _id, foo FROM docs ORDER BY _id"]
                             {:builder-fn xt-jdbc/builder-fn})))
 
-    (psql-session
-     (fn [send read]
-       (send "SELECT _id, foo FROM docs ORDER BY _id;\n")
-       (t/is (= [["_id" "foo"]
-                 ["1" "2023-03-15 12:00:00+01:00"]
-                 ["2" "2023-03-15 12:00:00+03:00"]]
-                (read)))))))
+    (when (psql-available?)
+      (psql-session
+       (fn [send read]
+         (send "SELECT _id, foo FROM docs ORDER BY _id;\n")
+         (t/is (= [["_id" "foo"]
+                   ["1" "2023-03-15 12:00:00+01:00"]
+                   ["2" "2023-03-15 12:00:00+03:00"]]
+                  (read))))))))
 
 (deftest test-max-rows-3902
   (with-open [conn (jdbc-conn)
@@ -2412,22 +2418,23 @@ ORDER BY t.oid DESC LIMIT 1"
     (t/is (= [{:standard-conforming-strings true}] (q conn ["SHOW STANDARD_CONFORMING_STRINGS"])))
     (t/is (= [{:world "hello"}] (q conn ["SELECT 'hello' AS world"])))))
 
-(t/deftest psql-queries-shouldnt-create-txs-4024
-  (psql-session
-   (fn [send read]
-     (send "SELECT COUNT(*) tx_count FROM xt.txs;\n")
-     (t/is (= [["tx_count"] ["0"]] (read)))
-     (send "SELECT COUNT(*) tx_count FROM xt.txs;\n")
-     (t/is (= [["tx_count"] ["0"]] (read)))
+(when (psql-available?)
+  (t/deftest psql-queries-shouldnt-create-txs-4024
+    (psql-session
+     (fn [send read]
+       (send "SELECT COUNT(*) tx_count FROM xt.txs;\n")
+       (t/is (= [["tx_count"] ["0"]] (read)))
+       (send "SELECT COUNT(*) tx_count FROM xt.txs;\n")
+       (t/is (= [["tx_count"] ["0"]] (read)))
 
-     (send "INSERT INTO foo RECORDS {_id: 1};\n")
+       (send "INSERT INTO foo RECORDS {_id: 1};\n")
 
-     (read)
+       (read)
 
-     (send "SELECT COUNT(*) tx_count FROM xt.txs;\n")
-     (t/is (= [["tx_count"] ["1"]] (read)))
-     (send "SELECT COUNT(*) tx_count FROM xt.txs;\n")
-     (t/is (= [["tx_count"] ["1"]] (read))))))
+       (send "SELECT COUNT(*) tx_count FROM xt.txs;\n")
+       (t/is (= [["tx_count"] ["1"]] (read)))
+       (send "SELECT COUNT(*) tx_count FROM xt.txs;\n")
+       (t/is (= [["tx_count"] ["1"]] (read)))))))
 
 (t/deftest date-error-propagating-to-client-4021
   (with-open [conn (jdbc-conn)]
@@ -2642,22 +2649,18 @@ ORDER BY 1,2;")
   ;;pgjdbc appears to use binary format for ts results but not tstz...
   (doseq [binary? [false true]
           {:keys [type val input]}
-          [{:type LocalDateTime :val #xt/date-time "2024-01-01T00:00:01.123456" :input "2024-01-01T00:00:00"}
-           {:type OffsetDateTime :val #xt/offset-date-time "2024-01-01T00:00:01.123456Z" :input "2024-01-01T00:00:00Z"}]
-          :let [q (format "SELECT TIMESTAMP '%s' + INTERVAL 'PT1.123456789S' v" input)]]
+          [{:type LocalDateTime :val #xt/date-time "2024-01-01T00:00:01.123456" :input "'2024-01-01T00:00:01.123456789'::TIMESTAMP(9)"}
+           {:type OffsetDateTime :val #xt/offset-date-time "2024-01-01T00:00:01.123456Z" :input "'2024-01-01T00:00:01.123456789Z'::TIMESTAMP(9) WITH TIME ZONE"}]
+          :let [q (format "SELECT %s v" input)]]
 
       (t/testing (format "pgjdbc - binary?: %s, type: %s, pg-type: %s, val: %s" binary? type val input)
         (with-open [conn (jdbc-conn "prepareThreshold" -1 "binaryTransfer" binary?)
                     stmt (.prepareStatement conn q)]
           (with-open [rs (.executeQuery stmt)]
             (.next rs)
-            (t/is (= val (.getObject rs 1 type))))))
+            (t/is (= val (.getObject rs 1 type))))))))
 
-      (t/testing (format "pg2 - binary?: %s, type: %s, pg-type: %s, val: %s" binary? type val input)
-        (with-open [conn (pg-conn {:binary-encode? binary? :binary-decode? binary?})]
 
-          (t/is (= [{:v val}]
-                   (pg/execute conn q)))))))
 
 (t/deftest test-sql-with-leading-whitespace
   (with-open [conn (pg-conn {})]

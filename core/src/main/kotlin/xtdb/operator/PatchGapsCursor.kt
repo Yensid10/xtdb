@@ -15,13 +15,12 @@ class PatchGapsCursor(
     private val validTo: Long,
 ) : ICursor<RelationReader> {
 
-    private val iidWriter = out.colWriter("_iid")
-    private val vfWriter = out.colWriter("_valid_from")
-    private val vtWriter = out.colWriter("_valid_to")
-    private val docWriter = out.colWriter("doc")
+    private val iidWriter = out.vectorFor("_iid")
+    private val vfWriter = out.vectorFor("_valid_from")
+    private val vtWriter = out.vectorFor("_valid_to")
+    private val docWriter = out.vectorFor("doc")
 
     private fun copyRow(idx: Int, iidCopier: RowCopier, validFrom: Long, validTo: Long, docCopier: RowCopier?) {
-        out.startRow()
         iidCopier.copyRow(idx)
         vfWriter.writeLong(validFrom)
         if (validTo == MAX_LONG) vtWriter.writeNull() else vtWriter.writeLong(validTo)
@@ -32,16 +31,16 @@ class PatchGapsCursor(
     override fun tryAdvance(c: Consumer<in RelationReader>) = inner.tryAdvance { inRel ->
         out.clear()
 
-        val iidReader = inRel.readerForName("_iid")
+        val iidReader = inRel["_iid"]
         val iidCopier = iidReader.rowCopier(iidWriter)
-        val vfReader = inRel.readerForName("_valid_from")
-        val vtReader = inRel.readerForName("_valid_to")
-        val docCopier = inRel.readerForName("doc").rowCopier(docWriter)
+        val vfReader = inRel["_valid_from"]
+        val vtReader = inRel["_valid_to"]
+        val docCopier = inRel["doc"].rowCopier(docWriter)
 
         val currentIid = ArrowBufPointer()
         val prevIid = ArrowBufPointer()
 
-        val rowCount = inRel.rowCount()
+        val rowCount = inRel.rowCount
         if (rowCount > 0) {
             var currentValidTime = validFrom
 

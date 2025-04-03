@@ -23,7 +23,7 @@ dependencies {
 
     compileOnlyApi(files("src/main/resources"))
     api(kotlin("stdlib-jdk8"))
-    implementation("org.postgresql:postgresql:42.2.23")
+    implementation("org.postgresql:postgresql:42.7.5")
 
     testImplementation(libs.next.jdbc)
 }
@@ -31,17 +31,17 @@ dependencies {
 java.toolchain.languageVersion.set(JavaLanguageVersion.of(21))
 
 tasks.compileJava {
-    sourceCompatibility = "11"
-    targetCompatibility = "11"
+    sourceCompatibility = "21"
+    targetCompatibility = "21"
 }
 
 tasks.compileTestJava {
-    sourceCompatibility = "11"
-    targetCompatibility = "11"
+    sourceCompatibility = "21"
+    targetCompatibility = "21"
 }
 
 kotlin {
     compilerOptions {
-        jvmTarget.set(JvmTarget.JVM_11)
+        jvmTarget.set(JvmTarget.JVM_21)
     }
 }

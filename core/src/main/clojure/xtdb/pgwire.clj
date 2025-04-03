@@ -40,7 +40,7 @@
            (xtdb.api Authenticator ServerConfig Xtdb$Config)
            xtdb.api.module.XtdbModule
            (xtdb.query BoundQuery PreparedQuery)
-           [xtdb.types IntervalDayTime IntervalMonthDayNano IntervalYearMonth]
+           [xtdb.types IntervalDayTime IntervalMonthDayMicro IntervalMonthDayNano IntervalYearMonth]
            [xtdb.vector IVectorReader RelationReader]))
 
 ;; references
@@ -652,6 +652,7 @@
     (instance? IntervalYearMonth obj) (str obj)
     (instance? IntervalDayTime obj) (str obj)
     (instance? IntervalMonthDayNano obj) (str obj)
+    (instance? IntervalMonthDayMicro obj) (str obj)
 
     ;; represent period duration as an iso8601 duration string (includes period components)
     (instance? PeriodDuration obj)
@@ -1353,11 +1354,11 @@
 
                                      @!closing? (log/trace "query result stream stopping (conn closing)")
 
-                                     :else (dotimes [idx (cond-> (.rowCount rel)
+                                     :else (dotimes [idx (cond-> (.getRowCount rel)
                                                            limit (min (- limit @n-rows-out)))]
                                              (let [row (mapv
-                                                        (fn [{:keys [field-name write-binary write-text result-format]}]
-                                                          (let [rdr (.readerForName rel field-name)]
+                                                        (fn [{:keys [^String field-name write-binary write-text result-format]}]
+                                                          (let [rdr (.vectorForOrNull rel field-name)]
                                                             (when-not (.isNull rdr idx)
                                                               (if (= :binary result-format)
                                                                 (write-binary session rdr idx)
@@ -1694,7 +1695,7 @@
                                     (try
                                       (-> inner
                                           (assoc :args (vec (for [^Field field arg-fields]
-                                                              (-> (.readerForName args-rel (.getName field))
+                                                              (-> (.vectorForOrNull args-rel (.getName field))
                                                                   (.getObject 0))))
                                                  :param-fields arg-fields))
                                       (finally

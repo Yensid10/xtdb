@@ -157,8 +157,8 @@ class RelationTest {
             )
         )
 
-        val i32Leg = duv.legWriter("i32")
-        val utf8Leg = duv.legWriter("utf8")
+        val i32Leg = duv.vectorFor("i32")
+        val utf8Leg = duv.vectorFor("utf8")
 
         i32Leg.writeInt(12)
         utf8Leg.writeObject("hello")
@@ -168,7 +168,7 @@ class RelationTest {
 
         val duvValues = listOf(12, "hello", "world!", 34, null)
 
-        assertEquals(duvValues, duv.asList)
+        assertEquals(duvValues, duv.toList())
 
         val buf = ByteArrayOutputStream()
 
@@ -181,7 +181,7 @@ class RelationTest {
 
         loader(allocator, buf.toByteArray().asChannel).use { loader ->
             loader.loadPage(0, allocator).use { rel ->
-                assertEquals(duvValues, rel["duv"]!!.asList)
+                assertEquals(duvValues, rel["duv"]!!.toList())
             }
         }
     }

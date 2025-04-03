@@ -131,6 +131,13 @@ class LocalBufferPool(
     override fun listAllObjects(): Iterable<StoredObject> = diskStore.listAll()
     override fun listAllObjects(dir: Path) = diskStore.resolve(dir).listAll()
 
+    @OptIn(ExperimentalPathApi::class)
+    override fun deleteAllObjects() = diskStore.deleteRecursively()
+
+    override fun deleteIfExists(key: Path) {
+        diskStore.resolve(key).deleteIfExists()
+    }
+
     override fun openArrowWriter(key: Path, rel: Relation): ArrowWriter {
         val tmpPath = diskStore.createTempUploadFile()
         return newByteChannel(tmpPath, WRITE, TRUNCATE_EXISTING, CREATE).closeOnCatch { fileChannel ->

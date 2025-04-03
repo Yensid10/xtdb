@@ -23,7 +23,7 @@
            (xtdb.arrow ListValueReader RelationReader ValueReader VectorPosition VectorReader)
            xtdb.arrow.ValueBox
            (xtdb.operator ProjectionSpec SelectionSpec)
-           (xtdb.types IntervalDayTime IntervalMonthDayNano IntervalYearMonth)
+           (xtdb.types IntervalDayTime IntervalMonthDayNano IntervalMonthDayMicro IntervalYearMonth)
            (xtdb.util StringUtil)))
 
 (set! *unchecked-math* :warn-on-boxed)
@@ -393,6 +393,10 @@
 (defmethod emit-value IntervalMonthDayNano [_ code]
   `(let [imdn# ~code]
      (PeriodDuration. (.-period imdn#) (.-duration imdn#))))
+
+(defmethod emit-value IntervalMonthDayMicro [_ code]
+  `(let [imdm# ~code]
+     (PeriodDuration. (.-period imdm#) (.-duration imdm#))))
 
 (defmethod codegen-expr :literal [{:keys [literal]} _]
   (let [return-type (vw/value->col-type literal)
@@ -1732,8 +1736,8 @@
 
 (defn batch-bindings [emitted-expr]
   (letfn [(child-seq [{:keys [children] :as expr}]
-            (lazy-seq
-             (cons expr (mapcat child-seq children))))]
+            (-> (into [] (mapcat child-seq) children)
+                (conj expr)))]
     (->> (for [{:keys [batch-bindings]} (child-seq emitted-expr)
                batch-binding batch-bindings]
            batch-binding)
@@ -1746,7 +1750,8 @@
                              (into {} (map (juxt types/field->col-type (fn [_] (gensym 'out-writer))))))]
         {:writer-bindings (into [out-writer-sym `(vw/->writer ~out-vec-sym)]
                                 (mapcat (fn [[value-type writer-sym]]
-                                          [writer-sym `(.legWriter ~out-writer-sym ~(types/->arrow-type value-type))]))
+                                          [writer-sym `(.vectorFor ~out-writer-sym
+                                                                   ~(types/arrow-type->leg (types/->arrow-type value-type)))]))
                                 writer-syms)
 
          :write-value-out! (fn [value-type code]
@@ -1816,14 +1821,10 @@
                             :return-type)]
 
     (reify ProjectionSpec
-      (getColumnName [_] col-name)
-
-      (getColumnType [_] widest-out-type)
+      (getField [_] (types/col-type->field col-name widest-out-type))
 
       (project [_ allocator in-rel schema args]
-        (let [in-rel (RelationReader/from in-rel)
-              args (RelationReader/from args)
-              var->col-type (->> (seq in-rel)
+        (let [var->col-type (->> in-rel
                                  (into {} (map (fn [^VectorReader iv]
                                                  [(symbol (.getName iv))
                                                   (types/field->col-type (.getField iv))]))))
@@ -1855,7 +1856,7 @@
       (select [_ al in-rel schema args]
         (with-open [selection (.project projector al in-rel schema args)]
           (let [res (IntStream/builder)]
-            (dotimes [idx (.valueCount selection)]
+            (dotimes [idx (.getValueCount selection)]
               (when (.getBoolean selection idx)
                 (.add res idx)))
             (.toArray (.build res))))))))

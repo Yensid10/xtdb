@@ -40,18 +40,15 @@
       (let [live-idx-tx (.startTx live-index (serde/->TxKey 0 (.toInstant #inst "2000")))
             live-table-tx (.liveTable live-idx-tx "my-table")
             put-doc-wrt (.getDocWriter live-table-tx)]
-        (let [wp (VectorPosition/build)]
-          (doseq [^UUID iid iids]
-            (.logPut live-table-tx (ByteBuffer/wrap (util/uuid->bytes iid)) 0 0
-                     #(do
-                        (.getPositionAndIncrement wp)
-                        (.writeObject put-doc-wrt {:some :doc})))))
+        (doseq [^UUID iid iids]
+          (.logPut live-table-tx (ByteBuffer/wrap (util/uuid->bytes iid)) 0 0
+                   #(.writeObject put-doc-wrt {:some :doc})))
 
         (.commit live-idx-tx)
 
         (let [live-table (.liveTable live-index "my-table")
               live-rel (.getLiveRelation live-table)
-              iid-vec (.getVector (.colWriter live-rel "_iid"))
+              iid-vec (.getVector (.vectorFor live-rel "_iid"))
 
               trie (.getLiveTrie live-table)]
 
@@ -67,14 +64,14 @@
             leaf-ba (.getByteArray buffer-pool (util/->path "tables/my-table/data/l00-rc-b00.arrow"))]
         (util/with-open [trie-loader (Relation/loader allocator (util/->seekable-byte-channel (ByteBuffer/wrap trie-ba)))
                          trie-rel (Relation. allocator (.getSchema trie-loader))
-                         leaf-rdr (ArrowFileReader. (util/->seekable-byte-channel (ByteBuffer/wrap leaf-ba)) allocator)]
-          (let [iid-vec (.getVector (.getVectorSchemaRoot leaf-rdr) "_iid")]
+                         leaf-loader (Relation/loader allocator (util/->seekable-byte-channel (ByteBuffer/wrap leaf-ba)))
+                         leaf-rel (Relation. allocator (.getSchema leaf-loader))]
+          (let [iid-vec (.vectorFor leaf-rel "_iid")]
             (.loadPage trie-loader 0 trie-rel)
             (t/is (= iid-bytes
                      (->> (.getLeaves (ArrowHashTrie. (.get trie-rel "nodes")))
                           (mapcat (fn [^ArrowHashTrie$Leaf leaf]
-                                    ;; would be good if ArrowFileReader accepted a page-idx...
-                                    (.loadRecordBatch leaf-rdr (.get (.getRecordBlocks leaf-rdr) (.getDataPageIndex leaf)))
+                                    (.loadPage leaf-loader (.getDataPageIndex leaf) leaf-rel)
 
                                     (->> (range 0 (.getValueCount iid-vec))
                                          (mapv #(vec (.getObject iid-vec %)))))))))))))))
@@ -126,7 +123,7 @@
           (t/is (= [(os/->StoredObject "tables/public$foo/data/l00-rc-b00.arrow" 2558)]
                    (.listAllObjects bp (util/->path "tables/public$foo/data"))))
 
-          (t/is (= [(os/->StoredObject "tables/public$foo/meta/l00-rc-b00.arrow" 3718)]
+          (t/is (= [(os/->StoredObject "tables/public$foo/meta/l00-rc-b00.arrow" 3966)]
                    (.listAllObjects bp (util/->path "tables/public$foo/meta")))))
 
         (tj/check-json (.toPath (io/as-file (io/resource "xtdb/indexer-test/can-build-live-index")))
@@ -143,7 +140,6 @@
           doc-wtr (.getDocWriter foo-table-tx)]
       (.logPut foo-table-tx (ByteBuffer/allocate 16) 0 0
                (fn []
-                 (.startStruct doc-wtr)
                  (.endStruct doc-wtr)))
       (.commit live-tx0))
 
@@ -153,7 +149,6 @@
           doc-wtr (.getDocWriter bar-table-tx)]
       (.logPut bar-table-tx (ByteBuffer/allocate 16) 0 0
                (fn []
-                 (.startStruct doc-wtr)
                  (.endStruct doc-wtr)))
 
       (t/testing "doesn't get added in the tx either"
@@ -170,7 +165,6 @@
             doc-wtr (.getDocWriter foo-table-tx)]
         (.logPut foo-table-tx (ByteBuffer/allocate 16) 0 0
                  (fn []
-                   (.startStruct doc-wtr)
                    (.endStruct doc-wtr)))
         (.abort live-tx2))
 
@@ -182,7 +176,6 @@
             doc-wtr (.getDocWriter bar-table-tx)]
         (.logPut bar-table-tx (ByteBuffer/allocate 16) 0 0
                  (fn []
-                   (.startStruct doc-wtr)
                    (.endStruct doc-wtr)))
         (.commit live-tx3))
 

@@ -56,7 +56,7 @@ class MultiVectorReaderTest {
                 IntVector(alloc, "my-int", false).use { resVec ->
                     val rowCopier = indirectRdr.rowCopier(resVec)
                     r.forEach { rowCopier.copyRow(it) }
-                    assertEquals(r.toList(), resVec.asList)
+                    assertEquals(r.toList(), resVec.toList())
                 }
             }
         }
@@ -100,7 +100,7 @@ class MultiVectorReaderTest {
                 Vector.fromField(alloc, structField).use { resVec ->
                     val rowCopier = indirectRdr.rowCopier(resVec)
                     r.forEach { rowCopier.copyRow(it) }
-                    assertEquals(expected, resVec.asList)
+                    assertEquals(expected, resVec.toList())
                 }
             }
         }
@@ -124,7 +124,7 @@ class MultiVectorReaderTest {
 
                 val r = 0..3
                 val expected = listOf(0, "first", 1, "second")
-                assertEquals(expected, indirectRdr.asList)
+                assertEquals(expected, indirectRdr.toList())
 
                 val pos = VectorPosition.build(0)
                 val valueRdr = indirectRdr.valueReader(pos)
@@ -138,7 +138,7 @@ class MultiVectorReaderTest {
                 Vector.fromField(alloc, duvField).use { resVec ->
                     val rowCopier = indirectRdr.rowCopier(resVec)
                     r.forEach { rowCopier.copyRow(it) }
-                    assertEquals(expected, resVec.asList)
+                    assertEquals(expected, resVec.toList())
                 }
             }
         }
@@ -160,8 +160,8 @@ class MultiVectorReaderTest {
                 )
 
                 Vector.fromField(alloc, duvField).use { duvVec ->
-                    duvVec.legWriter("i32").writeInt(2)
-                    duvVec.legWriter("utf8").writeObject("fifth")
+                    duvVec.vectorFor("i32").writeInt(2)
+                    duvVec.vectorFor("utf8").writeObject("fifth")
 
                     val indirectRdr = MultiVectorReader(
                         listOf(intVec, stringVec, duvVec),
@@ -171,7 +171,7 @@ class MultiVectorReaderTest {
 
                     val r = 0..5
                     val expected = listOf(0, "first", 2, 3, "fourth", "fifth")
-                    assertEquals(expected, indirectRdr.asList)
+                    assertEquals(expected, indirectRdr.toList())
 
                     val pos = VectorPosition.build(0)
                     val valueRdr = indirectRdr.valueReader(pos)
@@ -181,7 +181,7 @@ class MultiVectorReaderTest {
                         val rowCopier = indirectRdr.rowCopier(resVec)
                         r.forEach { rowCopier.copyRow(it) }
 
-                        assertEquals(expected, resVec.asList)
+                        assertEquals(expected, resVec.toList())
                     }
                 }
             }
@@ -201,12 +201,12 @@ class MultiVectorReaderTest {
 
         Vector.fromField(alloc, duvField).use { duv1 ->
             Vector.fromField(alloc, duvField).use { duv2 ->
-                duv1.legWriter("i32").writeInt(0)
-                duv2.legWriter("utf8").writeObject("first")
-                duv1.legWriter("null").writeNull()
-                duv2.legWriter("i32").writeInt(3)
-                duv1.legWriter("utf8").writeObject("fourth")
-                duv2.legWriter("null").writeNull()
+                duv1.vectorFor("i32").writeInt(0)
+                duv2.vectorFor("utf8").writeObject("first")
+                duv1.vectorFor("null").writeNull()
+                duv2.vectorFor("i32").writeInt(3)
+                duv1.vectorFor("utf8").writeObject("fourth")
+                duv2.vectorFor("null").writeNull()
 
                 val indirectRdr = MultiVectorReader(
                     listOf(duv1, duv2),
@@ -215,7 +215,7 @@ class MultiVectorReaderTest {
                 )
                 val r = 0..5
                 val expected = listOf(0, "first", null, 3, "fourth", null)
-                assertEquals(expected, indirectRdr.asList)
+                assertEquals(expected, indirectRdr.toList())
 
                 val pos = VectorPosition.build(0)
                 val valueRdr = indirectRdr.valueReader(pos)
@@ -229,7 +229,7 @@ class MultiVectorReaderTest {
                     val rowCopier = indirectRdr.rowCopier(resVec)
                     r.forEach { rowCopier.copyRow(it) }
 
-                    assertEquals(expected, resVec.asList)
+                    assertEquals(expected, resVec.toList())
                 }
             }
         }
@@ -243,7 +243,7 @@ class MultiVectorReaderTest {
         )
 
         Vector.fromField(alloc, duvField).use { duvVec1 ->
-            duvVec1.legWriter("i32").run { writeInt(0); writeInt(1) }
+            duvVec1.vectorFor("i32").run { writeInt(0); writeInt(1) }
 
             val indirectRdr = MultiVectorReader(
                 listOf(duvVec1),
@@ -253,7 +253,7 @@ class MultiVectorReaderTest {
 
             val r = 0..1
             val expected = listOf(0, 1)
-            assertEquals(expected, indirectRdr.asList)
+            assertEquals(expected, indirectRdr.toList())
 
             val pos = VectorPosition.build(0)
             val valueRdr = indirectRdr.valueReader(pos)

@@ -39,6 +39,9 @@
     :id :playground-port
     :parse-fn parse-long]
 
+   [nil "--force" "Confirm any destructive operations without prompting"
+    :id :force?]
+
    ["-h" "--help"]])
 
 (defn edn-file->config-opts
@@ -63,7 +66,7 @@
                 (true? playground-port) {::playground-port 5432}
                 (integer? playground-port) {::playground-port playground-port}
 
-                :else {:migrate-from-version migrate-from-version
+                :else {::migrate-from-version migrate-from-version
                        ::node-opts (let [file-extension (some-> file util/file-extension)
                                          yaml-file (if (= file-extension "yaml")
                                                      file
@@ -77,12 +80,11 @@
 
 (defn- shutdown-hook-promise []
   (let [main-thread (Thread/currentThread)
-        shutdown? (promise)]
+        !shutdown? (promise)]
     (.addShutdownHook (Runtime/getRuntime)
                       (Thread. (fn []
                                  (let [shutdown-ms 10000]
-                                   (deliver shutdown? true)
-                                   (shutdown-agents)
+                                   (deliver !shutdown? true)
                                    (.join main-thread shutdown-ms)
                                    (if (.isAlive main-thread)
                                      (do
@@ -91,27 +93,31 @@
 
                                      (log/info "Node stopped."))))
                                "xtdb.shutdown-hook-thread"))
-    shutdown?))
+    !shutdown?))
 
 #_{:clj-kondo/ignore [:clojure-lsp/unused-public-var]}
 (defn start-node-from-command-line [args]
   (util/install-uncaught-exception-handler!)
+
   (logging/set-from-env! (System/getenv))
 
   (try
-    (let [{::keys [errors help migrate-from-version playground-port node-opts]} (parse-args args)]
+    (let [{::keys [errors help migrate-from-version playground-port node-opts force?]} (parse-args args)]
       (cond
         errors (binding [*out* *err*]
                  (doseq [error errors]
                    (println error))
-                 (System/exit 1))
+                 (System/exit 2))
 
-        help (println help)
+        help (do
+               (println help)
+               (System/exit 0))
 
-        :else (util/with-open [_node (cond
-                                       playground-port (pgw/open-playground {:port playground-port})
-                                       migrate-from-version (mig/migrate-from migrate-from-version node-opts)
-                                       :else (xtn/start-node node-opts))]
+        migrate-from-version (System/exit (mig/migrate-from migrate-from-version node-opts {:force? force?}))
+
+        :else (util/with-open [_node (if playground-port
+                                       (pgw/open-playground {:port playground-port})
+                                       (xtn/start-node node-opts))]
                 (log/info "Node started")
                 ;; NOTE: This isn't registered until the node manages to start up
                 ;; cleanly, so ctrl-c keeps working as expected in case the node
@@ -119,6 +125,8 @@
                 @(shutdown-hook-promise)))
 
       (shutdown-agents))
+
     (catch Throwable t
-      (log/error "Error starting node" t)
-      (throw t))))
+      (shutdown-agents)
+      (log/error t "Uncaught exception running XTDB")
+      (System/exit 1))))

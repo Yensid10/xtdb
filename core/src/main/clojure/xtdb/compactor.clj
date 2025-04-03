@@ -10,11 +10,12 @@
            (xtdb.trie Trie$Key TrieCatalog)))
 
 (def ^:dynamic *ignore-signal-block?* false)
+(def ^:dynamic *recency-partition* nil)
 
 (defrecord Job [table-name trie-keys part out-trie-key partitioned-by-recency?]
   Compactor$Job
   (getTableName [_] table-name)
-  (getTrieKeys [_] (set trie-keys))
+  (getTrieKeys [_] trie-keys)
   (getPart [_] part)
   (getOutputTrieKey [_] out-trie-key)
   (getPartitionedByRecency [_] partitioned-by-recency?))
@@ -125,7 +126,7 @@
                             (into [] (mapcat (fn [table-name]
                                                (compaction-jobs table-name (cat/trie-state trie-catalog table-name) trie-catalog)))))))
 
-                   *ignore-signal-block?* threads *page-size*))
+                   *ignore-signal-block?* threads *page-size* *recency-partition*))
 
 (defmethod ig/init-key :xtdb/compactor [_ {:keys [threads] :as opts}]
   (if (pos? threads)
@@ -139,5 +140,7 @@
   (.signalBlock compactor))
 
 (defn compact-all!
-  ([node] (compact-all! node nil))
-  ([node timeout] (.compactAll ^Compactor (util/component node :xtdb/compactor) timeout)))
+  "`timeout` is now required, explicitly specify `nil` if you want to wait indefinitely."
+  [node timeout]
+
+  (.compactAll ^Compactor (util/component node :xtdb/compactor) timeout))
