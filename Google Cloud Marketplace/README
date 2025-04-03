@@ -1,0 +1,233 @@
+# XTDB on Google Cloud Marketplace
+
+## Overview
+
+XTDB is a general-purpose bitemporal database for SQL, Datalog & graph queries. It provides a flexible and powerful database solution with a focus on temporal features and immutable storage.
+
+For more information on XTDB, see the [XTDB website](https://xtdb.com/).
+
+## About Google Click to Deploy
+
+Popular open source software stacks on Kubernetes packaged by Google and made available in Google Cloud Marketplace.
+
+## Architecture
+
+This solution installs a single instance of XTDB server on your Kubernetes cluster.
+
+The XTDB deployment uses a GCS bucket for persistent storage and is exposed through a Kubernetes service. The deployment is configured with workload identity to securely access Google Cloud resources.
+
+## Prerequisites
+
+Before you begin, make sure you have the following tools installed:
+
+- [gcloud](https://cloud.google.com/sdk/gcloud/) - Google Cloud CLI
+- [kubectl](https://kubernetes.io/docs/tasks/tools/install-kubectl/) - Kubernetes command-line tool
+- [Docker](https://docs.docker.com/get-docker/) - Container platform (needs to be running)
+- [mpdev](https://github.com/GoogleCloudPlatform/marketplace-k8s-app-tools/blob/master/docs/tool-prerequisites.md) - GCP Marketplace deployment tool (requires Docker to be running)
+
+You'll also need:
+
+- An active **Google Cloud Project** with billing enabled
+- Required **Google Cloud APIs** enabled (**Cloud Storage**, **IAM**, **Kubernetes Engine**, **Compute Engine**)
+- Ensure the following **Permissions** are granted to the logged in user:
+  - **Storage Admin** - Required for creating and managing Google Cloud Storage buckets.
+  - **Service Account Admin** - Required for creating and managing service accounts.
+  - **Kubernetes Engine Admin** - Required for creating and managing Google Kubernetes Engine clusters and their resources.
+
+## Installation
+
+### Quick Install with Make
+
+The easiest way to deploy XTDB is using the provided Makefile. This will guide you through the entire process.
+
+```shell
+# Clone the repository
+git clone https://github.com/Yensid10/xtdb.git
+cd xtdb/Google\ Cloud\ Marketplace
+
+# View available commands
+make help
+
+# Deploy the complete solution
+make setup-all
+```
+
+### Manual Installation Steps
+
+If you prefer to follow the installation steps manually, follow this guide.
+
+#### 1. Set up your Google Cloud Project
+
+Ensure you're authenticated with gcloud and have set your project:
+
+```shell
+gcloud auth login
+gcloud config set project YOUR_PROJECT_ID
+```
+
+#### 2. Configure VPC Network
+
+You'll need a VPC network for your GKE cluster. You can either create a new one or use an existing one:
+
+```shell
+# Create a new VPC network
+gcloud compute networks create xtdb-vpc --subnet-mode=custom
+
+# Or use an existing one
+```
+
+#### 3. Configure Subnet
+
+Create a subnet within your VPC or use an existing one:
+
+```shell
+# Create a new subnet
+gcloud compute networks subnets create xtdb-vpc-subnet \
+  --network=xtdb-vpc \
+  --region=us-central1 \
+  --range=10.10.10.0/24
+
+# Or use an existing one
+```
+
+#### 4. Create Service Account
+
+Create a service account for XTDB with the necessary permissions:
+
+```shell
+gcloud iam service-accounts create xtdb-service-account \
+  --display-name="XTDB Service Account"
+
+gcloud projects add-iam-policy-binding YOUR_PROJECT_ID \
+  --member="serviceAccount:xtdb-service-account@YOUR_PROJECT_ID.iam.gserviceaccount.com" \
+  --role="roles/storage.admin"
+```
+
+#### 5. Create GCS Bucket for Storage
+
+```shell
+gcloud storage buckets create gs://xtdb-storage-YOUR_PROJECT_ID \
+  --location=us-central1 \
+  --default-storage-class=STANDARD
+```
+
+#### 6. Create GKE Cluster
+
+```shell
+gcloud container clusters create xtdb-cluster \
+  --zone=us-central1 \
+  --network=xtdb-vpc \
+  --subnetwork=xtdb-vpc-subnet \
+  --num-nodes=1 \
+  --machine-type=n2-highmem-2 \
+  --disk-size=50 \
+  --disk-type=pd-standard \
+  --local-ssd-count=1 \
+  --workload-pool=YOUR_PROJECT_ID.svc.id.goog
+
+gcloud container node-pools create application-pool \
+  --cluster=xtdb-cluster \
+  --zone=us-central1 \
+  --machine-type=n2-highmem-2 \
+  --disk-size=50 \
+  --disk-type=pd-standard \
+  --local-ssd-count=1 \
+  --num-nodes=1
+
+gcloud container clusters get-credentials xtdb-cluster \
+  --zone=us-central1
+```
+
+#### 7. Setup Kubernetes Namespace and Service Account
+
+```shell
+kubectl create namespace xtdb-deployment
+kubectl create serviceaccount xtdb-service-account --namespace xtdb-deployment
+```
+
+#### 8. Configure Workload Identity
+
+```shell
+gcloud iam service-accounts add-iam-policy-binding \
+  xtdb-service-account@YOUR_PROJECT_ID.iam.gserviceaccount.com \
+  --role roles/iam.workloadIdentityUser \
+  --member "serviceAccount:YOUR_PROJECT_ID.svc.id.goog[xtdb-deployment/xtdb-service-account]"
+
+kubectl annotate serviceaccount xtdb-service-account \
+  --namespace xtdb-deployment \
+  iam.gke.io/gcp-service-account=xtdb-service-account@YOUR_PROJECT_ID.iam.gserviceaccount.com
+```
+
+#### 9. Deploy XTDB
+
+```shell
+kubectl apply -f "https://raw.githubusercontent.com/GoogleCloudPlatform/marketplace-k8s-app-tools/master/crd/app-crd.yaml"
+
+# Set deployment parameters
+PARAMETERS='{
+  "name": "xtdb-kubernetes-deployment",
+  "namespace": "xtdb-deployment",
+  "xtdb.serviceAccount": "xtdb-service-account",
+  "xtdbConfig.gcpProjectId": "YOUR_PROJECT_ID",
+  "xtdbConfig.gcpBucket": "xtdb-storage-YOUR_PROJECT_ID"
+}'
+
+# Deploy using mpdev
+mpdev install --deployer=us-central1-docker.pkg.dev/bcs-test-450214/xtdb-repo/xtdb/deployer:1.0.0 \
+  --parameters="$PARAMETERS"
+```
+
+## Connecting to XTDB
+
+After deployment, you can connect to XTDB using:
+
+```shell
+# Get the service IP
+XTDB_IP=$(kubectl get svc xtdb-service --namespace xtdb-deployment -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+
+# Connect using psql
+psql "host=$XTDB_IP port=5432 user=xtdb"
+```
+
+Or simply run:
+
+```shell
+make connect
+```
+
+## Cleanup
+
+To clean up all resources when you're done:
+
+```shell
+# Complete cleanup
+make cleanup-all
+
+# Or clean up components individually
+make cleanup-deployment  # Remove the XTDB Kubernetes deployment
+make cleanup-infra       # Remove GKE cluster, GCS bucket, and other GCP resources
+```
+
+## Troubleshooting
+
+If you encounter issues during deployment:
+
+1. Check the pod status:
+   ```shell
+   kubectl get pods -n xtdb-deployment
+   ```
+
+2. View pod logs:
+   ```shell
+   kubectl logs -n xtdb-deployment <pod-name>
+   ```
+
+3. Verify that Docker is running on your system before deploying XTDB.
+
+4. Ensure all required GCP APIs are enabled in your project.
+
+## Additional Resources
+
+- [XTDB Documentation](https://docs.xtdb.com/)
+- [Google Kubernetes Engine Documentation](https://cloud.google.com/kubernetes-engine/docs)
+- [Google Cloud Storage Documentation](https://cloud.google.com/storage/docs)
