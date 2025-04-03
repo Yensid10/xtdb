@@ -3,22 +3,9 @@
             [clojure.string :as str]
             [xtdb.expression :as expr]
             [xtdb.logical-plan :as lp]
-            [xtdb.types :as types]
-            [xtdb.util :as util]
-            [xtdb.vector.reader :as vr]
-            [xtdb.vector.writer :as vw])
-  (:import java.time.Clock
-           java.util.ArrayList
-           java.util.function.Consumer
-           java.util.List
-           org.apache.arrow.memory.BufferAllocator
-           org.apache.arrow.vector.BigIntVector
-           org.apache.arrow.vector.complex.StructVector
-           (org.apache.arrow.vector.types.pojo Field FieldType)
-           xtdb.ICursor
-           xtdb.operator.ProjectionSpec
-           xtdb.vector.IVectorReader
-           xtdb.vector.RelationReader))
+            [xtdb.types :as types])
+  (:import (org.apache.arrow.vector.types.pojo Field)
+           (xtdb.operator ProjectCursor ProjectionSpec ProjectionSpec$Identity ProjectionSpec$Rename ProjectionSpec$RowNumber ProjectionSpec$Star)))
 
 (s/def ::append-columns? boolean?)
 
@@ -47,121 +34,35 @@
 
 (set! *unchecked-math* :warn-on-boxed)
 
-(defrecord IdentityProjectionSpec [col-name col-type]
-  ProjectionSpec
-  (getColumnName [_] col-name)
-  (getColumnType [_] col-type)
-  (project [_ _allocator in-rel _schema _args]
-    (.readerForName in-rel (str col-name))))
+(defn ->identity-projection-spec ^ProjectionSpec [field]
+  (ProjectionSpec$Identity. field))
 
-(defn ->identity-projection-spec ^ProjectionSpec [col-name field]
-  (->IdentityProjectionSpec col-name (types/field->col-type field)))
-
-(defn ->row-number-projection-spec ^ProjectionSpec [col-name]
-  (let [row-num (long-array [1])]
-    (reify ProjectionSpec
-      (getColumnName [_] col-name)
-      (getColumnType [_] :i64)
-      (project [_ allocator in-rel _schema _args]
-        (util/with-close-on-catch [row-num-wtr (vw/->writer (BigIntVector. (str col-name) (FieldType/notNullable #xt.arrow/type :i64) allocator))]
-          (let [start-row-num (aget row-num 0)
-                row-count (.rowCount in-rel)]
-            (dotimes [idx row-count]
-              (.writeLong row-num-wtr (+ idx start-row-num)))
-            (aset row-num 0 (+ start-row-num row-count))
-            (vw/vec-wtr->rdr row-num-wtr)))))))
-
-(defn ->star-projection-spec ^ProjectionSpec [col-name col-type]
-  (reify ProjectionSpec
-    (getColumnName [_] col-name)
-    (getColumnType [_] col-type)
-    (project [_ allocator in-rel _schema _args]
-      (let [row-count (.rowCount in-rel)]
-        (util/with-close-on-catch [^StructVector struct-vec (-> ^Field (apply types/->field (str col-name) #xt.arrow/type :struct false
-                                                                              (for [^IVectorReader col in-rel]
-                                                                                (types/field-with-name (.getField col) (.getName col))))
-                                                                (.createVector allocator))]
-
-          ;; TODO can we quickly set all of these to 1?
-          (dotimes [idx row-count]
-            (.setIndexDefined struct-vec idx))
-
-          (doseq [^IVectorReader col in-rel]
-            (.copyTo col (.getChild struct-vec (.getName col))))
-
-          (.setValueCount struct-vec (.rowCount in-rel))
-
-          (vr/vec->reader struct-vec))))))
-
-(defrecord RenameProjectionSpec [to-name from-name col-type]
-  ProjectionSpec
-  (getColumnName [_] to-name)
-  (getColumnType [_] col-type)
-  (project [_ _allocator in-rel _schema _args]
-    (or (some-> (.readerForName in-rel (str from-name))
-                (.withName (str to-name)))
-        (throw (ex-info (str "Column " from-name " not found in relation")
-                        {:from-name from-name
-                         :to-name to-name
-                         :relation (into #{} (map #(.getName ^IVectorReader %)) in-rel)})))))
-
-(defn ->rename-projection-spec ^ProjectionSpec [to-name from-name field]
-  (->RenameProjectionSpec to-name from-name (types/field->col-type field)))
-
-(deftype ProjectCursor [^BufferAllocator allocator
-                        ^ICursor in-cursor
-                        ^List #_<ProjectionSpec> projection-specs
-                        ^Clock clock
-                        schema
-                        args]
-  ICursor
-  (tryAdvance [_ c]
-    (.tryAdvance in-cursor
-                 (reify Consumer
-                   (accept [_ read-rel]
-                     (let [^RelationReader read-rel read-rel
-                           close-cols (ArrayList.)
-                           out-cols (ArrayList.)]
-                       (try
-                         (doseq [^ProjectionSpec projection-spec projection-specs]
-                           (let [out-col (.project projection-spec allocator read-rel schema args)]
-                             (when-not (or (instance? IdentityProjectionSpec projection-spec)
-                                           (instance? RenameProjectionSpec projection-spec))
-                               (.add close-cols out-col))
-                             (.add out-cols out-col)))
-
-                         (.accept c (vr/rel-reader out-cols (.rowCount read-rel)))
-
-                         (finally
-                           (run! util/try-close close-cols))))))))
-
-  (close [_]
-    (util/try-close in-cursor)))
-
-(defn ->project-cursor [{:keys [allocator clock args schema]} in-cursor projection-specs]
-  (->ProjectCursor allocator in-cursor projection-specs clock schema args))
+(defn ->project-cursor [{:keys [allocator args schema]} in-cursor projection-specs]
+  (ProjectCursor. allocator in-cursor projection-specs schema args))
 
 (defmethod lp/emit-expr :project [{:keys [projections relation], {:keys [append-columns?]} :opts} {:keys [param-fields] :as args}]
   (let [emitted-child-relation (lp/emit-expr relation args)]
     (lp/unary-expr emitted-child-relation
       (fn [inner-fields]
         (let [projection-specs (concat (when append-columns?
-                                         (for [[col-name field] inner-fields]
-                                           (->identity-projection-spec col-name field)))
+                                         (for [[_col-name field] inner-fields]
+                                           (->identity-projection-spec field)))
                                        (for [[p-type arg] projections]
                                          (case p-type
-                                           :column (->identity-projection-spec arg (get inner-fields arg))
+                                           :column (->identity-projection-spec (-> (get inner-fields arg)
+                                                                                   (types/field-with-name (str arg))))
 
                                            :row-number-column (let [[col-name _form] (first arg)]
-                                                                (->row-number-projection-spec col-name))
+                                                                (ProjectionSpec$RowNumber. (str col-name)))
 
                                            :star (let [[col-name _star] (first arg)]
-                                                   (->star-projection-spec col-name [:struct (update-vals inner-fields types/field->col-type)]))
+                                                   (ProjectionSpec$Star. (apply types/->field (str col-name) #xt.arrow/type :struct false (vals inner-fields))))
 
                                            :rename (let [[to-name from-name] (first arg)
-                                                         field (get inner-fields from-name)]
+                                                         field (some-> (get inner-fields from-name)
+                                                                       (types/field-with-name (str to-name)))]
                                                      (assert field (format "Field %s not found in relation, available %s" from-name (pr-str (keys inner-fields))))
-                                                     (->rename-projection-spec to-name from-name field))
+                                                     (ProjectionSpec$Rename. (str from-name) field))
 
                                            :extend (let [[col-name form] (first arg)
                                                          input-types {:col-types (update-vals inner-fields types/field->col-type)
@@ -169,8 +70,8 @@
                                                          expr (expr/form->expr form input-types)]
                                                      (expr/->expression-projection-spec col-name expr input-types)))))]
           {:fields (->> projection-specs
-                        (into {} (map (juxt #(.getColumnName ^ProjectionSpec %)
-                                            (comp types/col-type->field #(.getColumnType ^ProjectionSpec %))))))
+                        (into {} (map (comp (juxt #(symbol (.getName ^Field %)) identity)
+                                            #(.getField ^ProjectionSpec %)))))
            :stats (:stats emitted-child-relation)
            :->cursor (fn [opts in-cursor]
                        (->project-cursor opts in-cursor projection-specs))})))))

@@ -33,21 +33,21 @@ constructor(
 
     val liveRelation: IRelationWriter = Trie.openLogDataWriter(al)
 
-    private val iidWtr = liveRelation.colWriter("_iid")
-    private val systemFromWtr = liveRelation.colWriter("_system_from")
-    private val validFromWtr = liveRelation.colWriter("_valid_from")
-    private val validToWtr = liveRelation.colWriter("_valid_to")
+    private val iidWtr = liveRelation.vectorFor("_iid")
+    private val systemFromWtr = liveRelation.vectorFor("_system_from")
+    private val validFromWtr = liveRelation.vectorFor("_valid_from")
+    private val validToWtr = liveRelation.vectorFor("_valid_to")
 
     var liveTrie: MemoryHashTrie = liveTrieFactory(iidWtr.vector.asReader)
 
     private val iidRdr = iidWtr.asReader
 
-    private val opWtr = liveRelation.colWriter("op")
-    private val putWtr = opWtr.legWriter("put")
-    private val deleteWtr = opWtr.legWriter("delete")
-    private val eraseWtr = opWtr.legWriter("erase")
+    private val opWtr = liveRelation.vectorFor("op")
+    private val putWtr = opWtr.vectorFor("put")
+    private val deleteWtr = opWtr.vectorFor("delete")
+    private val eraseWtr = opWtr.vectorFor("erase")
 
-    private val trieWriter = TrieWriter(al, bp, false)
+    private val trieWriter = TrieWriter(al, bp, calculateBlooms = false)
     private val trieMetadataCalculator = TrieMetadataCalculator(
         VectorReader.from(iidRdr), validFromWtr.asReader, validToWtr.asReader, systemFromWtr.asReader
     )
@@ -77,10 +77,10 @@ constructor(
         val docWriter: IVectorWriter = putWtr
         val liveRelation: IRelationWriter = this@LiveTable.liveRelation
 
-        private val startPos = liveRelation.writerPosition().position
+        private val startPos = liveRelation.rowCount
 
         fun logPut(iid: ByteBuffer, validFrom: Long, validTo: Long, writeDocFun: Runnable) {
-            val pos = liveRelation.writerPosition().position
+            val pos = liveRelation.rowCount
 
             iidWtr.writeBytes(iid)
             systemFromWtr.writeLong(systemFrom)
@@ -96,7 +96,7 @@ constructor(
         }
 
         fun logDelete(iid: ByteBuffer, validFrom: Long, validTo: Long) {
-            val pos = liveRelation.writerPosition().position
+            val pos = liveRelation.rowCount
 
             iidWtr.writeBytes(iid)
             systemFromWtr.writeLong(systemFrom)
@@ -110,7 +110,7 @@ constructor(
         }
 
         fun logErase(iid: ByteBuffer) {
-            val pos = liveRelation.writerPosition().position
+            val pos = liveRelation.rowCount
 
             iidWtr.writeBytes(iid)
             systemFromWtr.writeLong(systemFrom)
@@ -124,9 +124,9 @@ constructor(
         }
 
         fun commit(): LiveTable {
-            val pos = liveRelation.writerPosition().position
+            val pos = liveRelation.rowCount
             trieMetadataCalculator.update(startPos, pos)
-            hllCalculator.update(putWtr.asReader, startPos, pos)
+            hllCalculator.update(opWtr.asReader, startPos, pos)
 
             liveTrie = transientTrie
 
@@ -144,7 +144,7 @@ constructor(
     fun startTx(txKey: TransactionKey, newLiveTable: Boolean) = Tx(txKey, newLiveTable)
 
     private val IRelationWriter.fields
-        get() = colWriter("op").legWriter("put").field
+        get() = this.vectorFor("op").vectorFor("put").field
             .also { assert(it.type is ArrowType.Struct) }
             .children
             .associateBy { it.name }
@@ -161,7 +161,7 @@ constructor(
 
     private fun openWatermark(trie: MemoryHashTrie): Watermark {
         val wmLiveRel = liveRelation.openWatermarkLiveRel()
-        val wmLiveTrie = trie.withIidReader(wmLiveRel.readerForName("_iid"))
+        val wmLiveTrie = trie.withIidReader(wmLiveRel["_iid"])
 
         return Watermark(liveRelation.fields, wmLiveRel, wmLiveTrie)
     }
@@ -179,11 +179,11 @@ constructor(
 
     fun finishBlock(blockIdx: BlockIndex): FinishedBlock? {
         liveRelation.syncRowCount()
-        val rowCount = liveRelation.writerPosition().position
+        val rowCount = liveRelation.rowCount
         if (rowCount == 0) return null
         val trieKey = Trie.l0Key(blockIdx).toString()
 
-        return liveRelation.openAsRelation().useAll { dataRel ->
+        return liveRelation.openAsRelation().use { dataRel ->
             val dataFileSize = trieWriter.writeLiveTrie(tableName, trieKey, liveTrie, dataRel)
             FinishedBlock(
                 liveRelation.fields, trieKey, dataFileSize, rowCount,

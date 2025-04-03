@@ -9,6 +9,7 @@ import xtdb.arrow.RelationReader
 import xtdb.bitemporal.PolygonCalculator
 import xtdb.compactor.OutWriter.OutWriters
 import xtdb.compactor.OutWriter.RecencyRowCopier
+import xtdb.compactor.RecencyPartition.*
 import xtdb.trie.*
 import xtdb.trie.Trie.dataRelSchema
 import xtdb.types.Fields.mergeFields
@@ -34,10 +35,10 @@ private fun ByteArray.toPathPredicate() =
         Arrays.equals(this, 0, len, pagePath, 0, len)
     }
 
-private fun <N : HashTrie.Node<N>, L : N> MergePlanNode<N, L>.loadDataPage(): RelationReader<*>? =
+private fun <N : HashTrie.Node<N>, L : N> MergePlanNode<N, L>.loadDataPage(): RelationReader? =
     segment.dataRel?.loadPage(node)
 
-internal class SegmentMerge(private val al: BufferAllocator) {
+internal class SegmentMerge(private val al: BufferAllocator) : AutoCloseable {
 
     class Result(internal val path: Path, val recency: LocalDate?, val leaves: List<PageTree.Leaf>) : AutoCloseable {
         fun openForRead() = path.openReadableChannel()
@@ -83,7 +84,7 @@ internal class SegmentMerge(private val al: BufferAllocator) {
         val mergeQueue = PriorityQueue(Comparator.comparing(QueueElem::evPtr, EventRowPointer.comparator()))
 
         for (dataReader in mpNodes.mapNotNull { it.loadDataPage() }) {
-            val evPtr = EventRowPointer.XtArrow(dataReader, path)
+            val evPtr = EventRowPointer(dataReader, path)
             val rowCopier = outWriter.rowCopier(dataReader)
 
             if (evPtr.isValid(isValidPtr, path))
@@ -91,12 +92,15 @@ internal class SegmentMerge(private val al: BufferAllocator) {
         }
 
         var seenErase = false
+        val iidPtr = ArrowBufPointer()
 
         val polygonCalculator = PolygonCalculator()
 
         while (true) {
             val elem = mergeQueue.poll() ?: break
             val (evPtr, rowCopier) = elem
+
+            if (polygonCalculator.currentIidPtr != evPtr.getIidPointer(iidPtr)) seenErase = false
 
             when (val polygon = polygonCalculator.calculate(evPtr)) {
                 null -> {
@@ -122,15 +126,17 @@ internal class SegmentMerge(private val al: BufferAllocator) {
         class Preserve(val recency: LocalDate?) : RecencyPartitioning
     }
 
+    @JvmOverloads
     fun mergeSegments(
         segments: List<ISegment<*, *>>,
         pathFilter: ByteArray?,
         recencyPartitioning: RecencyPartitioning,
+        recencyPartition: RecencyPartition? = WEEK
     ): Results {
         val schema = logDataRelSchema(segments.map { it.dataRel!!.schema })
 
         val outWriter = when(recencyPartitioning) {
-            RecencyPartitioning.Partition -> outWriters.PartitionedOutWriter(schema)
+            RecencyPartitioning.Partition -> outWriters.PartitionedOutWriter(schema, recencyPartition)
             is RecencyPartitioning.Preserve -> outWriters.OutRel(schema, recency = recencyPartitioning.recency)
         }
 
@@ -144,4 +150,6 @@ internal class SegmentMerge(private val al: BufferAllocator) {
             it.end()
         }
     }
+
+    override fun close() = outWriters.close()
 }

@@ -3,6 +3,7 @@
             [clojure.string :as str]
             [clojure.test :as t]
             [xtdb.api :as xt]
+            [xtdb.check-pbuf :as cpb]
             [xtdb.compactor :as c]
             [xtdb.metadata :as meta]
             [xtdb.node :as xtn]
@@ -20,6 +21,7 @@
            xtdb.api.storage.Storage
            (xtdb.arrow RelationReader)
            [xtdb.block.proto TableBlock]
+           (xtdb.compactor RecencyPartition)
            (xtdb.trie DataRel Trie)))
 
 (t/use-fixtures :each tu/with-allocator tu/with-node)
@@ -478,7 +480,7 @@
         (dotimes [v 12]
           (xt/execute-tx node [[:put-docs :docs {:xt/id 0, :v v} {:xt/id 1, :v v}]]))
 
-        (c/compact-all! node)
+        (c/compact-all! node #xt/duration "PT2S")
 
         (t/is (= #{{:xt/id 0, :count 12} {:xt/id 1, :count 12}}
                  (set (xt/q node "SELECT _id, count(*) count
@@ -556,20 +558,21 @@
                                          :valid-to #xt/instant "2011-01-01T00:00:00Z"}
                               {:xt/id 1}]])
         (tu/finish-block! node)
+        ;; to have consistent block files
+        (c/compact-all! node #xt/duration "PT5S")
 
         (xt/execute-tx node [[:put-docs {:into :foo
                                          :valid-from #xt/instant "2015-01-01T00:00:00Z"
                                          :valid-to #xt/instant "2016-01-01T00:00:00Z"}
                               {:xt/id 2}]])
-        (tu/finish-block! node)
+        (tu/finish-block! node )
 
-        (c/compact-all! node)
+        (c/compact-all! node #xt/duration "PT5S")
         ;; to artifically create a new table block
         (tu/finish-block! node)
 
-
-        (t/is (= (os/->StoredObject "tables/public$foo/blocks/b02.binpb" 4858)
-                 (last (.listAllObjects bp (table-cat/->table-block-dir "public/foo")))))
+        (cpb/check-pbuf (.toPath (io/as-file (io/resource "xtdb/compactor-test/compactor-metadata-test")))
+                        (.resolve node-dir "objects"))
 
         (let [current-tries (->> (.getByteArray bp (util/->path "tables/public$foo/blocks/b02.binpb"))
                                  TableBlock/parseFrom
@@ -600,3 +603,41 @@
                         (into {} (map (juxt :trie-key
                                             (fn [{:keys [trie-metadata]}]
                                               (dissoc trie-metadata :iid-bloom)))))))))))))
+
+(t/deftest different-recency-partitioning
+  (binding [c/*recency-partition* RecencyPartition/YEAR]
+    (with-open [node (xtn/start-node (merge tu/*node-opts* {:log [:in-memory {:instant-src (tu/->mock-clock (tu/->instants :year))}]}))]
+      (let [tc (tu/component node :xtdb/trie-catalog)]
+        (xt/execute-tx node [[:put-docs :docs {:xt/id 1 :version 1}]])
+        (xt/execute-tx node [[:put-docs :docs {:xt/id 1 :version 2}]])
+        (xt/execute-tx node [[:put-docs :docs {:xt/id 1 :version 3}]])
+        (tu/finish-block! node)
+        (c/compact-all! node #xt/duration "PT1S")
+
+        (t/is (= #{"l01-r20210101-b00" "l01-r20220101-b00" "l01-rc-b00"}
+                 (->> (cat/trie-state tc "public/docs")
+                      (cat/current-tries)
+                      (into #{} (map :trie-key)))))))))
+
+(t/deftest dont-lose-erases-during-compaction
+  (xt/submit-tx tu/*node* [[:put-docs :foo {:xt/id 1 :xt/valid-to #inst "2050"} {:xt/id 2 :xt/valid-to #inst "2050"}]])
+  (tu/finish-block! tu/*node*)
+  (c/compact-all! tu/*node* #xt/duration "PT1S")
+
+  (xt/submit-tx tu/*node* [[:erase-docs :foo 1 2]])
+
+  (t/is (= [] (xt/q tu/*node* "SELECT _id FROM foo")))
+
+  (tu/finish-block! tu/*node*)
+  (c/compact-all! tu/*node* #xt/duration "PT1S")
+
+  (t/is (= [] (xt/q tu/*node* "SELECT _id FROM foo"))))
+
+(t/deftest null-duv-issue-4231
+  (xt/execute-tx tu/*node* [[:put-docs :docs {:xt/id 1 :l [{:foo 1}]}]] )
+  (xt/execute-tx tu/*node* [[:put-docs :docs {:xt/id 2 :l []}]])
+  (tu/finish-block! tu/*node*)
+  (c/compact-all! tu/*node* nil)
+
+  (t/is (= [{:xt/id 2, :l []} {:xt/id 1, :l [{:foo 1}]}]
+           (xt/q tu/*node* ["SELECT * FROM docs" ]))))

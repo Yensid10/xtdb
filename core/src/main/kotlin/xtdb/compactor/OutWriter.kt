@@ -5,6 +5,7 @@ import org.apache.arrow.memory.BufferAllocator
 import org.apache.arrow.vector.types.pojo.Schema
 import xtdb.arrow.Relation
 import xtdb.arrow.RelationReader
+import xtdb.compactor.RecencyPartition.*
 import xtdb.compactor.SegmentMerge.Results
 import xtdb.time.microsAsInstant
 import xtdb.trie.Trie
@@ -14,20 +15,56 @@ import java.nio.file.Path
 import java.time.DayOfWeek
 import java.time.LocalDate
 import java.time.ZoneOffset
+import java.time.ZonedDateTime
+import java.time.temporal.TemporalAdjusters
 import java.time.temporal.TemporalAdjusters.next
+import kotlin.io.path.ExperimentalPathApi
 import kotlin.io.path.createTempDirectory
 import kotlin.io.path.createTempFile
+import kotlin.io.path.deleteRecursively
 
 private typealias RecencyMicros = Long
 
-internal fun RecencyMicros.toPartition(): LocalDate =
+enum class RecencyPartition {
+    WEEK,
+    MONTH,
+    QUARTER,
+    YEAR;
+}
+
+internal fun ZonedDateTime.roundToNextPartition(recencyPartition: RecencyPartition): ZonedDateTime =
+    // No need to round below day level as these get dropped in the TrieKey anyway
+    when (recencyPartition) {
+        WEEK -> this.with(next(DayOfWeek.MONDAY))
+        MONTH -> this.with(TemporalAdjusters.firstDayOfNextMonth())
+        QUARTER -> {
+            val month = this.monthValue
+            val nextQuarterMonth = when {
+                month < 4 -> 4
+                month < 7 -> 7
+                month < 10 -> 10
+                else -> 1
+            }
+
+            var result = this
+            if (month >= 10) {
+                result = result.plusYears(1)
+            }
+
+            result.withMonth(nextQuarterMonth)
+                .withDayOfMonth(1)
+        }
+        YEAR -> this.with(TemporalAdjusters.firstDayOfNextYear())
+    }
+
+internal fun RecencyMicros.toPartition(recencyPartition: RecencyPartition = WEEK): LocalDate =
     microsAsInstant.minusNanos(1)
         .atZone(ZoneOffset.UTC)
-        .with(next(DayOfWeek.MONDAY))
+        .roundToNextPartition(recencyPartition)
         .toLocalDate()
 
 internal interface OutWriter : AutoCloseable {
-    fun rowCopier(reader: RelationReader<*>): RecencyRowCopier
+    fun rowCopier(reader: RelationReader): RecencyRowCopier
     fun endPage(path: ByteArrayList)
 
     /**
@@ -39,38 +76,21 @@ internal interface OutWriter : AutoCloseable {
         fun copyRow(recency: RecencyMicros, sourceIndex: Int): Int
     }
 
-    class OutWriters(private val al: BufferAllocator) {
+    class OutWriters(private val al: BufferAllocator): AutoCloseable {
+
+        private val tempDir = createTempDirectory("compactor")
+
         private class CopierFactory(private val dataRel: Relation) {
-            private val iidWtr = dataRel["_iid"]
-            private val sfWtr = dataRel["_system_from"]
-            private val vfWtr = dataRel["_valid_from"]
-            private val vtWtr = dataRel["_valid_to"]
-            private val opWtr = dataRel["op"]
+            fun rowCopier(dataReader: RelationReader) = object : RecencyRowCopier {
+                private val copier = dataRel.rowCopier(dataReader)
 
-            fun rowCopier(dataReader: RelationReader<*>) = object : RecencyRowCopier {
-                private val iidCopier = dataReader["_iid"].rowCopier(iidWtr)
-                private val sfCopier = dataReader["_system_from"].rowCopier(sfWtr)
-                private val vfCopier = dataReader["_valid_from"].rowCopier(vfWtr)
-                private val vtCopier = dataReader["_valid_to"].rowCopier(vtWtr)
-                private val opCopier = dataReader["op"].rowCopier(opWtr)
-
-                override fun copyRow(recency: RecencyMicros, sourceIndex: Int): Int {
-                    val pos = iidCopier.copyRow(sourceIndex)
-
-                    sfCopier.copyRow(sourceIndex)
-                    vfCopier.copyRow(sourceIndex)
-                    vtCopier.copyRow(sourceIndex)
-                    opCopier.copyRow(sourceIndex)
-                    dataRel.endRow()
-
-                    return pos
-                }
+                override fun copyRow(recency: RecencyMicros, sourceIndex: Int): Int = copier.copyRow(sourceIndex)
             }
         }
 
         internal inner class OutRel(
             schema: Schema,
-            private val outPath: Path = createTempFile("merged-segments", ".arrow"),
+            private val outPath: Path = createTempFile(tempDir, "merged-segments", ".arrow"),
             val recency: LocalDate?
         ) : OutWriter {
             private val outRel = Relation(al, schema)
@@ -86,7 +106,7 @@ internal interface OutWriter : AutoCloseable {
 
             val leaves: List<PageTree.Leaf> get() = leaves0
 
-            override fun rowCopier(reader: RelationReader<*>) = copierFactory.rowCopier(reader)
+            override fun rowCopier(reader: RelationReader) = copierFactory.rowCopier(reader)
 
             override fun endPage(path: ByteArrayList) {
                 if (outRel.rowCount == 0) return
@@ -108,8 +128,8 @@ internal interface OutWriter : AutoCloseable {
             }
         }
 
-        internal inner class PartitionedOutWriter(private val schema: Schema) : OutWriter {
-            private val outDir = createTempDirectory("merged-segments")
+        internal inner class PartitionedOutWriter(private val schema: Schema, private val recencyPartition: RecencyPartition?) : OutWriter {
+            private val outDir = createTempDirectory(tempDir, "merged-segments")
             private var currentRel = OutRel(schema, outDir.resolve("rc.arrow"), null)
 
             private val historicalRels = mutableMapOf<LocalDate, OutRel>()
@@ -118,13 +138,13 @@ internal interface OutWriter : AutoCloseable {
                 OutRel(schema, outDir.resolve("r${Trie.RECENCY_FMT.format(it)}.arrow"), recencyPartition)
             }
 
-            override fun rowCopier(reader: RelationReader<*>) = object : RecencyRowCopier {
+            override fun rowCopier(reader: RelationReader) = object : RecencyRowCopier {
                 private val currentCopier = currentRel.rowCopier(reader)
                 private val historicalCopiers = mutableMapOf<LocalDate, RecencyRowCopier>()
 
                 private fun copier(recency: RecencyMicros) =
                     if (recency == Long.MAX_VALUE) currentCopier
-                    else historicalCopiers.computeIfAbsent(recency.toPartition()) { historicalRel(it).rowCopier(reader) }
+                    else historicalCopiers.computeIfAbsent(recency.toPartition(this@PartitionedOutWriter.recencyPartition ?: WEEK)) { historicalRel(it).rowCopier(reader) }
 
                 override fun copyRow(recency: RecencyMicros, sourceIndex: Int) =
                     copier(recency).copyRow(recency, sourceIndex)
@@ -142,6 +162,11 @@ internal interface OutWriter : AutoCloseable {
                 historicalRels.closeAll()
                 currentRel.close()
             }
+        }
+
+        @OptIn(ExperimentalPathApi::class)
+        override fun close() {
+            tempDir.deleteRecursively()
         }
     }
 }

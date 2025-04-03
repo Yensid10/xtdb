@@ -2076,8 +2076,7 @@
            (set (xt/q node '(from :ints {:bind [{:n n :xt/id 0 :xt/valid-time valid-time}]
                                          :for-valid-time (in #inst "2020-01-01" #inst "2020-01-06")})))))))
 
-
-(t/deftest sort-current-tries-by-block-index-2531
+(t/deftest sort-current-tries-by-block-index-4191
   (with-open [node (xtn/start-node (merge tu/*node-opts* {:compactor {:threads 0}
                                                           :indexer {:rows-per-block 1}
                                                           :log [:in-memory {:instant-src (tu/->mock-clock)}]}))]
@@ -2085,7 +2084,7 @@
     ;; creating l00-00
     (xt/submit-tx node [[:put-docs :ints {:xt/id 0 :v 0}]])
     ;; creating l01-00
-    (c/compact-all! node)
+    (c/compact-all! node #xt/duration "PT1S")
     ;; creating l00-01, bounds v0 in valid-time, but not relevant for the query
     (xt/submit-tx node [[:put-docs :ints {:xt/id 0 :v 1}]])
 

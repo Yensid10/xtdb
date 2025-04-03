@@ -29,7 +29,7 @@ class StructVectorTest {
 
     @Test
     fun structVectorValues() {
-        val children = linkedMapOf(
+        val children = linkedMapOf<String, Vector>(
             "i32" to IntVector(allocator, "i32", false),
             "utf8" to Utf8Vector(allocator, "utf8", true)
         )
@@ -43,20 +43,20 @@ class StructVectorTest {
             structVec.writeObject(m2)
             structVec.writeObject(m3)
 
-            assertEquals(listOf(m1, m2, m3), structVec.asList)
+            assertEquals(listOf(m1, m2, m3), structVec.toList())
         }
     }
 
     @Test
     fun useNestedWriters() {
-        val children = linkedMapOf(
+        val children = linkedMapOf<String, Vector>(
             "i32" to IntVector(allocator, "i32", false),
             "utf8" to Utf8Vector(allocator, "utf8", true)
         )
 
         StructVector(allocator, "struct", false, children).use { structVec ->
-            val i32Writer = structVec.keyWriter("i32")
-            val utf8Writer = structVec.keyWriter("utf8")
+            val i32Writer = structVec.vectorFor("i32")
+            val utf8Writer = structVec.vectorFor("utf8")
 
             i32Writer.writeInt(4)
             utf8Writer.writeObject("Hello")
@@ -75,7 +75,7 @@ class StructVectorTest {
                     mapOf("i32" to 8),
                     mapOf("i32" to 12, "utf8" to "world!")
                 ),
-                structVec.asList
+                structVec.toList()
             )
         }
     }
@@ -83,12 +83,12 @@ class StructVectorTest {
     @Test
     fun createsMissingVectors() {
         StructVector(allocator, "struct", false).use { structVec ->
-            val i32Writer = structVec.keyWriter("i32", 4.toFieldType())
+            val i32Writer = structVec.vectorFor("i32", 4.toFieldType())
 
             i32Writer.writeInt(4)
             structVec.endStruct()
 
-            val utf8Writer = structVec.keyWriter("utf8", "foo".toFieldType())
+            val utf8Writer = structVec.vectorFor("utf8", "foo".toFieldType())
 
             i32Writer.writeInt(8)
             utf8Writer.writeObject("Hello")
@@ -104,7 +104,7 @@ class StructVectorTest {
                     mapOf("i32" to 8, "utf8" to "Hello"),
                     mapOf("i32" to 12, "utf8" to "world!")
                 ),
-                structVec.asList
+                structVec.toList()
             )
         }
 
@@ -118,7 +118,7 @@ class StructVectorTest {
 
         val buf = ByteArrayOutputStream()
 
-        val children = linkedMapOf(
+        val children = linkedMapOf<String, Vector>(
             "i32" to IntVector(allocator, "i32", false),
             "utf8" to Utf8Vector(allocator, "utf8", true)
         )
@@ -147,7 +147,7 @@ class StructVectorTest {
 
         loader(allocator, buf.toByteArray().asChannel).use { loader ->
             Relation(allocator, loader.schema).use { rel ->
-                val structVec = rel["struct"]!!
+                val structVec = rel["struct"]
 
                 assertEquals(2, loader.pageCount)
 
@@ -204,9 +204,9 @@ class StructVectorTest {
             )))
 
         StructVector(allocator, "struct", false, children).use { structVec ->
-            val i32Writer = structVec.keyWriter("i32")
-            val duvWriter = structVec.keyWriter("duv")
-            val nestedUtf8Writer = duvWriter.legWriter("utf8")
+            val i32Writer = structVec.vectorFor("i32")
+            val duvWriter = structVec.vectorFor("duv")
+            val nestedUtf8Writer = duvWriter.vectorFor("utf8")
             i32Writer.writeInt(1)
             nestedUtf8Writer.writeObject("one")
             structVec.endStruct()
@@ -219,7 +219,7 @@ class StructVectorTest {
                     mapOf("i32" to 1, "duv" to "one"),
                     mapOf("i32" to 2),
                 ),
-                structVec.asList
+                structVec.toList()
             )
         }
     }
@@ -236,11 +236,11 @@ class StructVectorTest {
             structVec.writeObject(els[1])
             structVec.writeObject(els[2])
 
-            assertEquals(els, structVec.asList)
+            assertEquals(els, structVec.toList())
 
             assertEquals(
-                Field("struct", FieldType(false, STRUCT_TYPE, null), listOf(
-                    Field("i32", FieldType(true, I32_TYPE, null), emptyList()),
+                Field("struct", FieldType(false, STRUCT, null), listOf(
+                    Field("i32", FieldType(true, I32, null), emptyList()),
                     Field("utf8", FieldType(true, UTF8_TYPE, null), emptyList())
                 )),
                 structVec.field
@@ -256,12 +256,12 @@ class StructVectorTest {
 
             assertEquals(
                 listOf(mapOf("i32" to 4, "utf8" to "Hello"), null),
-                structVec.asList
+                structVec.toList()
             )
 
             assertEquals(
-                Field("struct", FieldType(true, STRUCT_TYPE, null), listOf(
-                    Field("i32", FieldType(false, I32_TYPE, null), emptyList()),
+                Field("struct", FieldType(true, STRUCT, null), listOf(
+                    Field("i32", FieldType(false, I32, null), emptyList()),
                     Field("utf8", FieldType(false, UTF8_TYPE, null), emptyList())
                 )),
                 structVec.field
@@ -275,12 +275,12 @@ class StructVectorTest {
             val els = listOf(mapOf("a" to 4), mapOf("a" to "Hello"))
                 .onEach(structVec::writeObject)
 
-            assertEquals(els, structVec.asList)
+            assertEquals(els, structVec.toList())
 
             assertEquals(
-                Field("struct", FieldType(false, STRUCT_TYPE, null), listOf(
+                Field("struct", FieldType(false, STRUCT, null), listOf(
                     Field("a", FieldType(false, UNION_TYPE, null), listOf(
-                        Field("i32", FieldType(false, I32_TYPE, null), emptyList()),
+                        Field("i32", FieldType(false, I32, null), emptyList()),
                         Field("utf8", FieldType(false, UTF8_TYPE, null), emptyList())
                     ))
                 )),

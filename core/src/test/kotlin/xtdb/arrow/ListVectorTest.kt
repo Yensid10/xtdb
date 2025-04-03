@@ -28,16 +28,16 @@ class ListVectorTest {
         ListVector(allocator, "list", false, NullVector("\$data\$")).use { listVec ->
             listVec.writeObject(listOf(1, 2, 3))
             listVec.writeObject(listOf(4, 5, "6"))
-            assertEquals(listOf(listOf(1, 2, 3), listOf(4, 5, "6")), listVec.asList)
+            assertEquals(listOf(listOf(1, 2, 3), listOf(4, 5, "6")), listVec.toList())
 
             assertEquals(
                 Field(
-                    "list", FieldType(false, LIST_TYPE, null),
+                    "list", FieldType(false, LIST, null),
                     listOf(
                         Field(
                             "\$data\$", FieldType(false, UNION_TYPE, null),
                             listOf(
-                                Field("i32", FieldType(false, I32_TYPE, null), null),
+                                Field("i32", FieldType(false, I32, null), null),
                                 Field("utf8", FieldType(false, UTF8_TYPE, null), null)
                             )
                         )
@@ -54,7 +54,7 @@ class ListVectorTest {
             listVec.writeObject(listOf(null))
             listVec.writeObject(listOf(1, 2, 3))
 
-            assertEquals(listOf(listOf(null), listOf(1, 2, 3)), listVec.asList)
+            assertEquals(listOf(listOf(null), listOf(1, 2, 3)), listVec.toList())
         }
     }
 }

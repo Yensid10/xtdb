@@ -13,6 +13,7 @@ import xtdb.util.Hasher;
 import java.nio.ByteBuffer;
 import java.util.Collection;
 import java.util.List;
+import java.util.Set;
 
 public class RenamedVectorReader implements IVectorReader {
 
@@ -25,8 +26,8 @@ public class RenamedVectorReader implements IVectorReader {
     }
 
     @Override
-    public int valueCount() {
-        return reader.valueCount();
+    public int getValueCount() {
+        return reader.getValueCount();
     }
 
     @Override
@@ -96,11 +97,6 @@ public class RenamedVectorReader implements IVectorReader {
     }
 
     @Override
-    public ArrowBufPointer getPointer(int idx) {
-        return reader.getPointer(idx);
-    }
-
-    @Override
     public ArrowBufPointer getPointer(int idx, ArrowBufPointer reuse) {
         return reader.getPointer(idx, reuse);
     }
@@ -120,13 +116,13 @@ public class RenamedVectorReader implements IVectorReader {
     }
 
     @Override
-    public Collection<String> structKeys() {
-        return reader.structKeys();
+    public Set<String> getKeyNames() {
+        return reader.getKeyNames();
     }
 
     @Override
-    public IVectorReader listElementReader() {
-        return reader.listElementReader();
+    public IVectorReader getListElements() {
+        return reader.getListElements();
     }
 
     @Override
@@ -140,13 +136,13 @@ public class RenamedVectorReader implements IVectorReader {
     }
 
     @Override
-    public IVectorReader mapKeyReader() {
-        return reader.mapKeyReader();
+    public IVectorReader getMapKeys() {
+        return reader.getMapKeys();
     }
 
     @Override
-    public IVectorReader mapValueReader() {
-        return reader.mapValueReader();
+    public IVectorReader getMapValues() {
+        return reader.getMapValues();
     }
 
     @Override
@@ -160,8 +156,8 @@ public class RenamedVectorReader implements IVectorReader {
     }
 
     @Override
-    public List<String> legs() {
-        return reader.legs();
+    public Set<String> getLegNames() {
+        return reader.getLegNames();
     }
 
     @Override
@@ -200,7 +196,7 @@ public class RenamedVectorReader implements IVectorReader {
     }
 
     @Override
-    public void close() {
+    public void close() throws Exception {
         reader.close();
     }
 }

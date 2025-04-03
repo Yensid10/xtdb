@@ -4,11 +4,9 @@ import org.apache.arrow.memory.BufferAllocator
 import org.apache.arrow.vector.types.pojo.FieldType
 import xtdb.arrow.Relation
 import xtdb.arrow.Vector
-import xtdb.arrow.VectorPosition
 
 @Suppress("unused")
 class RelationWriter(private val allocator: BufferAllocator) : IRelationWriter {
-    private val wp = VectorPosition.build()
     private val writers = mutableMapOf<String, IVectorWriter>()
 
     constructor(allocator: BufferAllocator, writers: List<IVectorWriter>) : this(allocator) {
@@ -17,28 +15,30 @@ class RelationWriter(private val allocator: BufferAllocator) : IRelationWriter {
 
     override fun iterator() = writers.iterator()
 
-    override fun writerPosition() = wp
+    override var rowCount = 0
+    override val vectors: Iterable<IVectorWriter> get() = writers.values
 
-    override fun startRow() = Unit
-
-    override fun endRow() {
-        val pos = ++wp.position
-        writers.values.forEach { it.populateWithAbsents(pos) }
+    override fun endRow(): Int {
+        val pos = rowCount++
+        writers.values.forEach { it.populateWithAbsents(rowCount) }
+        return pos
     }
 
-    override fun colWriter(colName: String) = writers[colName] ?: colWriter(colName, UNION_FIELD_TYPE)
+    override fun vectorForOrNull(name: String) = writers[name]
 
-    override fun colWriter(colName: String, fieldType: FieldType) =
-        writers[colName]
+    override fun vectorFor(name: String, fieldType: FieldType) =
+        writers[name]
             ?.also { it.checkFieldType(fieldType) }
 
-            ?: writerFor(fieldType.createNewSingleVector(colName, allocator, null))
+            ?: writerFor(fieldType.createNewSingleVector(name, allocator, null))
                 .also {
-                    it.populateWithAbsents(wp.position)
-                    writers[colName] = it
+                    it.populateWithAbsents(rowCount)
+                    writers[name] = it
                 }
 
-    override fun openAsRelation() = Relation(writers.values.map { Vector.fromArrow(it.vector) }, wp.position)
+    override fun openAsRelation() = Relation(writers.values.map { Vector.fromArrow(it.vector) }, rowCount)
+
+    val asReader get() = RelationReader.from(vectors.map { it.asReader }, rowCount)
 
     override fun close() {
         writers.values.forEach(IVectorWriter::close)

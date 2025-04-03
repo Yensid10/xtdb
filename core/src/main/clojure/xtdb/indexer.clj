@@ -104,7 +104,7 @@
                                                    {:keys [indexer tx-key]}]
   (let [put-leg (.legReader tx-ops-rdr "put-docs")
         iids-rdr (.structKeyReader put-leg "iids")
-        iid-rdr (.listElementReader iids-rdr)
+        iid-rdr (.getListElements iids-rdr)
         docs-rdr (.structKeyReader put-leg "documents")
 
         ;; HACK: can remove this once we're sure a few more people have migrated their logs
@@ -114,13 +114,13 @@
 
         valid-to-rdr (.structKeyReader put-leg "_valid_to")
         system-time-µs (time/instant->micros system-time)
-        tables (->> (.legs docs-rdr)
+        tables (->> (.getLegNames docs-rdr)
                     (into {} (map (fn [table-name]
                                     (when (xt-log/forbidden-table? table-name) (throw (xt-log/forbidden-table-ex table-name)))
 
                                     (let [table-docs-rdr (.legReader docs-rdr table-name)
-                                          doc-rdr (.listElementReader table-docs-rdr)
-                                          ks (.structKeys doc-rdr)]
+                                          doc-rdr (.getListElements table-docs-rdr)
+                                          ks (.getKeyNames doc-rdr)]
                                       (when-let [forbidden-cols (not-empty (->> ks
                                                                                 (into #{} (filter (every-pred #(str/starts-with? % "_")
                                                                                                               (complement #{"_id" "_fn" "_valid_from" "_valid_to"}))))))]
@@ -128,9 +128,9 @@
                                                                 {::err/message (str "Cannot put documents with columns: " (pr-str forbidden-cols))
                                                                  :table-name table-name
                                                                  :forbidden-cols forbidden-cols})))
-                                      (let [^RelationReader table-rel-rdr (vr/rel-reader (for [sk ks]
+                                      (let [^RelationReader table-rel-rdr (vr/rel-reader (for [sk ks, :when (not (contains? #{"_valid_from" "_valid_to"} sk))]
                                                                                            (.structKeyReader doc-rdr sk))
-                                                                                         (.valueCount doc-rdr))
+                                                                                         (.getValueCount doc-rdr))
                                             live-table-tx (.liveTable live-idx-tx table-name)]
                                         (MapEntry/create table-name
                                                          {:id-rdr (.structKeyReader doc-rdr "_id")
@@ -196,7 +196,7 @@
   (let [delete-leg (.legReader tx-ops-rdr "delete-docs")
         table-rdr (.structKeyReader delete-leg "table")
         iids-rdr (.structKeyReader delete-leg "iids")
-        iid-rdr (.listElementReader iids-rdr)
+        iid-rdr (.getListElements iids-rdr)
         valid-from-rdr (.structKeyReader delete-leg "_valid_from")
         valid-to-rdr (.structKeyReader delete-leg "_valid_to")
         current-time-µs (time/instant->micros current-time)]
@@ -234,7 +234,7 @@
   (let [erase-leg (.legReader tx-ops-rdr "erase-docs")
         table-rdr (.structKeyReader erase-leg "table")
         iids-rdr (.structKeyReader erase-leg "iids")
-        iid-rdr (.listElementReader iids-rdr)]
+        iid-rdr (.getListElements iids-rdr)]
     (reify OpIndexer
       (indexOp [_ tx-op-idx]
         (let [table (.getObject table-rdr tx-op-idx)
@@ -258,17 +258,17 @@
   (let [current-time-µs (time/instant->micros current-time)]
     (reify RelationIndexer
       (indexOp [_ in-rel {:keys [table]}]
-        (let [row-count (.rowCount in-rel)
+        (let [row-count (.getRowCount in-rel)
               ^RelationReader content-rel (vr/rel-reader (->> in-rel
                                                               (remove (comp types/temporal-column? #(.getName ^IVectorReader %))))
-                                                         (.rowCount in-rel))
+                                                         (.getRowCount in-rel))
               table (str table)
 
               _ (when (xt-log/forbidden-table? table) (throw (xt-log/forbidden-table-ex table)))
 
-              id-col (.readerForName in-rel "_id")
-              valid-from-rdr (.readerForName in-rel "_valid_from")
-              valid-to-rdr (.readerForName in-rel "_valid_to")
+              id-col (.vectorForOrNull in-rel "_id")
+              valid-from-rdr (.vectorForOrNull in-rel "_valid_from")
+              valid-to-rdr (.vectorForOrNull in-rel "_valid_to")
 
               live-table-tx (.liveTable live-idx-tx table)]
 
@@ -310,10 +310,10 @@
   (reify RelationIndexer
     (indexOp [_ in-rel {:keys [table]}]
       (let [table (str table)
-            row-count (.rowCount in-rel)
-            iid-rdr (.readerForName in-rel "_iid")
-            valid-from-rdr (.readerForName in-rel "_valid_from")
-            valid-to-rdr (.readerForName in-rel "_valid_to")]
+            row-count (.getRowCount in-rel)
+            iid-rdr (.vectorFor in-rel "_iid")
+            valid-from-rdr (.vectorFor in-rel "_valid_from")
+            valid-to-rdr (.vectorFor in-rel "_valid_to")]
 
         (when (xt-log/forbidden-table? table)
           (throw (xt-log/forbidden-table-ex table)))
@@ -340,8 +340,8 @@
   (reify RelationIndexer
     (indexOp [_ in-rel {:keys [table]}]
       (let [table (str table)
-            row-count (.rowCount in-rel)
-            iid-rdr (.readerForName in-rel "_iid")]
+            row-count (.getRowCount in-rel)
+            iid-rdr (.vectorForOrNull in-rel "_iid")]
 
         (when (xt-log/forbidden-table? table) (throw (xt-log/forbidden-table-ex table)))
 
@@ -368,12 +368,12 @@
                            (reify Consumer
                              (accept [_ in-rel]
                                (let [^RelationReader in-rel in-rel]
-                                 (when-not (pos? (.rowCount in-rel))
+                                 (when-not (pos? (.getRowCount in-rel))
                                    (throw-assert-failed))))))
 
               (throw-assert-failed)))
 
-        (assert (not (.tryAdvance res nil))
+        (assert (not (.tryAdvance res (fn [_])))
                 "only expecting one batch in assert")))))
 
 (defn- query-indexer [^IQuerySource q-src, wm-src, ^RelationIndexer rel-idxer, query, tx-opts, query-opts]
@@ -401,16 +401,16 @@
       (while (.loadNextBatch asr)
         (let [param-rel (vr/<-root param-root)
               selection (int-array 1)]
-          (dotimes [idx (.rowCount param-rel)]
+          (dotimes [idx (.getRowCount param-rel)]
             (aset selection 0 idx)
             (eval-query (-> param-rel (.select selection)))))))))
 
 (defn- patch-rel! [table-name ^LiveTable$Tx live-table, ^RelationReader rel {:keys [indexer tx-key]}]
-  (let [iid-rdr (.readerForName rel "_iid")
-        doc-copier (.rowCopier (.readerForName rel "doc") (.getDocWriter live-table))
-        from-rdr (.readerForName rel "_valid_from")
-        to-rdr (.readerForName rel "_valid_to")]
-    (dotimes [idx (.rowCount rel)]
+  (let [iid-rdr (.vectorForOrNull rel "_iid")
+        doc-copier (.rowCopier (.vectorForOrNull rel "doc") (.getDocWriter live-table))
+        from-rdr (.vectorForOrNull rel "_valid_from")
+        to-rdr (.vectorForOrNull rel "_valid_to")]
+    (dotimes [idx (.getRowCount rel)]
       (with-crash-log indexer "error patching rows"
           {:table-name table-name, :tx-key tx-key, :row-idx idx}
           {:live-table live-table, :query-rel rel}
@@ -426,7 +426,7 @@
                              {:keys [snapshot-time] :as tx-opts}]
   (let [patch-leg (.legReader tx-ops-rdr "patch-docs")
         iids-rdr (.structKeyReader patch-leg "iids")
-        iid-rdr (.listElementReader iids-rdr)
+        iid-rdr (.getListElements iids-rdr)
         docs-rdr (.structKeyReader patch-leg "documents")
 
         valid-from-rdr (.structKeyReader patch-leg "_valid_from")
@@ -438,8 +438,8 @@
                 (throw (xt-log/forbidden-table-ex table-name)))
 
               (let [table-docs-rdr (.legReader docs-rdr table-name)
-                    doc-rdr (.listElementReader table-docs-rdr)
-                    ks (.structKeys doc-rdr)]
+                    doc-rdr (.getListElements table-docs-rdr)
+                    ks (.getKeyNames doc-rdr)]
                 (when-let [forbidden-cols (not-empty (->> ks
                                                           (into #{} (filter (every-pred #(str/starts-with? % "_")
                                                                                         (complement #{"_id" "_fn"}))))))]
@@ -488,7 +488,7 @@
                                                (fn [^RelationReader rel]
                                                  (patch-rel! table-name live-table rel tx-opts)))))))))))]
 
-      (let [tables (->> (.legs docs-rdr)
+      (let [tables (->> (.getLegNames docs-rdr)
                         (into {} (map (juxt identity ->table-idxer))))]
         (reify OpIndexer
           (indexOp [_ tx-op-idx]
@@ -504,7 +504,7 @@
                                 {::err/message "Arguments list was expected but not provided"
                                  :param-count param-count})))
 
-      (let [arg-count (count (seq args))]
+      (let [arg-count (count args)]
         (if (not= arg-count param-count)
           (throw (err/runtime-err :xtdb.indexer/incorrect-sql-arg-count
                                   {::err/message (format "Parameter error: %d provided, %d expected" arg-count param-count)
@@ -524,17 +524,16 @@
 
     (.logPut live-table (util/->iid user) system-time-µs Long/MAX_VALUE
              (fn write-doc! []
-               (.startStruct doc-writer)
-               (doto (.structKeyWriter doc-writer "_id" (FieldType/notNullable #xt.arrow/type :utf8))
+               (doto (.vectorFor doc-writer "_id" (FieldType/notNullable #xt.arrow/type :utf8))
                  (.writeObject user))
 
-               (doto (.structKeyWriter doc-writer "username" (FieldType/notNullable #xt.arrow/type :utf8))
+               (doto (.vectorFor doc-writer "username" (FieldType/notNullable #xt.arrow/type :utf8))
                  (.writeObject user))
 
-               (doto (.structKeyWriter doc-writer "usesuper" (FieldType/notNullable #xt.arrow/type :bool))
+               (doto (.vectorFor doc-writer "usesuper" (FieldType/notNullable #xt.arrow/type :bool))
                  (.writeObject false))
 
-               (doto (.structKeyWriter doc-writer "passwd" (FieldType/nullable #xt.arrow/type :utf8))
+               (doto (.vectorFor doc-writer "passwd" (FieldType/nullable #xt.arrow/type :utf8))
                  (.writeObject (authn/encrypt-pw password)))
 
                (.endStruct doc-writer)))))
@@ -615,17 +614,16 @@
 
     (.logPut live-table (util/->iid tx-id) system-time-µs Long/MAX_VALUE
              (fn write-doc! []
-               (.startStruct doc-writer)
-               (doto (.structKeyWriter doc-writer "_id" (FieldType/notNullable #xt.arrow/type :i64))
+               (doto (.vectorFor doc-writer "_id" (FieldType/notNullable #xt.arrow/type :i64))
                  (.writeLong tx-id))
 
-               (doto (.structKeyWriter doc-writer "system_time" (FieldType/notNullable (types/->arrow-type types/temporal-col-type)))
+               (doto (.vectorFor doc-writer "system_time" (FieldType/notNullable (types/->arrow-type types/temporal-col-type)))
                  (.writeLong system-time-µs))
 
-               (doto (.structKeyWriter doc-writer "committed" (FieldType/notNullable #xt.arrow/type :bool))
+               (doto (.vectorFor doc-writer "committed" (FieldType/notNullable #xt.arrow/type :bool))
                  (.writeBoolean (nil? t)))
 
-               (let [e-wtr (.structKeyWriter doc-writer "error" (FieldType/nullable #xt.arrow/type :transit))]
+               (let [e-wtr (.vectorFor doc-writer "error" (FieldType/nullable #xt.arrow/type :transit))]
                  (if (or (nil? t) (= t abort-exn))
                    (.writeNull e-wtr)
                    (try
@@ -712,7 +710,7 @@
                     !sql-idxer (delay (->sql-indexer allocator live-idx-tx tx-ops-rdr q-src wm-src tx-opts))]
 
                 (if-let [e (try
-                             (dotimes [tx-op-idx (.valueCount tx-ops-rdr)]
+                             (dotimes [tx-op-idx (.getValueCount tx-ops-rdr)]
                                (.recordCallable tx-timer
                                                 #(case (.getLeg tx-ops-rdr tx-op-idx)
                                                    "xtql" (throw (err/illegal-arg :xtdb/xtql-dml-removed

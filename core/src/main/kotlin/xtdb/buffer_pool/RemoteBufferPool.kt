@@ -2,16 +2,16 @@ package xtdb.buffer_pool
 
 import io.micrometer.core.instrument.Counter
 import io.micrometer.core.instrument.MeterRegistry
-import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Dispatchers.IO
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.future.await
+import kotlinx.coroutines.future.future
 import kotlinx.coroutines.runBlocking
 import org.apache.arrow.memory.ArrowBuf
 import org.apache.arrow.memory.BufferAllocator
 import org.apache.arrow.vector.ipc.message.ArrowFooter
 import org.apache.arrow.vector.ipc.message.ArrowRecordBatch
-import org.slf4j.LoggerFactory
 import xtdb.BufferPool
 import xtdb.IEvictBufferTest
 import xtdb.api.storage.ObjectStore
@@ -58,7 +58,7 @@ class RemoteBufferPool(
             factory.localDiskCache.also { it.createDirectories() },
             factory.maxDiskCacheBytes
                 ?: (factory.localDiskCache.totalSpace * (factory.maxDiskCachePercentage / 100.0)).toLong()
-        ).apply { meterRegistry?.registerDiskCache("disk-cache")}
+        ).apply { meterRegistry?.registerDiskCache("disk-cache") }
 
     private val recordBatchRequests: Counter? = meterRegistry?.counter("record-batch-requests")
     private val memCacheMisses: Counter? = meterRegistry?.counter("mem-cache-misses")
@@ -68,14 +68,13 @@ class RemoteBufferPool(
         internal var minMultipartPartSize = 5 * 1024 * 1024
         private const val MAX_CONCURRENT_PART_UPLOADS = 4
 
-        private val LOGGER = LoggerFactory.getLogger(RemoteBufferPool::class.java)
+        private val LOGGER = RemoteBufferPool::class.logger
 
-        private val Path.totalSpace get() = Files.getFileStore(this).totalSpace.also {
-            LOGGER.debug("Total disk space for $this: ${Files.getFileStore(this).totalSpace}")
-        }
-        
+        private val Path.totalSpace
+            get() = Files.getFileStore(this).totalSpace
+
         private val multipartUploadDispatcher =
-            Dispatchers.IO.limitedParallelism(MAX_CONCURRENT_PART_UPLOADS, "upload-multipart")
+            IO.limitedParallelism(MAX_CONCURRENT_PART_UPLOADS, "upload-multipart")
 
         @JvmStatic
         fun <P> SupportsMultipart<P>.uploadMultipartBuffers(key: Path, nioBuffers: List<ByteBuffer>) = runBlocking {
@@ -94,7 +93,7 @@ class RemoteBufferPool(
                     LOGGER.warn("Error caught in uploadMultipartBuffers - aborting multipart upload of $key")
                     upload.abort().get()
                 } catch (abortError: Throwable) {
-                    LOGGER.warn("Throwable caught when aborting uploadMultipartBuffers", abortError)
+                    LOGGER.warn(abortError, "Throwable caught when aborting uploadMultipartBuffers")
                     e.addSuppressed(abortError)
                 }
                 throw e
@@ -192,6 +191,15 @@ class RemoteBufferPool(
 
     override fun listAllObjects() = objectStore.listAllObjects()
     override fun listAllObjects(dir: Path) = objectStore.listAllObjects(dir)
+
+    override fun deleteAllObjects() {
+        runBlocking(IO.limitedParallelism(8, "xtdb-delete-all-objects")) {
+            for (obj in listAllObjects())
+                future { objectStore.deleteIfExists(obj.key) }
+        }
+    }
+
+    override fun deleteIfExists(key: Path): Unit = runBlocking { objectStore.deleteIfExists(key).await() }
 
     override fun openArrowWriter(key: Path, rel: Relation): xtdb.ArrowWriter {
         val tmpPath = diskCache.createTempPath()

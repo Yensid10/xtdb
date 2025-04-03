@@ -6,6 +6,7 @@ import org.apache.arrow.vector.BaseFixedWidthVector
 import org.apache.arrow.vector.ValueVector
 import org.apache.arrow.vector.ipc.message.ArrowFieldNode
 import org.apache.arrow.vector.types.TimeUnit
+import xtdb.arrow.metadata.MetadataFlavour
 import xtdb.util.Hasher
 import java.nio.ByteBuffer
 
@@ -19,7 +20,7 @@ internal fun TimeUnit.toLong(seconds: Long, nanos: Int): Long = when (this) {
 sealed class FixedWidthVector : Vector() {
 
     protected abstract val byteWidth: Int
-    override val children: Iterable<Vector> = emptyList()
+    override val vectors: Iterable<Vector> = emptyList()
 
     internal abstract val validityBuffer: ExtensibleBuffer
     internal abstract val dataBuffer: ExtensibleBuffer
@@ -27,8 +28,8 @@ sealed class FixedWidthVector : Vector() {
     final override fun isNull(idx: Int) = !validityBuffer.getBit(idx)
 
     final override fun writeUndefined() {
-        if (byteWidth == 0) dataBuffer.writeBit(valueCount, 0) else dataBuffer.writeZero(byteWidth)
         validityBuffer.writeBit(valueCount++, 0)
+        dataBuffer.writeZero(byteWidth)
     }
 
     final override fun writeNull() {
@@ -37,15 +38,6 @@ sealed class FixedWidthVector : Vector() {
     }
 
     private fun writeNotNull() = validityBuffer.writeBit(valueCount++, 1)
-
-    protected fun getBoolean0(idx: Int) =
-        if (NULL_CHECKS && isNull(idx)) throw NullPointerException("null at index $idx")
-        else dataBuffer.getBit(idx)
-
-    protected fun writeBoolean0(value: Boolean) {
-        dataBuffer.writeBit(valueCount, if (value) 1 else 0)
-        writeNotNull()
-    }
 
     protected fun getByte0(idx: Int) =
         if (NULL_CHECKS && isNull(idx)) throw NullPointerException("null at index $idx")
@@ -108,13 +100,15 @@ sealed class FixedWidthVector : Vector() {
         return ByteArray(buf.remaining()).also { buf.duplicate().get(it) }
     }
 
-    override fun writeBytes(buf: ByteBuffer) {
-        dataBuffer.writeBytes(buf)
+    override fun writeBytes(v: ByteBuffer) {
+        dataBuffer.writeBytes(v)
         writeNotNull()
     }
 
     override fun getPointer(idx: Int, reuse: ArrowBufPointer) =
         dataBuffer.getPointer(idx * byteWidth, byteWidth, reuse)
+
+    override val metadataFlavours get() = listOf(this as MetadataFlavour)
 
     override fun hashCode0(idx: Int, hasher: Hasher) =
         hasher.hash(getByteArray(idx))

@@ -31,7 +31,7 @@ interface Compactor : AutoCloseable {
 
     interface Job {
         val tableName: String
-        val trieKeys: Set<TrieKey>
+        val trieKeys: List<TrieKey>
         val part: ByteArray
         val outputTrieKey: Trie.Key
         val partitionedByRecency: Boolean
@@ -50,11 +50,12 @@ interface Compactor : AutoCloseable {
         private val jobCalculator: JobCalculator,
         private val ignoreBlockSignal: Boolean,
         threadCount: Int, private val pageSize: Int,
+        private val recencyPartition: RecencyPartition?
     ) : Compactor {
         private val al = al.openChildAllocator("compactor")
             .also { meterRegistry?.register(it) }
 
-        private val trieWriter = TrieWriter(al, bp, true)
+        private val trieWriter = TrieWriter(al, bp, calculateBlooms = true)
         private val segMerge = SegmentMerge(al)
 
         companion object {
@@ -62,7 +63,7 @@ interface Compactor : AutoCloseable {
 
         }
 
-        private fun Job.trieDetails(trieKey: TrieKey, dataFileSize: FileSize, trieMetadata: TrieMetadata) =
+        private fun Job.trieDetails(trieKey: TrieKey, dataFileSize: FileSize, trieMetadata: TrieMetadata?) =
             TrieDetails.newBuilder()
                 .setTableName(tableName).setTrieKey(trieKey)
                 .setDataFileSize(dataFileSize)
@@ -86,7 +87,7 @@ interface Compactor : AutoCloseable {
                             if (partitionedByRecency) SegmentMerge.RecencyPartitioning.Partition
                             else SegmentMerge.RecencyPartitioning.Preserve(outputTrieKey.recency)
 
-                        segMerge.mergeSegments(segments, part, recencyPartitioning)
+                        segMerge.mergeSegments(segments, part, recencyPartitioning, this@Impl.recencyPartition)
                             .useAll { mergeRes ->
                                 mergeRes.map {
                                     it.openForRead().use { mergeReadCh ->
@@ -196,7 +197,14 @@ interface Compactor : AutoCloseable {
         }
 
         override fun close() {
-            runBlocking { withTimeout(5.seconds) { scope.coroutineContext.job.cancelAndJoin() } }
+            runBlocking {
+                withTimeoutOrNull(10.seconds) { scope.coroutineContext.job.cancelAndJoin() }
+                    ?: LOGGER.warn("failed to close compactor cleanly in 10s")
+            }
+
+            segMerge.close()
+
+            LOGGER.debug("compactor closed")
         }
     }
 

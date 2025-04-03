@@ -1,5 +1,6 @@
 package xtdb.arrow
 
+import com.google.protobuf.struct
 import org.apache.arrow.memory.BufferAllocator
 import org.apache.arrow.memory.RootAllocator
 import org.junit.jupiter.api.AfterEach
@@ -7,6 +8,7 @@ import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import java.util.SequencedMap
 
 class DenseUnionVectorTest {
     private lateinit var allocator: BufferAllocator
@@ -30,8 +32,8 @@ class DenseUnionVectorTest {
                 Utf8Vector(allocator, "utf8", true)
             )
         ).use { duv ->
-            val i32Leg = duv.legWriter("i32")
-            val utf8Leg = duv.legWriter("utf8")
+            val i32Leg = duv.vectorFor("i32")
+            val utf8Leg = duv.vectorFor("utf8")
 
             i32Leg.writeInt(12)
             utf8Leg.writeObject("hello")
@@ -40,9 +42,9 @@ class DenseUnionVectorTest {
             utf8Leg.writeNull()
 
             assertEquals(5, duv.valueCount)
-            assertEquals(listOf(12, 34), i32Leg.asList)
-            assertEquals(listOf("hello", "world!", null), utf8Leg.asList)
-            assertEquals(listOf(12, "hello", "world!", 34, null), duv.asList)
+            assertEquals(listOf(12, 34), i32Leg.toList())
+            assertEquals(listOf("hello", "world!", null), utf8Leg.toList())
+            assertEquals(listOf(12, "hello", "world!", 34, null), duv.toList())
 
             assertEquals(listOf(0, 1, 1, 0, 1).map { it.toByte() }, duv.typeIds())
             assertEquals(listOf(0, 0, 1, 1, 2), duv.offsets())
@@ -67,7 +69,7 @@ class DenseUnionVectorTest {
                     copyRow(0)
                 }
 
-                assertEquals(listOf(64, 32), destVec.asList)
+                assertEquals(listOf(64, 32), destVec.toList())
             }
         }
     }
@@ -89,7 +91,7 @@ class DenseUnionVectorTest {
                     copyRow(2)
                 }
 
-                assertEquals(listOf(3.14, null, 2.71), destVec.asList)
+                assertEquals(listOf(3.14, null, 2.71), destVec.toList())
             }
         }
     }
@@ -117,4 +119,104 @@ class DenseUnionVectorTest {
         }
     }
 
+    @Test
+    fun `from nullable duv vector to mono vector`() {
+        DenseUnionVector(
+            allocator, "v1",
+            listOf(
+                NullVector("null"),
+                IntVector(allocator, "i32", false),
+            )
+        ).use { duv ->
+            val intLeg = duv.legWriter("i32")
+            val nullLeg = duv.legWriter("null")
+            intLeg.writeInt(12)
+            nullLeg.writeNull()
+            intLeg.writeInt(34)
+
+            assertEquals(3, duv.valueCount)
+
+            IntVector(allocator, "mono", true).use { mono ->
+                duv.rowCopier(mono).run {
+                    copyRow(0)
+                    copyRow(1)
+                    copyRow(2)
+                }
+
+                assertEquals(listOf(1, 0, 1).map { it.toByte() }, duv.typeIds())
+                assertEquals(listOf(12, null, 34), mono.toList())
+            }
+        }
+
+        DenseUnionVector(
+            allocator, "v1",
+            listOf(
+                NullVector("null"),
+                StructVector(allocator, "struct", false,
+                    linkedMapOf(
+                        "a" to IntVector(allocator, "i32", false),
+                        "b" to IntVector(allocator, "i32", false)
+                    )
+                ),
+            )
+        ).use { duv ->
+            val obj1 = mapOf("a" to 1, "b" to 2)
+            val obj2 = mapOf("a" to 3, "b" to 4)
+
+            val structLeg = duv.legWriter("struct")
+            val nullLeg = duv.legWriter("null")
+            structLeg.writeObject(obj1)
+            nullLeg.writeNull()
+            structLeg.writeObject(obj2)
+
+            assertEquals(3, duv.valueCount)
+
+            StructVector(allocator, "mono", true,
+                linkedMapOf(
+                    "a" to IntVector(allocator, "i32", false),
+                    "b" to IntVector(allocator, "i32", false)
+                )
+            ).use { mono ->
+                duv.rowCopier(mono).run {
+                    copyRow(0)
+                    copyRow(1)
+                    copyRow(2)
+                }
+
+                assertEquals(listOf(1, 0, 1).map { it.toByte() }, duv.typeIds())
+                assertEquals(listOf(obj1, null, obj2), mono.toList())
+            }
+        }
+
+        DenseUnionVector(
+            allocator, "v1",
+            listOf(
+                NullVector("null"),
+                ListVector(allocator, "list", false, IntVector(allocator, "i32", false))
+            ),
+        )
+        .use { duv ->
+            val obj1 = listOf(1, 2)
+            val obj2 = emptyList<Int>()
+
+            val structLeg = duv.legWriter("list")
+            val nullLeg = duv.legWriter("null")
+            structLeg.writeObject(obj1)
+            nullLeg.writeNull()
+            structLeg.writeObject(obj2)
+
+            assertEquals(3, duv.valueCount)
+
+            ListVector(allocator, "list", false, IntVector(allocator, "i32", false)).use { mono ->
+                duv.rowCopier(mono).run {
+                    copyRow(0)
+                    copyRow(1)
+                    copyRow(2)
+                }
+
+                assertEquals(listOf(1, 0, 1).map { it.toByte() }, duv.typeIds())
+                assertEquals(listOf(obj1, null, obj2), mono.toList())
+            }
+        }
+    }
 }

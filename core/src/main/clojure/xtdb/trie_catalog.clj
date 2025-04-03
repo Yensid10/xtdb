@@ -1,16 +1,19 @@
 (ns xtdb.trie-catalog
   (:require [integrant.core :as ig]
-            [xtdb.trie :as trie]
-            [xtdb.util :as util]
+            [xtdb.table-catalog :as table-cat]
             [xtdb.time :as time]
-            [xtdb.table-catalog :as table-cat])
-  (:import org.roaringbitmap.buffer.ImmutableRoaringBitmap
-           [java.nio ByteBuffer]
-           [java.util Map]
+            [xtdb.trie :as trie]
+            [xtdb.util :as util])
+  (:import [java.nio ByteBuffer]
+           [java.time LocalDate ZoneOffset]
+           [java.util ArrayList Map]
            [java.util.concurrent ConcurrentHashMap]
+           org.roaringbitmap.buffer.ImmutableRoaringBitmap
            (xtdb BufferPool)
            xtdb.catalog.BlockCatalog
-           (xtdb.log.proto TrieDetails TrieMetadata TemporalMetadata)))
+           (xtdb.log.proto TemporalMetadata TrieDetails TrieMetadata)
+           xtdb.operator.scan.Metadata
+           (xtdb.util Temporal TemporalBounds TemporalDimension)))
 
 ;; table-tries data structure
 ;; values :: {:keys [level recency part block-idx state]}
@@ -88,7 +91,8 @@
                         (and (= other-state :live)
                              (< other-size file-size-target)
                              (<= other-block-idx block-idx))
-                        (assoc :state :garbage)))))))
+                        (-> (assoc :state :garbage)
+                            (dissoc :trie-metadata))))))))
 
 (defn- conj-trie [tries trie state]
   (conj (or tries '()) (assoc trie :state state)))
@@ -103,7 +107,8 @@
        (map-while (fn [{other-state :state, ^long other-block-idx :block-idx, :as trie}]
                     (when-not (= other-state :garbage)
                       (cond-> trie
-                        (<= other-block-idx block-idx) (assoc :state :garbage)))))))
+                        (<= other-block-idx block-idx) (-> (assoc :state :garbage)
+                                                           (dissoc :trie-metadata))))))))
 
 (defn- sibling-tries [table-tries, {:keys [^long level, recency, part]}]
   (let [pop-part (pop part)]
@@ -143,7 +148,10 @@
     1 (if recency
         ;; L1H files are nascent until we see the corresponding L1C file
         (-> table-cat
-            (update-in [:tries [1 recency part]] conj-trie trie :nascent)
+            (update-in [:tries [1 recency part]] conj-trie trie
+                       (let [{^long l1c-block-idx :block-idx} (get-in table-cat [:tries [1 nil part]])]
+                         (if (and l1c-block-idx (>= l1c-block-idx block-idx))
+                           :live :nascent)))
             (update-in [:l1h-recencies block-idx] (fnil conj #{}) recency))
 
         ;; L1C
@@ -197,15 +205,29 @@
 (defn current-tries [{:keys [tries]}]
   (->> tries
        (into [] (comp (mapcat val)
-                      (filter #(= (:state %) :live))))
-       (sort-by :block-idx)))
+                      (filter #(= (:state %) :live))))))
 
 (defn all-tries [{:keys [tries]}]
   (->> (into [] (mapcat val) tries)
-       (sort-by :block-idx)))
+       ;; the sort is needed as the table blocks need the current tries to be in the total order for restart
+       (sort-by (juxt :level :block-idx #(or (:recency %) LocalDate/MAX)))))
+
+(defrecord CatalogEntry [^LocalDate recency ^TrieMetadata trie-metadata ^TemporalBounds query-bounds]
+  Metadata
+  (testMetadata [_]
+    (let [min-query-recency (min (.getLower (.getValidTime query-bounds)) (.getLower (.getSystemTime query-bounds)))]
+      (if-let [^long recency (and recency (time/instant->micros (time/->instant recency {:default-tz ZoneOffset/UTC})))]
+        ;; the recency of a trie is exclusive, no row in that file has a recency equal to it
+        (< min-query-recency recency)
+        true)))
+  (getTemporalMetadata [_] (.getTemporalMetadata trie-metadata)))
+
+(defn filter-tries [tries query-bounds]
+  (-> (map (comp map->CatalogEntry #(assoc % :query-bounds query-bounds)) tries)
+      (trie/filter-meta-objects query-bounds)))
 
 (defn <-trie-metadata [^TrieMetadata trie-metadata]
-  (when (.hasTemporalMetadata trie-metadata)
+  (when (and trie-metadata (.hasTemporalMetadata trie-metadata))
     (let [^TemporalMetadata temporal-metadata (.getTemporalMetadata trie-metadata)]
       {:min-valid-from (time/micros->instant  (.getMinValidFrom temporal-metadata))
        :max-valid-from (time/micros->instant (.getMaxValidFrom temporal-metadata))

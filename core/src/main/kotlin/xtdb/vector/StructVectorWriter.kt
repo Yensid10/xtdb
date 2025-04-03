@@ -19,13 +19,12 @@ import org.apache.arrow.vector.types.pojo.ArrowType.Union as UNION_TYPE
 
 class StructVectorWriter(override val vector: StructVector, private val notify: FieldChangeListener?) : IVectorWriter,
     Iterable<Map.Entry<String, IVectorWriter>> {
-    private val wp = VectorPosition.build(vector.valueCount)
     override var field: Field = vector.field
 
     private val childFields: MutableMap<String, Field> =
         field.children.associateByTo(HashMap()) { childField -> childField.name }
 
-    override fun writerPosition() = wp
+    override var valueCount = vector.valueCount
 
     private fun upsertChildField(childField: Field) {
         childFields[childField.name] = childField
@@ -73,31 +72,29 @@ class StructVectorWriter(override val vector: StructVector, private val notify: 
     override fun writeObject0(obj: Any) {
         if (obj !is Map<*, *>) throw InvalidWriteObjectException(field.fieldType, obj)
 
-        writeStruct {
-            val structPos = wp.position
-
-            for ((k, v) in obj) {
-                val key = when (k) {
-                    is Keyword -> normalForm(k.sym.toString())
-                    is String -> k
-                    else -> throw IllegalArgumentException("invalid struct key: '$k'")
-                }
-
-                val writer = writers[key] ?: newChildWriter(key, v.toFieldType())
-
-                if (writer.writerPosition().position != structPos)
-                    throw xtdb.IllegalArgumentException(
-                        "xtdb/key-already-set".asKeyword,
-                        data = mapOf("ks".asKeyword to obj.keys, "k".asKeyword to k)
-                    )
-
-                writer.writeChildObject(v)
+        val structPos = valueCount
+        for ((k, v) in obj) {
+            val key = when (k) {
+                is Keyword -> normalForm(k.sym.toString())
+                is String -> k
+                else -> throw IllegalArgumentException("invalid struct key: '$k'")
             }
+
+            val writer = writers[key] ?: newChildWriter(key, v.toFieldType())
+
+            if (writer.valueCount != structPos)
+                throw xtdb.IllegalArgumentException(
+                    "xtdb/key-already-set".asKeyword,
+                    data = mapOf("ks".asKeyword to obj.keys, "k".asKeyword to k)
+                )
+
+            writer.writeChildObject(v)
         }
+        endStruct()
     }
 
     private fun newChildWriter(key: String, fieldType: FieldType): IVectorWriter {
-        val pos = wp.position
+        val pos = valueCount
         val fieldType1 = if (pos == 0) fieldType else FieldType(true, fieldType.type, fieldType.dictionary)
 
         return writerFor(vector.addOrGet(key, fieldType1, FieldVector::class.java))
@@ -108,22 +105,20 @@ class StructVectorWriter(override val vector: StructVector, private val notify: 
             }
     }
 
-    override fun structKeyWriter(key: String): IVectorWriter =
-        writers[key] ?: newChildWriter(key, FieldType.nullable(NULL_TYPE))
+    override fun vectorForOrNull(name: String) = writers[name]
 
-    override fun structKeyWriter(key: String, fieldType: FieldType) =
-        writers[key]?.let {
+    override fun vectorFor(name: String, fieldType: FieldType) =
+        writers[name]?.let {
             if ((it.field.type == fieldType.type && (it.field.isNullable || !fieldType.isNullable)) ||
                 it.field.type is ArrowType.Union
             ) it
             else promoteChild(it, fieldType)
         }
-            ?: newChildWriter(key, fieldType)
-
-    override fun startStruct() = vector.setIndexDefined(wp.position)
+            ?: newChildWriter(name, fieldType)
 
     override fun endStruct() {
-        val pos = ++wp.position
+        vector.setIndexDefined(valueCount)
+        val pos = ++valueCount
         writers.values.forEach { w ->
             try {
                 w.populateWithAbsents(pos)
@@ -133,16 +128,12 @@ class StructVectorWriter(override val vector: StructVector, private val notify: 
         }
     }
 
-    private inline fun writeStruct(f: () -> Unit) {
-        startStruct(); f(); endStruct()
-    }
-
     private inline fun childRowCopier(
         srcName: String,
         fieldType: FieldType,
         toRowCopier: (IVectorWriter) -> RowCopier,
     ): RowCopier {
-        val childWriter = structKeyWriter(srcName, fieldType)
+        val childWriter = vectorFor(srcName, fieldType)
 
         return try {
             toRowCopier(childWriter)
@@ -178,11 +169,12 @@ class StructVectorWriter(override val vector: StructVector, private val notify: 
                 src.map { child -> childRowCopier(child.name, child.field.fieldType) { w -> w.rowCopier(child) } }
 
             RowCopier { srcIdx ->
-                wp.position.also {
+                valueCount.also {
                     if (src.isNull(srcIdx))
                         writeNull()
-                    else writeStruct {
+                    else {
                         innerCopiers.forEach { it.copyRow(srcIdx) }
+                        endStruct()
                     }
                 }
             }
@@ -193,13 +185,12 @@ class StructVectorWriter(override val vector: StructVector, private val notify: 
 
     override fun rowCopier(src: RelationReader): RowCopier {
         val innerCopiers =
-            src.map { child -> childRowCopier(child.name, child.field.fieldType) { w -> child.rowCopier(w) } }
+            src.vectors.map { child -> childRowCopier(child.name, child.field.fieldType) { w -> child.rowCopier(w) } }
 
         return RowCopier { srcIdx ->
-            wp.position.also {
-                writeStruct {
-                    innerCopiers.forEach { it.copyRow(srcIdx) }
-                }
+            valueCount.also {
+                innerCopiers.forEach { it.copyRow(srcIdx) }
+                endStruct()
             }
         }
     }

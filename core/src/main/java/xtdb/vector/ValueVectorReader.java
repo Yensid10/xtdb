@@ -3,6 +3,7 @@ package xtdb.vector;
 import clojure.lang.*;
 import org.apache.arrow.memory.util.ArrowBufPointer;
 import org.apache.arrow.memory.util.ByteFunctionHelpers;
+import org.apache.arrow.vector.*;
 import org.apache.arrow.vector.BitVector;
 import org.apache.arrow.vector.DateDayVector;
 import org.apache.arrow.vector.DateMilliVector;
@@ -11,40 +12,42 @@ import org.apache.arrow.vector.FixedSizeBinaryVector;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.IntervalMonthDayNanoVector;
 import org.apache.arrow.vector.VarBinaryVector;
-import org.apache.arrow.vector.*;
+import org.apache.arrow.vector.complex.*;
 import org.apache.arrow.vector.complex.DenseUnionVector;
 import org.apache.arrow.vector.complex.FixedSizeListVector;
 import org.apache.arrow.vector.complex.ListVector;
 import org.apache.arrow.vector.complex.MapVector;
 import org.apache.arrow.vector.complex.StructVector;
-import org.apache.arrow.vector.complex.*;
 import org.apache.arrow.vector.holders.NullableIntervalDayHolder;
 import org.apache.arrow.vector.holders.NullableIntervalMonthDayNanoHolder;
 import org.apache.arrow.vector.types.TimeUnit;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
+import org.jetbrains.annotations.NotNull;
 import xtdb.Types;
 import xtdb.api.query.IKeyFn;
 import xtdb.arrow.*;
 import xtdb.types.IntervalDayTime;
+import xtdb.types.IntervalMonthDayMicro;
 import xtdb.types.IntervalMonthDayNano;
 import xtdb.types.IntervalYearMonth;
 import xtdb.util.Hasher;
+import xtdb.vector.extensions.*;
+import xtdb.vector.extensions.IntervalMonthDayMicroVector;
 import xtdb.vector.extensions.KeywordVector;
 import xtdb.vector.extensions.SetVector;
 import xtdb.vector.extensions.TransitVector;
 import xtdb.vector.extensions.TsTzRangeVector;
 import xtdb.vector.extensions.UuidVector;
-import xtdb.vector.extensions.*;
 
 import java.net.URI;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.time.*;
-import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
@@ -55,6 +58,7 @@ import static xtdb.time.Time.*;
 
 public class ValueVectorReader implements IVectorReader {
 
+    @NotNull
     public static IVectorReader from(ValueVector v) {
         return ValueVectorReadersKt.from(v);
     }
@@ -67,7 +71,7 @@ public class ValueVectorReader implements IVectorReader {
     }
 
     @Override
-    public int valueCount() {
+    public int getValueCount() {
         return vector.getValueCount();
     }
 
@@ -140,16 +144,6 @@ public class ValueVectorReader implements IVectorReader {
         throw unsupported();
     }
 
-
-    @Override
-    public ArrowBufPointer getPointer(int idx) {
-        if (vector instanceof ElementAddressableVector eav) {
-            return eav.getDataPointer(idx);
-        } else {
-            throw unsupported();
-        }
-    }
-
     @Override
     public ArrowBufPointer getPointer(int idx, ArrowBufPointer reuse) {
         if (vector instanceof ElementAddressableVector eav) {
@@ -179,12 +173,12 @@ public class ValueVectorReader implements IVectorReader {
     }
 
     @Override
-    public Collection<String> structKeys() {
+    public Set<String> getKeyNames() {
         return null;
     }
 
     @Override
-    public IVectorReader listElementReader() {
+    public IVectorReader getListElements() {
         throw unsupported();
     }
 
@@ -199,12 +193,12 @@ public class ValueVectorReader implements IVectorReader {
     }
 
     @Override
-    public IVectorReader mapKeyReader() {
+    public IVectorReader getMapKeys() {
         throw unsupported();
     }
 
     @Override
-    public IVectorReader mapValueReader() {
+    public IVectorReader getMapValues() {
         throw unsupported();
     }
 
@@ -214,8 +208,8 @@ public class ValueVectorReader implements IVectorReader {
     }
 
     @Override
-    public List<String> legs() {
-        return List.of(Types.toLeg(vector.getField().getFieldType().getType()));
+    public Set<String> getLegNames() {
+        return Set.of(Types.toLeg(vector.getField().getFieldType().getType()));
     }
 
     @Override
@@ -225,7 +219,7 @@ public class ValueVectorReader implements IVectorReader {
 
     @Override
     public IVectorReader copyTo(ValueVector vector) {
-        this.vector.makeTransferPair(vector).splitAndTransfer(0, valueCount());
+        this.vector.makeTransferPair(vector).splitAndTransfer(0, getValueCount());
         return from(vector);
     }
 
@@ -326,7 +320,7 @@ public class ValueVectorReader implements IVectorReader {
 
             @Override
             protected int hashCode0(int idx, Hasher hasher) {
-               return hasher.hash(getBoolean(idx) ? 1 : 0);
+                return hasher.hash(getBoolean(idx) ? 1 : 0);
             }
         };
     }
@@ -337,21 +331,25 @@ public class ValueVectorReader implements IVectorReader {
             public byte getByte(int idx) {
                 return v.get(idx);
             }
+
             @Override
             public short getShort(int idx) {
                 return v.get(idx);
             }
+
             @Override
             public int getInt(int idx) {
                 return v.get(idx);
             }
+
             @Override
             public long getLong(int idx) {
                 return v.get(idx);
             }
+
             @Override
             public int hashCode0(int idx, Hasher hasher) {
-                return hasher.hash((double)v.get(idx));
+                return hasher.hash((double) v.get(idx));
             }
         };
     }
@@ -362,17 +360,20 @@ public class ValueVectorReader implements IVectorReader {
             public short getShort(int idx) {
                 return v.get(idx);
             }
+
             @Override
             public int getInt(int idx) {
                 return v.get(idx);
             }
+
             @Override
             public long getLong(int idx) {
                 return v.get(idx);
             }
+
             @Override
             public int hashCode0(int idx, Hasher hasher) {
-                return hasher.hash((double)v.get(idx));
+                return hasher.hash((double) v.get(idx));
             }
         };
     }
@@ -383,13 +384,15 @@ public class ValueVectorReader implements IVectorReader {
             public int getInt(int idx) {
                 return v.get(idx);
             }
+
             @Override
             public long getLong(int idx) {
                 return v.get(idx);
             }
+
             @Override
             public int hashCode0(int idx, Hasher hasher) {
-                return hasher.hash((double)v.get(idx));
+                return hasher.hash((double) v.get(idx));
             }
         };
     }
@@ -400,9 +403,10 @@ public class ValueVectorReader implements IVectorReader {
             public long getLong(int idx) {
                 return v.get(idx);
             }
+
             @Override
             public int hashCode0(int idx, Hasher hasher) {
-                return hasher.hash((double)v.get(idx));
+                return hasher.hash((double) v.get(idx));
             }
         };
     }
@@ -413,10 +417,12 @@ public class ValueVectorReader implements IVectorReader {
             public float getFloat(int idx) {
                 return v.get(idx);
             }
+
             @Override
             public double getDouble(int idx) {
                 return v.get(idx);
             }
+
             @Override
             public int hashCode0(int idx, Hasher hasher) {
                 return hasher.hash(v.get(idx));
@@ -430,6 +436,7 @@ public class ValueVectorReader implements IVectorReader {
             public double getDouble(int idx) {
                 return v.get(idx);
             }
+
             @Override
             public int hashCode0(int idx, Hasher hasher) {
                 return hasher.hash(v.get(idx));
@@ -546,11 +553,6 @@ public class ValueVectorReader implements IVectorReader {
             }
 
             @Override
-            public ArrowBufPointer getPointer(int idx) {
-                return underlyingVector.getDataPointer(idx);
-            }
-
-            @Override
             public ArrowBufPointer getPointer(int idx, ArrowBufPointer reuse) {
                 return underlyingVector.getDataPointer(idx, reuse);
             }
@@ -571,7 +573,7 @@ public class ValueVectorReader implements IVectorReader {
 
             @Override
             public int hashCode0(int idx, Hasher hasher) {
-                return hasher.hash(getInt(idx) * 86_400_000L * 1_000_000L);
+                return hasher.hash(getInt(idx) * 86_400.0);
             }
         };
     }
@@ -590,7 +592,7 @@ public class ValueVectorReader implements IVectorReader {
 
             @Override
             public int hashCode0(int idx, Hasher hasher) {
-                return hasher.hash(getInt(idx) * 1_000_000L);
+                return hasher.hash(getInt(idx) / 1_000.0);
             }
         };
     }
@@ -617,11 +619,10 @@ public class ValueVectorReader implements IVectorReader {
             public int hashCode0(int idx, Hasher hasher) {
                 return hasher.hash(
                         switch (unit) {
-                            case SECOND -> getLong(idx) * NANO_HZ;
-                            case MILLISECOND -> getLong(idx) * MICRO_HZ;
-                            case MICROSECOND -> getLong(idx) * MILLI_HZ;
-                            case NANOSECOND -> getLong(idx);
-                            default -> throw new IllegalStateException("Unexpected time unit: " + unit);
+                            case SECOND -> (double) getLong(idx);
+                            case MILLISECOND -> getLong(idx) / (double) MILLI_HZ;
+                            case MICROSECOND -> getLong(idx) / (double) MICRO_HZ;
+                            case NANOSECOND -> getLong(idx) / (double) NANO_HZ;
                         });
             }
         };
@@ -641,7 +642,7 @@ public class ValueVectorReader implements IVectorReader {
 
             @Override
             public int hashCode0(int idx, Hasher hasher) {
-                return hasher.hash(getLong(idx) * 1_000_000_000L);
+                return hasher.hash((double) getLong(idx));
             }
         };
     }
@@ -660,7 +661,7 @@ public class ValueVectorReader implements IVectorReader {
 
             @Override
             public int hashCode0(int idx, Hasher hasher) {
-                return hasher.hash(getLong(idx) * 1_000_000L);
+                return hasher.hash(getLong(idx) / (double) MILLI_HZ);
             }
         };
     }
@@ -679,7 +680,7 @@ public class ValueVectorReader implements IVectorReader {
 
             @Override
             public int hashCode0(int idx, Hasher hasher) {
-                return hasher.hash(getLong(idx) * 1_000L);
+                return hasher.hash(getLong(idx) / (double) MICRO_HZ);
             }
         };
     }
@@ -698,7 +699,7 @@ public class ValueVectorReader implements IVectorReader {
 
             @Override
             public int hashCode0(int idx, Hasher hasher) {
-                return hasher.hash(getLong(idx));
+                return hasher.hash(getLong(idx) / (double) NANO_HZ);
             }
         };
     }
@@ -713,8 +714,8 @@ public class ValueVectorReader implements IVectorReader {
             }
 
             @Override
-            public IVectorReader listElementReader() {
-                return inner.listElementReader();
+            public IVectorReader getListElements() {
+                return inner.getListElements();
             }
 
             @Override
@@ -899,6 +900,28 @@ public class ValueVectorReader implements IVectorReader {
         };
     }
 
+    public static IVectorReader intervalMdmVector(IntervalMonthDayMicroVector v) {
+        var underlyingVec = intervalMdnVector(v.getUnderlyingVector());
+
+        return new ValueVectorReader(v) {
+            @Override
+            protected Object getObject0(int idx, IKeyFn<?> keyFn) {
+                IntervalMonthDayNano inner = (IntervalMonthDayNano) underlyingVec.getObject(idx, keyFn);
+                return new IntervalMonthDayMicro(inner.period, inner.duration);
+            }
+
+            @Override
+            public ValueReader valueReader(VectorPosition pos) {
+                return underlyingVec.valueReader(pos);
+            }
+
+            @Override
+            public int hashCode0(int idx, Hasher hasher) {
+                return underlyingVec.hashCode(idx, hasher);
+            }
+        };
+    }
+
     public static IVectorReader durationVector(DurationVector v) {
         return new ValueVectorReader(v) {
             @Override
@@ -930,7 +953,7 @@ public class ValueVectorReader implements IVectorReader {
 
         return new ValueVectorReader(v) {
             @Override
-            public Collection<String> structKeys() {
+            public Set<String> getKeyNames() {
                 return rdrs.keySet();
             }
 
@@ -955,7 +978,7 @@ public class ValueVectorReader implements IVectorReader {
             @Override
             public ValueReader valueReader(VectorPosition pos) {
                 @SuppressWarnings("resource")
-                var readers = structKeys().stream().collect(Collectors.toMap(k -> k, k -> structKeyReader(k).valueReader(pos)));
+                var readers = getKeyNames().stream().collect(Collectors.toMap(k -> k, k -> structKeyReader(k).valueReader(pos)));
 
                 return new BaseValueReader(pos) {
                     @Override
@@ -996,7 +1019,7 @@ public class ValueVectorReader implements IVectorReader {
         }
 
         @Override
-        public IVectorReader listElementReader() {
+        public IVectorReader getListElements() {
             return elReader;
         }
 
@@ -1072,7 +1095,7 @@ public class ValueVectorReader implements IVectorReader {
         }
 
         @Override
-        public IVectorReader listElementReader() {
+        public IVectorReader getListElements() {
             return elReader;
         }
 
@@ -1139,8 +1162,8 @@ public class ValueVectorReader implements IVectorReader {
             }
 
             @Override
-            public IVectorReader listElementReader() {
-                return listReader.listElementReader();
+            public IVectorReader getListElements() {
+                return listReader.getListElements();
             }
 
             @Override
@@ -1198,18 +1221,18 @@ public class ValueVectorReader implements IVectorReader {
             }
 
             @Override
-            public IVectorReader mapKeyReader() {
+            public IVectorReader getMapKeys() {
                 return keyReader;
             }
 
             @Override
-            public IVectorReader mapValueReader() {
+            public IVectorReader getMapValues() {
                 return valueReader;
             }
 
             @Override
-            public IVectorReader listElementReader() {
-                return listReader.listElementReader();
+            public IVectorReader getListElements() {
+                return listReader.getListElements();
             }
 
             @Override
@@ -1353,8 +1376,8 @@ public class ValueVectorReader implements IVectorReader {
         }
 
         @Override
-        public List<String> legs() {
-            return legs;
+        public Set<String> getLegNames() {
+            return Set.copyOf(legs);
         }
 
         @Override

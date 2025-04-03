@@ -2660,8 +2660,8 @@ UNION ALL
   (xt/submit-tx tu/*node* ["INSERT INTO docs RECORDS {_id: 1, tx_interval: INTERVAL 'PT1H'};"])
 
   (t/is (= [{:xt/id 1,
-             :tx-interval #xt/interval-mdn ["P0D" "PT1H"],
-             :q-interval #xt/interval-mdn ["P0D" "PT1H"]}]
+             :tx-interval #xt/interval-mdm ["P0D" "PT1H"],
+             :q-interval #xt/interval-mdm ["P0D" "PT1H"]}]
            (xt/q tu/*node* "FROM docs SELECT *, INTERVAL 'PT1H' AS q_interval"))))
 
 (t/deftest test-push-selection-down-past-unnest
@@ -2749,14 +2749,13 @@ UNION ALL
                                   {_id: 1, value: TIMESTAMP '2024-01-01T00:00:00Z'};"]
                             [:put-docs :docs3 {:xt/id 2 :value #xt/date "2024-01-01"}]])
 
-  (t/is (= [#:xt{:id2 2, :id1 2}
-            #:xt{:id1 2, :id2 1}
-            #:xt{:id1 1, :id2 2}
-            #:xt{:id1 1, :id2 1}]
+  (t/is (= [{:id1 1, :id2 1}, {:id1 1, :id2 2},
+            {:id1 2, :id2 1}, {:id1 2, :id2 2}]
            (xt/q tu/*node*  "FROM docs3 AS d1
                              LEFT OUTER JOIN docs3 AS d2
                              ON d1.value = d2.value + INTERVAL 'PT0M'
-                             SELECT d1._id AS _id1, d2._id AS _id2"))
+                             SELECT d1._id AS id1, d2._id AS id2
+                             ORDER BY id1, id2"))
         "Testing joins with differnt temporal types"))
 
 (t/deftest mismatched-columns-in-table-projection-stops-ingestion-4069
@@ -2816,3 +2815,25 @@ UNION ALL
 
   (t/is (= [{:xt/id #uuid "2f64d726-b528-4897-b3b1-db41cd9e887b"}]
            (xt/q tu/*node* "SELECT * FROM foo"))))
+
+(t/deftest null->struct-ingestion-stopped-4300
+  ;; FIXME #4300
+  #_#_#_
+  (xt/execute-tx tu/*node* ["INSERT INTO \"test_null_values\" RECORDS {\"metadata\": {\"key\": 'value', \"value\": NULL}, \"_id\": UUID 'b5e2705f-5ba7-46c5-b595-afc96370742d'}"])
+  (xt/execute-tx tu/*node* ["UPDATE \"test_null_values\" SET \"metadata\" = NULL WHERE (\"_id\" = UUID 'b5e2705f-5ba7-46c5-b595-afc96370742d')"])
+
+  (xt/q tu/*node* "SELECT * FROM `test_null_values`"))
+
+(t/deftest interval-mdm
+  (xt/execute-tx tu/*node* ["INSERT INTO docs RECORDS {_id: 1, tx_interval: INTERVAL 'P1DT1.123456S'}"])
+  (xt/execute-tx tu/*node* [[:sql "INSERT INTO docs RECORDS {_id: 2, tx_interval: ?}" [#xt/interval-mdm ["P1D" "PT1.123456S"]]]])
+
+  (t/is (= [{:xt/id 2, :tx-interval #xt/interval-mdm ["P1D" "PT1.123456S"]}
+            {:xt/id 1, :tx-interval #xt/interval-mdm ["P1D" "PT1.123456S"]}]
+           (xt/q tu/*node* "FROM docs SELECT *")))
+
+  (t/is (= [{:mdm #xt/interval-mdm ["P1D" "PT1.123456S"],
+             :mdn [#xt/interval-mdn ["P1D" "PT1.123456789S"]],
+             :mdm-literal #xt/interval-mdm ["P1D" "PT1.123456S"]}]
+           (xt/q tu/*node* "SELECT ? mdm, ? mdn, INTERVAL 'P1DT1.123456S' mdm_literal"
+                 {:args [#xt/interval-mdm ["P1D" "PT1.123456S"] [#xt/interval-mdn ["P1D" "PT1.123456789S"]]]}))))

@@ -11,7 +11,7 @@
            (java.time Instant LocalDate LocalTime OffsetDateTime ZonedDateTime)
            (org.apache.arrow.vector BigIntVector BitVector DateDayVector DecimalVector Float4Vector Float8Vector IntVector IntervalMonthDayNanoVector NullVector SmallIntVector TimeNanoVector TimeStampMicroTZVector TinyIntVector VarBinaryVector VarCharVector)
            (org.apache.arrow.vector.complex DenseUnionVector ListVector StructVector)
-           (org.apache.arrow.vector.types.pojo ArrowType)
+           (org.apache.arrow.vector.types.pojo ArrowType FieldType)
            (xtdb.types IntervalDayTime IntervalYearMonth RegClass RegProc)
            (xtdb.vector IVectorWriter)
            (xtdb.vector.extensions KeywordVector RegClassVector RegProcVector TransitVector UriVector UuidVector)))
@@ -23,8 +23,9 @@
   (with-open [duv (DenseUnionVector/empty "" tu/*allocator*)]
     (let [duv-writer (vw/->writer duv)]
       (doseq [v vs]
-        (doto (.legWriter duv-writer ^ArrowType (arrow-type-fn v))
-          (write-fn v)))
+        (let [^ArrowType arrow-type (arrow-type-fn v)]
+          (doto (.vectorFor duv-writer (types/arrow-type->leg arrow-type) (FieldType. (= arrow-type #xt.arrow/type :null) arrow-type nil))
+            (write-fn v))))
 
       (let [duv-rdr (vw/vec-wtr->rdr duv-writer)]
         {:vs (vec (for [idx (range (count vs))]
@@ -228,8 +229,8 @@
   (t/is (= (types/col-type->field :utf8)
            (types/merge-fields (types/col-type->field :utf8) (types/col-type->field :utf8))))
 
-  (t/is (= (types/col-type->field [:union #{:utf8 :i64}])
-           (types/merge-fields (types/col-type->field :utf8) (types/col-type->field :i64))))
+  (t/is (= (types/col-type->field "a" [:union #{:utf8 :i64}])
+           (types/merge-fields (types/col-type->field "a" :utf8) (types/col-type->field "a" :i64))))
 
   (t/is (=
          ;; ordering seems to be important
@@ -268,8 +269,8 @@
     (t/is (= (types/col-type->field "struct" '[:union #{[:struct {a :utf8
                                                                   b [:union #{:utf8 :i64}]}]
                                                         :null}])
-             (types/merge-fields (types/col-type->field '[:union #{[:struct {a :utf8, b :utf8}] :null}])
-                                 (types/col-type->field '[:struct {a :utf8, b :i64}]))))
+             (types/merge-fields (types/col-type->field "struct" '[:union #{[:struct {a :utf8, b :utf8}] :null}])
+                                 (types/col-type->field "struct" '[:struct {a :utf8, b :i64}]))))
 
     (let [struct0 (types/col-type->field '[:struct {a :utf8, b :utf8}])
           struct1 (types/col-type->field '[:struct {b :utf8, c :i64}])]
@@ -313,18 +314,18 @@
     (t/is (= (types/col-type->field :null)
              (types/merge-fields (types/col-type->field :null) (types/col-type->field :null))))
 
-    (t/is (= (types/col-type->field "i64" [:union #{:null :i64}])
-             (types/merge-fields (types/col-type->field :null) (types/col-type->field :i64))))
+    (t/is (= (types/col-type->field "a" [:union #{:null :i64}])
+             (types/merge-fields (types/col-type->field "a" :null) (types/col-type->field "a" :i64))))
 
-    (t/is (= (types/col-type->field "union" [:union #{:null :i64 :f64}])
-             (types/merge-fields (types/col-type->field :f64) (types/col-type->field :null) (types/col-type->field :i64))))
+    (t/is (= (types/col-type->field "a" [:union #{:null :i64 :f64}])
+             (types/merge-fields (types/col-type->field "a" :f64) (types/col-type->field "a" :null) (types/col-type->field "a" :i64))))
 
     (t/testing "nulls kept within the legs they were originally in"
-      (t/is (= (types/->field "union" #xt.arrow/type :union false
+      (t/is (= (types/->field "a" #xt.arrow/type :union false
                               (types/col-type->field :f64)
                               (types/col-type->field "i64" [:union #{:null :i64}]))
-               (types/merge-fields (types/col-type->field :f64)
-                                   (types/col-type->field [:union #{:null :i64}]))))
+               (types/merge-fields (types/col-type->field "a" :f64)
+                                   (types/col-type->field "a" [:union #{:null :i64}]))))
 
       (t/is (= (types/->field "union" #xt.arrow/type :union false
                               (types/col-type->field :f64)

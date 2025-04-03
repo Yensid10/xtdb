@@ -32,7 +32,7 @@ class ScanCursor(
     private class LeafPointer(val evPtr: EventRowPointer, val relIdx: Int)
 
     private fun RelationReader.maybeSelect(iidPred: SelectionSpec?) =
-        if (iidPred != null) select(iidPred.select(al, this, schema, args)) else this
+        if (iidPred != null) select(iidPred.select(al, this, this@ScanCursor.schema, args)) else this
 
     override fun tryAdvance(action: Consumer<in RelationReader>): Boolean {
         val isValidPtr = ArrowBufPointer()
@@ -56,7 +56,7 @@ class ScanCursor(
                 val contentRelFactory = MultiVectorRelationFactory(leafReaders, colNames.toList())
 
                 leafReaders.forEachIndexed { idx, leafReader ->
-                    EventRowPointer.Arrow(leafReader, taskPath)
+                    EventRowPointer(leafReader, taskPath)
                         .takeIf { it.isValid(isValidPtr, taskPath) }
                         ?.let { mergeQueue.add(LeafPointer(it, idx)) }
                 }
@@ -80,7 +80,6 @@ class ScanCursor(
                                     temporalBounds.intersects(validFrom, validTo, sysFrom, sysTo)
                                     && validFrom != validTo && sysFrom != sysTo
                                 ) {
-                                    outRel.startRow()
                                     contentRelFactory.accept(leafPtr.relIdx, idx)
                                     bitemporalConsumer.accept(validFrom, validTo, sysFrom, sysTo)
                                     outRel.endRow()
@@ -96,7 +95,7 @@ class ScanCursor(
                 val rel = contentRelFactory.realize()
                     .let { rel ->
                         if (contentCols.isNullOrEmpty() || !temporalCols.isNullOrEmpty())
-                            RelationReader.concat(rel, outRel.toReader())
+                            RelationReader.concatCols(rel, outRel.toReader())
                         else rel
                     }
                     .let { rel ->
@@ -106,7 +105,7 @@ class ScanCursor(
                             .fold(rel) { acc, colPred -> acc.select(colPred.select(al, acc, schema, args)) }
                     }
 
-                if (rel.rowCount() > 0) {
+                if (rel.rowCount > 0) {
                     action.accept(rel)
                     return true
                 }

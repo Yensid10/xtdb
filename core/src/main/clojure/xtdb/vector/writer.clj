@@ -9,10 +9,10 @@
            (java.time Duration Instant LocalDate LocalDateTime LocalTime OffsetDateTime ZonedDateTime)
            (java.util Date List Map Set UUID)
            (org.apache.arrow.memory BufferAllocator)
-           (org.apache.arrow.vector PeriodDuration ValueVector VectorSchemaRoot)
+           (org.apache.arrow.vector ValueVector VectorSchemaRoot)
            (org.apache.arrow.vector.types.pojo Field FieldType)
            xtdb.Types
-           (xtdb.types ClojureForm IntervalDayTime IntervalMonthDayNano IntervalYearMonth ZonedDateTimeRange)
+           (xtdb.types ClojureForm IntervalDayTime IntervalMonthDayNano IntervalMonthDayMicro IntervalYearMonth ZonedDateTimeRange)
            (xtdb.vector FieldVectorWriters IRelationWriter IVectorReader IVectorWriter RelationReader RelationWriter RootWriter)))
 
 (set! *unchecked-math* :warn-on-boxed)
@@ -87,11 +87,11 @@
   IntervalMonthDayNano
   (value->col-type [_] [:interval :month-day-nano])
 
-  ZonedDateTimeRange
-  (value->col-type [_] :tstz-range)
+  IntervalMonthDayMicro
+  (value->col-type [_] [:interval :month-day-micro])
 
-  PeriodDuration
-  (value->col-type [_] [:interval :month-day-nano]))
+  ZonedDateTimeRange
+  (value->col-type [_] :tstz-range))
 
 (extend-protocol ArrowWriteable
   (Class/forName "[B")
@@ -154,10 +154,11 @@
 
 (defn rows->fields [rows]
   (->> (for [col-name (into #{} (mapcat keys) rows)]
-         [(symbol col-name) (->> rows
-                                 (into #{} (map (fn [row]
-                                                  (types/col-type->field (value->col-type (get row col-name))))))
-                                 (apply types/merge-fields ))])
+         [(symbol col-name) (-> rows
+                                (->> (into #{} (map (fn [row]
+                                                      (types/col-type->field (value->col-type (get row col-name))))))
+                                     (apply types/merge-fields))
+                                (types/field-with-name (str (symbol col-name))))])
        (into {})))
 
 (defn ->vec-writer ^xtdb.vector.IVectorWriter [^BufferAllocator allocator, ^String col-name, ^FieldType field-type]
@@ -208,17 +209,17 @@
   (vr/vec->reader (.getVector (doto w (.syncValueCount)))))
 
 (defn rel-wtr->rdr ^xtdb.vector.RelationReader [^xtdb.vector.IRelationWriter w]
-  (vr/rel-reader (map vec-wtr->rdr (vals w))
-                 (.getPosition (.writerPosition w))))
+  (vr/rel-reader (map vec-wtr->rdr w) (.getRowCount w)))
 
 (defn append-vec [^IVectorWriter vec-writer, ^IVectorReader in-col]
   (let [row-copier (.rowCopier in-col vec-writer)]
-    (dotimes [src-idx (.valueCount in-col)]
+    (dotimes [src-idx (.getValueCount in-col)]
       (.copyRow row-copier src-idx))))
 
 (defn append-rel [^IRelationWriter dest-rel, ^RelationReader src-rel]
   (doseq [^IVectorReader src-col src-rel]
-    (append-vec (.colWriter dest-rel (.getName src-col)) src-col))
+    (-> (or (.vectorForOrNull dest-rel (.getName src-col))
+            (.vectorFor dest-rel (.getName src-col) (.getFieldType src-col)))
+        (append-vec src-col)))
 
-  (let [wp (.writerPosition dest-rel)]
-    (.setPosition wp (+ (.getPosition wp) (.rowCount src-rel)))))
+  (.setRowCount dest-rel (+ (.getRowCount dest-rel) (.getRowCount src-rel))))

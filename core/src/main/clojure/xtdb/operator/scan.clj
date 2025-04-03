@@ -60,7 +60,7 @@
             (case tag
               :literal (-> arg
                            (time/sql-temporal->micros expr/*default-tz*))
-              :param (some-> (-> (.readerForName args (name arg))
+              :param (some-> (-> (.vectorForOrNull args (name arg))
                                  (.getObject 0))
                              (time/sql-temporal->micros expr/*default-tz*))
               :now (-> (expr/current-time)
@@ -117,8 +117,8 @@
           (util/->iid eid)
 
           (s/valid? ::lp/param eid)
-          (let [eid-rdr (.readerForName args-rel (name eid))]
-            (when (= 1 (.valueCount eid-rdr))
+          (let [eid-rdr (.vectorForOrNull args-rel (name eid))]
+            (when (= 1 (.getValueCount eid-rdr))
               (let [eid (.getObject eid-rdr 0)]
                 (if (util/valid-iid? eid)
                   (util/->iid eid)
@@ -127,16 +127,17 @@
 (defn filter-pushdown-bloom-page-idx-pred ^IntPredicate [^PageMetadata page-metadata ^String col-name]
   (when-let [^MutableRoaringBitmap pushdown-bloom (get *column->pushdown-bloom* (symbol col-name))]
     (let [metadata-rdr (.getMetadataLeafReader page-metadata)
-          bloom-rdr (-> (.keyReader metadata-rdr "columns")
-                        (.elementReader)
-                        (.keyReader "bloom"))]
+          bloom-rdr (-> (.vectorForOrNull metadata-rdr "columns")
+                        (.getListElements)
+                        (.vectorFor "bytes")
+                        (.vectorFor "bloom"))]
       (reify IntPredicate
         (test [_ page-idx]
           (boolean
             (let [bloom-vec-idx (.rowIndex page-metadata col-name page-idx)]
               (and (>= bloom-vec-idx 0)
-                   (not (nil? (.getObject bloom-rdr bloom-vec-idx)))
-                   (MutableRoaringBitmap/intersects pushdown-bloom (BloomUtils/bloomToBitmap bloom-rdr bloom-vec-idx))))))))))
+                   (or (.isNull bloom-rdr bloom-vec-idx)
+                       (MutableRoaringBitmap/intersects pushdown-bloom (BloomUtils/bloomToBitmap bloom-rdr bloom-vec-idx)))))))))))
 
 (defn ->path-pred [^ArrowBuf iid-arrow-buf]
   (when iid-arrow-buf
@@ -221,7 +222,7 @@
                                iid-bb (selects->iid-byte-buffer selects args)
                                col-preds (cond-> col-preds
                                            iid-bb (assoc "_iid" (IidSelector. iid-bb)))
-                               metadata-pred (expr.meta/->metadata-selector (cons 'and metadata-args) (update-vals fields types/field->col-type) args)
+                               metadata-pred (expr.meta/->metadata-selector allocator (cons 'and metadata-args) (update-vals fields types/field->col-type) args)
                                scan-opts (-> scan-opts
                                              (update :for-valid-time
                                                      (fn [fvt]
@@ -244,7 +245,8 @@
                                                                                                                 col-names)
                                                                                          :page-metadata page-metadata})))
                                                                               (-> (cat/trie-state trie-catalog table-name)
-                                                                                  (cat/current-tries)))
+                                                                                  (cat/current-tries)
+                                                                                  (cat/filter-tries temporal-bounds)))
 
                                                                   live-table-wm (conj (-> (trie/->Segment (.getLiveTrie live-table-wm))
                                                                                           (assoc :memory-rel (.getLiveRelation live-table-wm))))
@@ -253,7 +255,7 @@
                                                                                               (assoc :memory-rel memory-rel)))))]
                                                    (->> (HashTrieKt/toMergePlan segments (->path-pred iid-arrow-buf))
                                                         (into [] (keep (fn [^MergePlanTask mpt]
-                                                                         (when-let [leaves (trie/->merge-task
+                                                                         (when-let [leaves (trie/filter-meta-objects
                                                                                             (for [^MergePlanNode mpn (.getMpNodes mpt)
                                                                                                   :let [{:keys [data-file-path page-metadata page-idx-pred trie memory-rel]} (.getSegment mpn)
                                                                                                         node (.getNode mpn)]]
