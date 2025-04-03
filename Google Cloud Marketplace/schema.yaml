@@ -1,0 +1,75 @@
+x-google-marketplace:
+  schemaVersion: v2
+  applicationApiVersion: v1beta1
+  publishedVersion: '1.0.0'
+  publishedVersionMetadata:
+    releaseNote: >-
+      Initial release of XTDB for Google Cloud Marketplace.
+    releaseTypes:
+    - Feature
+    recommended: true
+  images:
+    xtdb:
+      properties:
+        xtdbRegistry:
+          type: REGISTRY
+        xtdbRepository:
+          type: REPO_WITHOUT_REGISTRY
+        xtdbTag:
+          type: TAG
+    kafka:
+      properties:
+        kafkaRegistry:
+          type: REGISTRY
+        kafkaRepository:
+          type: REPO_WITHOUT_REGISTRY
+        kafkaTag:
+          type: TAG
+
+# Adapted from postgresql's schema.yaml
+properties:
+  name:
+    type: string
+    default: "xtdb-kubernetes-deployment"
+    description: "Fixed application deployment name"
+    x-google-marketplace:
+      type: NAME
+  namespace:
+    type: string
+    x-google-marketplace:
+      type: NAMESPACE
+  xtdb.serviceAccount:
+    type: string
+    title: XTDB Service Account
+    x-google-marketplace:
+      type: SERVICE_ACCOUNT
+      serviceAccount:
+        description: "The service account for XTDB."
+  xtdb.adminPassword: # Ensure this is passed in to the xt-config
+    type: string
+    title: XTDB Admin Password
+    description: "Password for the XTDB admin user. This is automatically generated."
+    x-google-marketplace:
+      type: GENERATED_PASSWORD
+      generatedPassword:
+        length: 16
+  xtdbConfig.gcpProjectId:
+    type: string
+    title: GCP Project ID
+    description: The Google Cloud project ID where XTDB will run.
+    x-google-marketplace:
+      type: STRING
+  xtdbConfig.gcpBucket:
+    type: string
+    title: GCS Bucket
+    description: The GCS bucket to be used for XTDB storage.
+    x-google-marketplace:
+      type: STRING
+
+required:
+  - name
+  - namespace
+  - xtdb.serviceAccount
+  - xtdbConfig.gcpProjectId
+  - xtdbConfig.gcpBucket
+  - xtdb.adminPassword

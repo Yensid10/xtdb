@@ -1,0 +1,34 @@
+apiVersion: app.k8s.io/v1beta1
+kind: Application
+metadata:
+  name: {{ .Release.Name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ .Release.Name }}
+  annotations:
+    marketplace.cloud.google.com/deploy-info: '{
+      "partner_id": "xtdb",
+      "product_id": "xtdb",
+      "partner_name": "XTDB"
+    }'
+spec:
+  descriptor:
+    type: XTDB
+    version: {{ .Chart.Version }}
+    description: "XTDB is a general-purpose bitemporal database for SQL, Datalog & graph queries"
+    maintainers:
+    - name: XTDB
+      url: https://xtdb.com
+    links:
+    - description: Documentation
+      url: https://docs.xtdb.com
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ .Release.Name }}
+  componentKinds:
+  - group: apps
+    kind: StatefulSet
+  - group: v1
+    kind: Service
+  - group: v1
+    kind: ConfigMap 
