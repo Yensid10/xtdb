@@ -5,6 +5,9 @@
 # Define image tags
 XTDB_TAG ?=  1.0.0
 
+# Ensure bash is used for all commands
+SHELL := /bin/bash 
+
 # Define image sources
 PROJECT_ID ?= $(shell gcloud config get-value project)
 REGISTRY ?= us-central1-docker.pkg.dev/bcs-test-450214/xtdb-repo
