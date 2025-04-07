@@ -7,6 +7,7 @@ import org.apache.arrow.vector.*
 import org.apache.arrow.vector.BitVector
 import org.apache.arrow.vector.DateDayVector
 import org.apache.arrow.vector.DateMilliVector
+import org.apache.arrow.vector.DecimalVector
 import org.apache.arrow.vector.DurationVector
 import org.apache.arrow.vector.FixedSizeBinaryVector
 import org.apache.arrow.vector.IntVector
@@ -214,13 +215,23 @@ private class TimeNanoVectorWriter(override val vector: TimeNanoVector) : TimeVe
 private val DECIMAL_ERROR_KEY = Keyword.intern("xtdb.error", "decimal-error")
 
 private class DecimalVectorWriter(override val vector: DecimalVector) : ScalarVectorWriter(vector) {
-    @Throws(RuntimeException::class)
     override fun writeObject0(obj: Any) {
         if (obj !is BigDecimal) throw InvalidWriteObjectException(field.fieldType, obj)
         try {
             vector.setSafe(valueCount++, obj.setScale(vector.scale))
-        } catch (e: Exception) {
+        } catch (e: ArithmeticException) {
             throw RuntimeException(DECIMAL_ERROR_KEY, e.message, emptyMap<Keyword, Any>(), e)
+        }
+    }
+
+    override fun writeValue0(v: ValueReader) = writeObject(v.readObject())
+}
+
+private class Decimal256VectorWriter(override val vector: Decimal256Vector) : ScalarVectorWriter(vector) {
+    override fun writeObject0(obj: Any) {
+        if (obj !is BigDecimal) throw InvalidWriteObjectException(field.fieldType, obj)
+        try {
+            vector.setSafe(valueCount++, obj.setScale(vector.scale))
         } catch (e: ArithmeticException) {
             throw RuntimeException(DECIMAL_ERROR_KEY, e.message, emptyMap<Keyword, Any>(), e)
         }
@@ -508,6 +519,7 @@ private object WriterForVectorVisitor : VectorVisitor<IVectorWriter, FieldChange
         is Float8Vector -> Float8VectorWriter(vec)
 
         is DecimalVector -> DecimalVectorWriter(vec)
+        is Decimal256Vector -> Decimal256VectorWriter(vec)
 
         is DateDayVector -> DateDayVectorWriter(vec)
         is DateMilliVector -> DateMilliVectorWriter(vec)

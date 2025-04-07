@@ -20,7 +20,8 @@
            (xtdb JsonSerde Types)
            (xtdb.types IntervalMonthDayMicro IntervalMonthDayNano ZonedDateTimeRange)
            [xtdb.vector IVectorReader]
-           (xtdb.vector.extensions KeywordType RegClassType RegProcType SetType TransitType TsTzRangeType UriType UuidType IntervalMDMType)))
+           (xtdb.vector.extensions KeywordType RegClassType RegProcType SetType TransitType TsTzRangeType UriType UuidType IntervalMDMType)
+           (xtdb.pg.codec NumericBin)))
 
 (set! *unchecked-math* :warn-on-boxed)
 
@@ -95,7 +96,9 @@
   ArrowType$Binary (<-arrow-type [_] :varbinary)
   ArrowType$FixedSizeBinary (<-arrow-type [arrow-type] [:fixed-size-binary (.getByteWidth arrow-type)])
 
-  ArrowType$Decimal (<-arrow-type [_] :decimal)
+  ArrowType$Decimal
+  (<-arrow-type [arrow-type]
+    [:decimal (.getPrecision arrow-type) (.getScale arrow-type) (.getBitWidth arrow-type)])
 
   ArrowType$FixedSizeList (<-arrow-type [arrow-type] [:fixed-size-list (.getListSize arrow-type)])
 
@@ -139,9 +142,6 @@
     :f32 (.getType Types$MinorType/FLOAT4)
     :f64 (.getType Types$MinorType/FLOAT8)
 
-    ;; HACK we should support parameterised decimals here
-    :decimal (ArrowType$Decimal/createDecimal 38 19 (int 128))
-
     :utf8 (.getType Types$MinorType/VARCHAR)
     :varbinary (.getType Types$MinorType/VARBINARY)
 
@@ -170,6 +170,9 @@
 
       :date (let [[_ date-unit] col-type]
               (ArrowType$Date. (kw->date-unit date-unit)))
+
+      :decimal (let [[_ precision scale bitwidth] col-type]
+                 (ArrowType$Decimal/createDecimal precision scale (int bitwidth)))
 
       :timestamp-tz (let [[_ time-unit tz] col-type]
                       (ArrowType$Timestamp. (kw->time-unit time-unit) tz))
@@ -466,11 +469,11 @@
                      :utf8 Types$MinorType/VARCHAR, :varbinary Types$MinorType/VARBINARY)]
     (->field col-name (.getType minor-type) (or nullable? (= col-type :null)))))
 
-(defmethod col-type->field* :decimal [col-name nullable? _col-type]
-  ;; TODO decide on how deal with precision that is out of this range but still fits into
-  ;; a 128 bit decimal
-  (->field col-name (ArrowType$Decimal/createDecimal 38 19 (int 128)) nullable?))
+(defmethod col-type->field* :decimal [col-name nullable? [_ precision scale bit-width]]
+  (->field col-name (ArrowType$Decimal/createDecimal precision scale bit-width) nullable?))
 
+(defmethod col-type->field-name :decimal [[type-head precision scale bit-width :as v]]
+  (str (name type-head) "-" precision "-" scale "-" bit-width))
 
 (defmethod col-type->field* :tstz-range [col-name nullable? _col-type]
   (->field col-name TsTzRangeType/INSTANCE nullable?
@@ -518,7 +521,8 @@
 (defmethod arrow-type->col-type ArrowType$Bool [_] :bool)
 (defmethod arrow-type->col-type ArrowType$Utf8 [_] :utf8)
 (defmethod arrow-type->col-type ArrowType$Binary [_] :varbinary)
-(defmethod arrow-type->col-type ArrowType$Decimal  [_] :decimal)
+(defmethod arrow-type->col-type ArrowType$Decimal  [^ArrowType$Decimal arrow-type]
+  [:decimal (.getPrecision arrow-type) (.getScale arrow-type) (.getBitWidth arrow-type)])
 
 (defn col-type->nullable-col-type [col-type]
   (zmatch col-type
@@ -727,10 +731,12 @@
       (derive :int :decimal) (derive :uint :decimal)))
 
 (defmethod least-upper-bound2 [:num :num] [x-type y-type]
-  (cond
-    (isa? widening-hierarchy x-type y-type) y-type
-    (isa? widening-hierarchy y-type x-type) x-type
-    :else :any))
+  (let [x-head-type (col-type-head x-type)
+        y-head-type (col-type-head y-type)]
+    (cond
+      (isa? widening-hierarchy x-head-type y-head-type) y-type
+      (isa? widening-hierarchy y-head-type x-head-type) x-type
+      :else :any)))
 
 (defmethod least-upper-bound2 [:duration :duration] [[_ x-unit] [_ y-unit]]
   [:duration (smallest-ts-unit x-unit y-unit)])
@@ -1006,6 +1012,20 @@
                                 (.array bb)))
               :write-text (fn [_env ^IVectorReader rdr idx]
                             (utf8 (.getDouble rdr idx)))})
+
+   :numeric {:typname "numeric"
+             :col-type :decimal
+             :oid 1700
+             :typlen -1
+             :typsend "numeric_send"
+             :typreceive "numeric_recv"
+             :read-binary (fn [_env ba] (NumericBin/decode (ByteBuffer/wrap ba)))
+             :read-text (fn [_env ba] (-> ba read-utf8 bigdec))
+             :write-binary (fn [_env ^IVectorReader rdr idx]
+                             (.array (NumericBin/encode (.getObject rdr idx))))
+             :write-text (fn [_env ^IVectorReader rdr idx]
+                           (utf8 (.getObject rdr idx)))}
+
    :uuid (let [typlen 16]
            {:typname "uuid"
             :col-type :uuid
@@ -1452,6 +1472,7 @@
    #_#_:i8 :bit
    :f64 :float8
    :f32 :float4
+   :decimal :numeric
    :uuid :uuid
    :bool :boolean
    :null :text
@@ -1477,7 +1498,9 @@
        (cond-> col-type
          ;; ignore TZ
          (= (col-type-head col-type) :timestamp-tz)
-         (subvec 0 2))
+         (subvec 0 2)
+         (= (col-type-head col-type) :decimal)
+         col-type-head)
 
        (or fallback-pg-type :json)))
 
