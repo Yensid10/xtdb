@@ -20,12 +20,6 @@ RUN cat /tmp/schema.yaml && echo "Schema file exists and is readable"
 ARG REGISTRY
 ARG TAG
 
-# No need to use envsubst to replace variables here anymore as registry is handled by marketplace
-# RUN cat /tmp/schema.yaml \
-#     | env -i "REGISTRY=$REGISTRY" "TAG=$TAG" envsubst \
-#     > /tmp/schema.yaml.new \
-#     && mv /tmp/schema.yaml.new /tmp/schema.yaml
-
 # Final image
 FROM gcr.io/cloud-marketplace-tools/k8s/deployer_helm:$MARKETPLACE_TOOLS_TAG
 COPY --from=build /tmp/xtdb.tar.gz /data/chart/
