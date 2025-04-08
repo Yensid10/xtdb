@@ -284,6 +284,9 @@ setup-deployment: setup-namespace workload-identity deploy verify
 # Complete setup (infrastructure + deployment) in chronological order
 setup-all: setup-initial setup-deployment deployment-outro
 
+# Required setup to use the GCP Marketplace Click-to-Deploy
+click-to-deploy: setup-initial  setup-namespace workload-identity
+
 # Reboot deployment
 reboot-deployment: cleanup-deployment setup-deployment
 
@@ -320,11 +323,13 @@ help:
 	@echo "  cleanup-infra            Remove all GCP infrastructure"
 	@echo ""
 	@echo "Complete Workflows:"
-	@echo "★ setup-all                Setup infrastructure and deploy XTDB"
-	@echo "★ reboot-deployment        Clean up and redeploy XTDB"
+	@echo "★ setup-all                Setup infrastructure and deploy XTDB with CLI (mpdev)"
+	@echo "★ click-to-deploy          Setup infrastructure and prerequisites for Click-to-Deploy"
 	@echo "★ cleanup-all              Run all cleanup commands in sequence"
 	@echo ""
 	@echo "Example usage:"
-	@echo "  make setup-all           # Complete setup from scratch"
+	@echo "  click-to-deploy          # Complete setup for Click-to-Deploy (then use the GCP Marketplace to deploy XTDB)"
 	@echo "  make connect             # Connect to deployed XTDB instance"
 	@echo "  make cleanup-all         # Clean up everything"
+
+# @echo "★ reboot-deployment        Clean up and redeploy XTDB"
