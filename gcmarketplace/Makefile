@@ -152,6 +152,7 @@ workload-identity:
 deploy:
 	@echo "Deploying XTDB..."
 	kubectl apply -f "https://raw.githubusercontent.com/GoogleCloudPlatform/marketplace-k8s-app-tools/master/crd/app-crd.yaml"
+	gcloud auth configure-docker us-central1-docker.pkg.dev
 	mpdev install --deployer=$(REGISTRY)/xtdb/deployer:$(XTDB_TAG) \
 		--parameters='$(APP_PARAMETERS)' 
 	@echo "Waiting for 30 seconds to allow XTDB to initialise..."
