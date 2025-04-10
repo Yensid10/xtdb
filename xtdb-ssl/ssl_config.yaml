@@ -1,0 +1,18 @@
+server:
+  port: 5432
+  ssl:
+    keyStore: /ssl/xtdb.jks
+    keyStorePassword: password123
+
+log: !Local
+  path: "/var/lib/xtdb/log"
+
+storage: !Local
+  path: "/var/lib/xtdb/buffers"
+
+healthz:
+  port: 8080
+
+modules: 
+- !HttpServer
+  port: 3000

@@ -25,6 +25,14 @@ x-google-marketplace:
           type: REPO_WITHOUT_REGISTRY
         kafkaTag:
           type: TAG
+    tlsConverter:
+      properties:
+        tlsConverterRegistry:
+          type: REGISTRY
+        tlsConverterRepository:
+          type: REPO_WITHOUT_REGISTRY
+        tlsConverterTag:
+          type: TAG
 
 # Adapted from postgresql's schema.yaml
 properties:
@@ -53,6 +61,31 @@ properties:
       type: GENERATED_PASSWORD
       generatedPassword:
         length: 16
+  xtdb.tls.enabled:
+    type: string
+    title: Enable TLS/SSL
+    description: "Enable TLS/SSL for secure connections to XTDB"
+    default: "true"
+    x-google-marketplace:
+      type: STRING
+  xtdb.tls.certificate:
+    type: string
+    title: TLS Certificate Secret
+    description: "Name of Kubernetes Secret containing TLS certificate and key"
+    x-google-marketplace:
+      type: TLS_CERTIFICATE
+      tlsCertificate:
+        generatedProperties:
+          base64EncodedPrivateKey: xtdb.tls.base64EncodedPrivateKey
+          base64EncodedCertificate: xtdb.tls.base64EncodedCertificate
+  xtdb.tls.keystorePassword:
+    type: string
+    title: TLS Keystore Password
+    description: "Password for the Java keystore that will store the TLS certificate"
+    x-google-marketplace:
+      type: GENERATED_PASSWORD
+      generatedPassword:
+        length: 16
   xtdbConfig.gcpProjectId:
     type: string
     title: GCP Project ID
@@ -73,3 +106,6 @@ required:
   - xtdbConfig.gcpProjectId
   - xtdbConfig.gcpBucket
   - xtdb.adminPassword
+  - xtdb.tls.enabled
+  - xtdb.tls.certificate
+  - xtdb.tls.keystorePassword
