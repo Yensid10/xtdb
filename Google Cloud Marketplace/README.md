@@ -248,6 +248,8 @@ The cleanup process will:
 
 **Note:** The cleanup process will use the VPC and subnet names stored during setup. If you've deleted these temporary files (`.vpc_name` and `.subnet_name`), it will attempt to delete resources with the default names.
 
+**Note:** Sometimes this won't remove the Compute Engine's Storage Disks. To ensure they are properly deleted, navigate to their respective section within the Google Console website, and delete them manually.
+
 ## Troubleshooting
 
 If you encounter issues during deployment:

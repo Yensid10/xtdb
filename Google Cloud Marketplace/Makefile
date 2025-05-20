@@ -63,7 +63,7 @@ intro:
 	@echo "Also ensure you have enabled the required GCP APIs for this project."
 	@read -p "Press Enter to confirm and continue: "
 
-# 1.5 Check VPC Name
+# 2 Check VPC Name
 setup-vpc-name:
 	@echo "================================================================"
 	@echo "Checking VPC network configuration: "
@@ -81,7 +81,7 @@ setup-vpc-name:
 		echo "Using specified VPC name: $$input_vpc_name"; \
 	fi
 
-# 2. Setup XTDB Subnet
+# 3. Setup XTDB Subnet
 setup-subnet-name:
 	@echo "================================================================"
 	@echo "Checking subnet configuration: "
@@ -101,7 +101,7 @@ setup-subnet-name:
 		echo "Using specified subnet name: $$input_subnet_name"; \
 	fi
 
-# 2. Setup service account (needed for both GKE and storage)
+# 4. Setup service account (needed for both GKE and storage)
 setup-service-account:
 	@echo "================================================================"
 	@echo "Next, we will create a Service Account for XTDB and configure the necessary permissions."
@@ -113,7 +113,7 @@ setup-service-account:
 		--member="serviceAccount:xtdb-service-account@$(PROJECT_ID).iam.gserviceaccount.com" \
 		--role="roles/storage.admin"
 
-# 3. Setup GCS bucket (storage for XTDB)
+# 5. Setup GCS bucket (storage for XTDB)
 setup-bucket:
 	@echo "================================================================"
 	@echo "Then, we will create a GCS storage bucket specifically for XTDB."
@@ -124,7 +124,7 @@ setup-bucket:
 		--default-storage-class=STANDARD || true
 # May want to look into possibly changing where the location is set to.
 
-# 4. Setup GKE cluster with advanced configuration
+# 6. Setup GKE cluster with advanced configuration
 setup-infra:
 	@echo "================================================================"
 	@echo "Then we need to setup the GKE cluster and node pools with advanced configuration."
@@ -162,7 +162,7 @@ setup-infra:
 # Application Deployment
 # =============================================
 
-# 5. Setup namespace and Kubernetes service account
+# 7. Setup namespace and Kubernetes service account
 setup-namespace:
 	@echo "================================================================"
 	@echo "Following on we create a namespace and Kubernetes service account for XTDB."
@@ -170,7 +170,28 @@ setup-namespace:
 	kubectl create namespace $(NAMESPACE) || true
 	kubectl create serviceaccount xtdb-service-account --namespace $(NAMESPACE) || true
 
-# 10. Setup workload identity
+
+# DEV: Update the Helm dependencies
+update-deps:
+	@echo "Updating Helm dependencies..."
+	cd chart/xtdb && helm dependency update
+
+# DEV: Build the deployer image
+build-deployer:
+	@echo "Building deployer image..."
+	docker build \
+		--build-arg REGISTRY=$(REGISTRY) \
+		--build-arg TAG=$(XTDB_TAG) \
+		--build-arg MARKETPLACE_TOOLS_TAG=0.11.1 \
+		-t $(REGISTRY)/xtdb/deployer:$(XTDB_TAG) .
+
+# DEV: Push the deployer image
+push-deployer: 
+	@echo "Pushing deployer image..."
+	docker push $(REGISTRY)/xtdb/deployer:$(XTDB_TAG)
+
+
+# 8. Setup workload identity (Hard Requirement)
 workload-identity:	
 	@echo "================================================================"
 	@echo "Finally, we need to ensure that we setup workload identity before deployment"
@@ -186,26 +207,27 @@ workload-identity:
 		iam.gke.io/gcp-service-account=xtdb-service-account@$(PROJECT_ID).iam.gserviceaccount.com \
 		--overwrite || true
 
-# 11. Deploy to test environment
+# 9. Deploy to test environment
 deploy:
 	@echo "================================================================"
 	@echo "We can now deploy XTDB to your environment. Make sure you have Docker installed and running on your system."
 	@read -p "Press Enter to confirm that you have Docker running: "
 	@echo "Deploying XTDB: "
 	kubectl apply -f "https://raw.githubusercontent.com/GoogleCloudPlatform/marketplace-k8s-app-tools/master/crd/app-crd.yaml"
-  gcloud auth configure-docker us-central1-docker.pkg.dev
+	gcloud auth configure-docker us-central1-docker.pkg.dev
 	mpdev install --deployer=$(REGISTRY)/xtdb/deployer:$(XTDB_TAG) \
 		--parameters='$(APP_PARAMETERS)' 
 	@echo "Waiting for 90 seconds to allow XTDB to initialise..."
 	@sleep 90
 
-# 12. Verify deployment
+# 10. Verify deployment
 verify:
 	@echo "================================================================"
 	@echo "Verifying XTDB deployment..."
 	kubectl get pods -n $(NAMESPACE)
 	kubectl get svc xtdb-service -n xtdb-deployment
 
+# 11. Outro
 deployment-outro:
 	@echo "================================================================"
 	@echo "XTDB has been successfully deployed to your environment."
@@ -214,7 +236,7 @@ deployment-outro:
 	@echo "Or run \"make connect\" to connect to XTDB."
 	@echo "================================================================"
 
-# 13. Connect to XTDB
+# 12. Connect to XTDB
 connect:
 	@echo "Connecting to XTDB..."
 	@XTDB_IP=$$(kubectl get svc xtdb-service --namespace $(NAMESPACE) -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "pending"); \
@@ -230,6 +252,7 @@ connect:
 # Cleanup Operations (in reverse order)
 # =============================================
 
+# Intro (for cleanup)
 cleanup-intro:
 	@echo "================================================================"
 	@echo "Running this will remove all XTDB resources from your environment."
@@ -288,8 +311,8 @@ setup-all: setup-initial setup-deployment deployment-outro
 # Required setup to use the GCP Marketplace Click-to-Deploy
 click-to-deploy: setup-initial  setup-namespace workload-identity
 
-# Reboot deployment
-reboot-deployment: cleanup-deployment setup-deployment
+# DEV: Reboot deployment (this will delete the current deployment, then regenerate the deployer, before deploying again)
+reboot-deployment: cleanup-deployment setup-namespace update-deps build-deployer push-deployer workload-identity deploy verify
 
 # Complete cleanup (in reverse order)
 cleanup-all: cleanup-intro cleanup-deployment cleanup-infra
@@ -329,7 +352,7 @@ help:
 	@echo "★ cleanup-all              Run all cleanup commands in sequence"
 	@echo ""
 	@echo "Example usage:"
-	@echo "  click-to-deploy          # Complete setup for Click-to-Deploy (then use the GCP Marketplace to deploy XTDB)"
+	@echo "  make click-to-deploy     # Complete setup for Click-to-Deploy (then use the GCP Marketplace to deploy XTDB)"
 	@echo "  make connect             # Connect to deployed XTDB instance"
 	@echo "  make cleanup-all         # Clean up everything"
 
