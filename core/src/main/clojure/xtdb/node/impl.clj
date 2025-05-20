@@ -4,6 +4,7 @@
             [xtdb.antlr :as antlr]
             [xtdb.api :as api]
             [xtdb.error :as err]
+            [xtdb.garbage-collector]
             [xtdb.indexer :as idx]
             [xtdb.log :as xt-log]
             [xtdb.metrics :as metrics]
@@ -18,17 +19,18 @@
   (:import io.micrometer.core.instrument.composite.CompositeMeterRegistry
            io.micrometer.core.instrument.Counter
            (java.io Closeable Writer)
+           (java.util HashMap)
            (java.util.concurrent ExecutionException)
-           java.util.HashMap
            (org.apache.arrow.memory BufferAllocator RootAllocator)
            (xtdb.antlr Sql$DirectlyExecutableStatementContext)
-           (xtdb.api TransactionKey TransactionResult Xtdb Xtdb$Config)
+           (xtdb.api DataSource TransactionKey TransactionResult Xtdb Xtdb$CompactorNode Xtdb$Config)
            (xtdb.api.log Log)
            xtdb.api.module.XtdbModule$Factory
            (xtdb.api.query XtqlQuery)
            [xtdb.api.tx TxOp]
            (xtdb.indexer IIndexer LiveIndex LogProcessor)
-           (xtdb.query IQuerySource PreparedQuery)))
+           (xtdb.query IQuerySource PreparedQuery)
+           (xtdb.util TxIdUtil)))
 
 (set! *unchecked-math* :warn-on-boxed)
 
@@ -49,14 +51,6 @@
             query-opts)
       (update :snapshot-time #(some-> % (time/->instant)))
       (update :current-time #(some-> % (time/->instant)))))
-
-(defn- validate-snapshot-not-before [snapshot-time ^TransactionKey latest-completed-tx]
-  (when (and snapshot-time (or (nil? latest-completed-tx) (neg? (compare (.getSystemTime latest-completed-tx) snapshot-time))))
-    (throw (err/illegal-arg :xtdb/unindexed-tx
-                            {::err/message (format "snapshot-time (%s) is after the latest completed tx (%s)"
-                                                   (pr-str snapshot-time) (pr-str latest-completed-tx))
-                             :latest-completed-tx latest-completed-tx
-                             :snapshot-time snapshot-time}))))
 
 (defn- then-execute-prepared-query [^PreparedQuery prepared-query, allocator {:keys [args], :as query-opts} {:keys [query-timer] :as metrics}]
   (util/with-close-on-catch [bound-query (util/with-close-on-catch [args-rel (vw/open-args allocator args)]
@@ -90,6 +84,11 @@
   (getServerReadOnlyPort [this]
     (get-in (util/component this :xtdb.pgwire/server) [:read-only :port] -1))
 
+  (createConnectionBuilder [this]
+    (let [server (util/component this :xtdb.pgwire/server)
+          ^DataSource data-source (or (:read-write server) (:read-only server))]
+      (.createConnectionBuilder data-source)))
+
   (addMeterRegistry [_ reg]
     (.add metrics-registry reg))
 
@@ -99,8 +98,9 @@
 
   xtp/PNode
   (submit-tx [this tx-ops opts]
-    (try
-      @(xt-log/submit-tx& this (->TxOps tx-ops) opts)
+    (try 
+      (let [offset @(xt-log/submit-tx& this (->TxOps tx-ops) opts)]
+        (TxIdUtil/offsetToTxId (.getEpoch log) offset)) 
       (catch ExecutionException e
         (throw (ex-cause e)))
       (catch IllegalArgumentException e
@@ -161,31 +161,28 @@
                 :else (throw (err/illegal-arg :xtdb/unsupported-query-type
                                               {::err/message (format "Unsupported SQL query type: %s" (type query))})))
 
-          {:keys [snapshot-time ^long after-tx-id tx-timeout] :as query-opts} (-> query-opts (with-query-opts-defaults this))]
+          {:keys [^long after-tx-id tx-timeout] :as query-opts} (-> query-opts (with-query-opts-defaults this))]
 
       (xt-log/await-tx this after-tx-id tx-timeout)
 
-      (validate-snapshot-not-before snapshot-time (xtp/latest-completed-tx this))
       (let [plan (.planQuery q-src ast query-opts)]
         (.prepareRaQuery q-src plan query-opts))))
 
   (prepare-xtql [this query query-opts]
-    (let [{:keys [snapshot-time ^long after-tx-id tx-timeout] :as query-opts} (-> query-opts (with-query-opts-defaults this))
+    (let [{:keys [^long after-tx-id tx-timeout] :as query-opts} (-> query-opts (with-query-opts-defaults this))
           ast (cond
-                (sequential? query) (xtql/parse-query query)
+                (sequential? query) (xtql/parse-query query nil)
                 (instance? XtqlQuery query) query
                 :else (throw (err/illegal-arg :xtdb/unsupported-query-type
                                               {::err/message (format "Unsupported XTQL query type: %s" (type query))})))]
       (xt-log/await-tx this after-tx-id tx-timeout)
-      (validate-snapshot-not-before snapshot-time (xtp/latest-completed-tx this))
 
       (let [plan (.planQuery q-src ast query-opts)]
         (.prepareRaQuery q-src plan query-opts))))
 
   (prepare-ra [this plan query-opts]
-    (let [{:keys [snapshot-time ^long after-tx-id tx-timeout] :as query-opts} (-> query-opts (with-query-opts-defaults this))]
+    (let [{:keys [^long after-tx-id tx-timeout] :as query-opts} (-> query-opts (with-query-opts-defaults this))]
       (xt-log/await-tx this after-tx-id tx-timeout)
-      (validate-snapshot-not-before snapshot-time (xtp/latest-completed-tx this))
 
       (.prepareRaQuery q-src plan query-opts)))
 
@@ -258,16 +255,18 @@
          :xtdb/block-catalog {}
          :xtdb/table-catalog {}
          :xtdb/trie-catalog {}
+         :xtdb/information-schema {}
          :xtdb.log/processor opts
          :xtdb.metadata/metadata-manager {}
          :xtdb.operator.scan/scan-emitter {}
          :xtdb.query/query-source {}
          :xtdb/compactor (.getCompactor opts)
          :xtdb.metrics/registry {}
-         :xtdb/authn (.getAuthn opts)
+         :xtdb/authn {:authn-factory (.getAuthn opts)}
          :xtdb/log (.getLog opts)
          :xtdb/buffer-pool (.getStorage opts)
          :xtdb.indexer/live-index indexer-cfg
+         :xtdb/garbage-collector (.getGarbageCollector opts)
          :xtdb/modules (.getModules opts)}
         (cond-> srv-config (assoc :xtdb.pgwire/server srv-config)
                 healthz (assoc :xtdb/healthz healthz))
@@ -287,5 +286,24 @@
                               (ig/halt! system)
                               #_(println (.toVerboseString ^RootAllocator (:xtdb/allocator system)))))))
     (catch clojure.lang.ExceptionInfo e
-      (ig/halt! (:system (ex-data e)))
+      (try
+        (ig/halt! (:system (ex-data e)))
+        (catch Throwable t
+          (let [^Throwable e (or (ex-cause e) e)]
+            (throw (doto e (.addSuppressed t))))))
       (throw (ex-cause e)))))
+
+(defrecord CompactorNode [system !closing?]
+  Xtdb$CompactorNode
+  (close [_]
+    (when (compare-and-set! !closing? false true)
+      (ig/halt! system))))
+
+#_{:clj-kondo/ignore [:clojure-lsp/unused-public-var]}
+(defn open-compactor ^xtdb.api.Xtdb$CompactorNode [opts]
+  (let [system (-> (node-system opts) ig/prep (ig/init [:xtdb/compactor]))]
+    (try
+      (->CompactorNode system (atom false))
+      (catch clojure.lang.ExceptionInfo e
+        (ig/halt! system)
+        (throw (ex-cause e))))))

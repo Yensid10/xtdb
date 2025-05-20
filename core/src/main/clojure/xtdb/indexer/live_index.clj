@@ -24,6 +24,7 @@
            xtdb.BufferPool
            xtdb.catalog.BlockCatalog
            (xtdb.indexer LiveIndex$Tx LiveIndex$Watermark LiveTable LiveTable$Tx LiveTable$Watermark Watermark)
+           (xtdb.log.proto TrieDetails)
            (xtdb.trie TrieCatalog)
            (xtdb.util RefCounter RowCounter)))
 
@@ -51,7 +52,6 @@
                                    (.getAllColumnFields))
                            (comp set keys))))
 
-
 (deftype LiveIndex [^BufferAllocator allocator, ^BufferPool buffer-pool, ^Log log, compactor
                     ^BlockCatalog block-cat, table-cat, ^TrieCatalog trie-cat
 
@@ -70,6 +70,7 @@
   xtdb.indexer.LiveIndex
   (getLatestCompletedTx [_] latest-completed-tx)
   (getLatestCompletedBlockTx [_] latest-completed-block-tx)
+  (getLatestBlockIndex [_] (.getBlockIdx row-counter))
 
   (liveTable [_ table-name] (.get tables table-name))
 
@@ -174,7 +175,8 @@
                                    (util/rethrowing-cause))]
             (let [added-tries (for [[table-name {:keys [trie-key data-file-size trie-metadata]}] table-metadata]
                                 (trie/->trie-details table-name trie-key data-file-size trie-metadata))]
-              (.addTries trie-cat added-tries)
+              (doseq [^TrieDetails added-trie added-tries]
+                (.addTries trie-cat (.getTableName added-trie) [added-trie]))
               (.appendMessage log (Log$Message$TriesAdded. Storage/VERSION added-tries)))
 
             (let [all-tables (set (concat (keys table-metadata) (.getAllTableNames block-cat)))

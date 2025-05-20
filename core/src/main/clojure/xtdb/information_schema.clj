@@ -1,7 +1,9 @@
 (ns xtdb.information-schema
-  (:require [xtdb.api :as xt]
-            [xtdb.authn :as authn]
-            xtdb.metadata
+  (:require [clojure.string :as str]
+            [integrant.core :as ig]
+            [xtdb.authn.crypt :as authn.crypt]
+            [xtdb.metadata]
+            [xtdb.pgwire.types :as pg-types]
             [xtdb.table-catalog :as table-cat]
             [xtdb.trie :as trie]
             [xtdb.trie-catalog :as trie-cat]
@@ -17,20 +19,30 @@
            (xtdb.indexer Watermark)
            xtdb.operator.SelectionSpec
            (xtdb.trie MemoryHashTrie Trie TrieCatalog)
+           xtdb.types.Fields
            (xtdb.vector RelationReader)))
 
 (defn name->oid [s]
   (Math/abs ^Integer (hash s)))
 
-;;TODO add temporal cols
 (defn schema-info->col-rows [schema-info]
   (for [table-entry schema-info
-        [idx col] (map-indexed #(vector %1 %2) (val table-entry))
         :let [table (key table-entry)
-              name (key col)
+              cols (into (when-not (and (contains? #{"pg_catalog" "information_schema" "xt"} (namespace table))
+                                        (not= 'xt/txs table))
+                           {"_valid_from" (-> Fields/TEMPORAL (.toArrowField "_valid_from"))
+                            "_valid_to" (-> Fields/TEMPORAL (.getNullable) (.toArrowField "_valid_to"))
+                            "_system_from" (-> Fields/TEMPORAL (.toArrowField "_system_from"))
+                            "_system_to" (-> Fields/TEMPORAL (.getNullable) (.toArrowField "_system_to"))})
+                         (val table-entry))
+              {xt-cols true, user-cols false} (group-by (comp #(str/starts-with? % "_") key) cols)
+              cols (concat (sort-by key xt-cols)
+                           (sort-by key user-cols))]
+        [idx col] (map-indexed #(vector %1 %2) cols)
+        :let [name (key col)
               col-field (val col)]]
 
-    {:idx (inc idx) ;; no guarentee of order/stability of idx for a given col
+    {:idx (inc idx) ;; no guarentee of stability of idx for a given col
      :table table
      :name name
      :field col-field
@@ -171,7 +183,7 @@
      :reltoastrelid (int 0)}))
 
 (defn pg-type []
-  (for [{:keys [oid typname typsend typreceive typelem typinput typoutput]} (->> (vals types/pg-types)
+  (for [{:keys [oid typname typsend typreceive typelem typinput typoutput]} (->> (vals pg-types/pg-types)
                                                                                  (remove (comp zero? :oid)))]
     {:oid (int oid)
      :typname typname
@@ -189,7 +201,7 @@
      :typoutput (or typoutput "")}))
 
 (defn pg-range []
-  (for [{:keys [rngtypid rngsubtype rngmultitypid rngcollation rngsubopc rngcanonical rngsubdiff]} (vals types/pg-ranges)]
+  (for [{:keys [rngtypid rngsubtype rngmultitypid rngcollation rngsubopc rngcanonical rngsubdiff]} (vals pg-types/pg-ranges)]
     {:rngtypid (int rngtypid)
      :rngsubtype (int rngsubtype)
      :rngmultitypid (int rngmultitypid)
@@ -208,7 +220,7 @@
 
 (defn pg-attribute [col-rows]
   (for [{:keys [idx table name field]} col-rows
-        :let [{:keys [column-oid typlen]} (types/field->pg-type (types/field-with-name field name))]]
+        :let [{:keys [column-oid typlen]} (pg-types/field->pg-type (types/field-with-name field name))]]
     {:attrelid (name->oid table)
      :attname (.denormalize ^IKeyFn (identity #xt/key-fn :snake-case-string) name)
      :atttypid (int column-oid)
@@ -291,7 +303,7 @@
                                           passwd [:union #{:utf8 :null}]}]))
 
 (def ^:private initial-user-data
-  [{:_id "xtdb", :username "xtdb", :usesuper true, :passwd (authn/encrypt-pw "xtdb")}])
+  [{:_id "xtdb", :username "xtdb", :usesuper true, :passwd (authn.crypt/encrypt-pw "xtdb")}])
 
 (defn pg-user-template-page+trie [allocator]
   (util/with-close-on-catch [out-rel-writer (Trie/openLogDataWriter allocator (Trie/dataRelSchema pg-user-field))]
@@ -366,52 +378,65 @@
     (util/close vsr)
     (some-> out-rel .close)))
 
-(defn ->cursor [allocator derived-table-schema table col-names col-preds schema params
-                table-catalog trie-catalog ^Watermark wm]
-  (util/with-close-on-catch [root (VectorSchemaRoot/create (Schema. (vec (vals derived-table-schema)))
-                                                           allocator)]
-    ;;TODO should use the schema passed to it, but also regular merge is insufficient here for colFields
-    ;;should be types/merge-fields as per scan-fields
-    (let [schema-info (-> (merge-with merge
-                                      (table-cat/all-column-fields table-catalog)
-                                      (some-> (.getLiveIndex wm)
-                                              (.getAllColumnFields)))
-                          (update-keys symbol)
-                          (merge meta-table-schemas))
+(defprotocol InfoSchema
+  (->cursor [info-schema allocator wm derived-table-schema
+             table col-names col-preds
+             schema params]))
 
-          out-rel-wtr (vw/root->writer root)
-          out-rel (vw/rel-wtr->rdr (doto out-rel-wtr
-                                     (.writeRows (->> (case table
-                                                        information_schema/tables (tables schema-info)
-                                                        information_schema/columns (columns (schema-info->col-rows schema-info))
-                                                        information_schema/schemata schemas
-                                                        pg_catalog/pg_tables (pg-tables schema-info)
-                                                        pg_catalog/pg_type (pg-type)
-                                                        pg_catalog/pg_class (pg-class schema-info)
-                                                        pg_catalog/pg_description nil
-                                                        pg_catalog/pg_views nil
-                                                        pg_catalog/pg_matviews nil
-                                                        pg_catalog/pg_attribute (pg-attribute (schema-info->col-rows schema-info))
-                                                        pg_catalog/pg_namespace (pg-namespace)
-                                                        pg_catalog/pg_proc (pg-proc)
-                                                        pg_catalog/pg_database (pg-database)
-                                                        pg_catalog/pg_stat_user_tables (pg-stat-user-tables schema-info)
-                                                        pg_catalog/pg_settings (pg-settings)
-                                                        pg_catalog/pg_range (pg-range)
-                                                        pg_catalog/pg_am (pg-am)
-                                                        xt/trie_stats (trie-stats trie-catalog)
-                                                        xt/live_tables (live-tables wm)
-                                                        xt/live_columns (live-columns wm)
-                                                        (throw (UnsupportedOperationException. (str "Information Schema table does not exist: " table))))
-                                                      (into-array java.util.Map)))
-                                     (.syncRowCount)))]
+(defmethod ig/prep-key :xtdb/information-schema [_ opts]
+  (into {:table-catalog (ig/ref :xtdb/table-catalog)
+         :trie-catalog (ig/ref :xtdb/trie-catalog)}
+        opts))
 
-      ;;TODO reuse relation selector code from trie cursor
-      (InformationSchemaCursor. (reduce (fn [^RelationReader rel ^SelectionSpec col-pred]
-                                          (.select rel (.select col-pred allocator rel schema params)))
-                                        (-> out-rel
-                                            (->> (filter (comp (set col-names) #(.getName ^VectorReader %))))
-                                            (vr/rel-reader (.getRowCount out-rel))
-                                            (vr/with-absent-cols allocator col-names))
-                                        (vals col-preds))
-                                root))))
+(defmethod ig/init-key :xtdb/information-schema [_ {:keys [table-catalog trie-catalog]}]
+  (reify InfoSchema
+    (->cursor [_ allocator wm derived-table-schema
+               table col-names col-preds
+               schema params]
+      (util/with-close-on-catch [root (VectorSchemaRoot/create (Schema. (vec (vals derived-table-schema)))
+                                                               allocator)]
+        ;;TODO should use the schema passed to it, but also regular merge is insufficient here for colFields
+        ;;should be types/merge-fields as per scan-fields
+        (let [schema-info (-> (merge-with merge
+                                          (table-cat/all-column-fields table-catalog)
+                                          (some-> (.getLiveIndex ^Watermark wm)
+                                                  (.getAllColumnFields)))
+                              (update-keys symbol)
+                              (merge meta-table-schemas))
+
+              out-rel-wtr (vw/root->writer root)
+              out-rel (vw/rel-wtr->rdr (doto out-rel-wtr
+                                         (.writeRows (->> (case table
+                                                            information_schema/tables (tables schema-info)
+                                                            information_schema/columns (columns (schema-info->col-rows schema-info))
+                                                            information_schema/schemata schemas
+                                                            pg_catalog/pg_tables (pg-tables schema-info)
+                                                            pg_catalog/pg_type (pg-type)
+                                                            pg_catalog/pg_class (pg-class schema-info)
+                                                            pg_catalog/pg_description nil
+                                                            pg_catalog/pg_views nil
+                                                            pg_catalog/pg_matviews nil
+                                                            pg_catalog/pg_attribute (pg-attribute (schema-info->col-rows schema-info))
+                                                            pg_catalog/pg_namespace (pg-namespace)
+                                                            pg_catalog/pg_proc (pg-proc)
+                                                            pg_catalog/pg_database (pg-database)
+                                                            pg_catalog/pg_stat_user_tables (pg-stat-user-tables schema-info)
+                                                            pg_catalog/pg_settings (pg-settings)
+                                                            pg_catalog/pg_range (pg-range)
+                                                            pg_catalog/pg_am (pg-am)
+                                                            xt/trie_stats (trie-stats trie-catalog)
+                                                            xt/live_tables (live-tables wm)
+                                                            xt/live_columns (live-columns wm)
+                                                            (throw (UnsupportedOperationException. (str "Information Schema table does not exist: " table))))
+                                                          (into-array java.util.Map)))
+                                         (.syncRowCount)))]
+
+          ;;TODO reuse relation selector code from trie cursor
+          (InformationSchemaCursor. (reduce (fn [^RelationReader rel ^SelectionSpec col-pred]
+                                              (.select rel (.select col-pred allocator rel schema params)))
+                                            (-> out-rel
+                                                (->> (filter (comp (set col-names) #(.getName ^VectorReader %))))
+                                                (vr/rel-reader (.getRowCount out-rel))
+                                                (vr/with-absent-cols allocator col-names))
+                                            (vals col-preds))
+                                    root))))))

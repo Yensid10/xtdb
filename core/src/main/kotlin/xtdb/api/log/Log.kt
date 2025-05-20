@@ -78,7 +78,7 @@ interface Log : AutoCloseable {
             }
         }
 
-        data class FlushBlock(val expectedBlockTxId: LogOffset) : ProtobufMessage() {
+        data class FlushBlock(val expectedBlockTxId: MessageId) : ProtobufMessage() {
             override fun toLogMessage() = logMessage {
                 flushBlock = flushBlock { expectedBlockTxId = this@FlushBlock.expectedBlockTxId }
             }
@@ -104,6 +104,8 @@ interface Log : AutoCloseable {
      * then it's the latest-submitted-offset of _this_ node.
      */
     val latestSubmittedOffset: LogOffset
+
+    val epoch: Int
 
     fun appendMessage(message: Message): CompletableFuture<LogOffset>
 

@@ -4,16 +4,13 @@
             [clojure.test :as t]
             [clojure.tools.logging :as log]
             [integrant.core :as ig]
-            [next.jdbc :as jdbc]
-            [next.jdbc.optional :as jdbc.optional]
             [next.jdbc.prepare :as jdbc.prep]
-            [next.jdbc.result-set :as jdbc.rs]
+            [xtdb.api :as xt]
             [xtdb.client :as xtc]
             [xtdb.indexer :as idx]
             [xtdb.indexer.live-index :as li]
             [xtdb.log :as xt-log]
             [xtdb.logical-plan :as lp]
-            [xtdb.next.jdbc :as xt-jdbc]
             [xtdb.node :as xtn]
             [xtdb.protocols :as xtp]
             [xtdb.query :as q]
@@ -24,8 +21,6 @@
             [xtdb.vector.reader :as vr]
             [xtdb.vector.writer :as vw])
   (:import (clojure.lang ExceptionInfo)
-           (io.micrometer.core.instrument.composite CompositeMeterRegistry)
-           (io.micrometer.core.instrument.simple SimpleMeterRegistry)
            (java.io FileOutputStream)
            java.net.ServerSocket
            (java.nio.channels Channels)
@@ -73,9 +68,6 @@
 #_{:clj-kondo/ignore [:uninitialized-var]}
 (def ^:dynamic ^xtdb.api.Xtdb *node*)
 
-#_{:clj-kondo/ignore [:uninitialized-var]}
-(def ^:dynamic ^java.sql.Connection *conn*)
-
 (defn with-opts
   ([opts] (partial with-opts opts))
   ([opts f]
@@ -84,28 +76,10 @@
 
 (declare component)
 
-(defn with-simple-registry [f]
-  (let [^CompositeMeterRegistry registry (component *node* :xtdb.metrics/registry)]
-    (.add registry (SimpleMeterRegistry.))
-    (f)))
-
 (defn with-node [f]
-  (util/with-open [node (xtn/start-node *node-opts*)
-                   conn (jdbc/get-connection node)]
-    (binding [*node* node, *conn* conn]
+  (util/with-open [node (xtn/start-node *node-opts*)]
+    (binding [*node* node]
       (f))))
-
-(extend-protocol jdbc.prep/SettableParameter
-  java.util.Date
-  (set-parameter [v ^PreparedStatement ps ^long i]
-    (.setObject ps i (-> (.toInstant v) (.atZone #xt/zone "Z") (.toLocalDateTime)) Types/TIMESTAMP)))
-
-(def jdbc-qopts
-  {:builder-fn
-   (jdbc.rs/as-maps-adapter
-    (fn [rs opts]
-      (jdbc.optional/as-unqualified-modified-maps rs (-> opts (assoc :label-fn xt-jdbc/label-fn))))
-    xt-jdbc/col-reader)})
 
 #_{:clj-kondo/ignore [:uninitialized-var]}
 (def ^:dynamic *sys*)
@@ -305,7 +279,7 @@
        (let [rows (-> (<-cursor res (serde/read-key-fn key-fn))
                       (cond->> (not preserve-pages?) (into [] cat)))]
          (if with-col-types?
-           {:res rows, :col-types (->> (.columnFields bq)
+           {:res rows, :col-types (->> (.getColumnFields bq)
                                        (into {} (map (juxt #(symbol (.getName ^Field %)) types/field->col-type))))}
            rows))))))
 
@@ -541,3 +515,17 @@
   (let [name (str (.getFileName path))]
     (when-let [idx (str/last-index-of name ".")]
       (subs name (inc idx)))))
+
+(defn q-sql
+  "Like xtdb.api/q, but also returns the result type."
+  ([node query] (q-sql node query {}))
+  ([node query opts]
+   (let [^PreparedQuery prepared-q (xtp/prepare-sql node query opts)]
+     {:res (xt/q node query opts)
+      :res-type (mapv (juxt #(.getName ^Field %) types/field->col-type) (.getColumnFields prepared-q []))})))
+
+(defn temporal-bounds->data [^TemporalBounds bounds]
+  (let [vt (.getValidTime bounds)
+        st (.getSystemTime bounds)]
+    {:valid-time [(.getLower vt) (.getUpper vt)]
+     :system-time [(.getLower st) (.getUpper st)]}))

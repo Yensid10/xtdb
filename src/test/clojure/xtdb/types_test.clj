@@ -3,7 +3,6 @@
             [xtdb.test-util :as tu]
             [xtdb.time :as time]
             [xtdb.types :as types]
-            [xtdb.vector.reader :as vr]
             [xtdb.vector.writer :as vw])
   (:import (java.math BigDecimal)
            java.net.URI
@@ -12,9 +11,10 @@
            (org.apache.arrow.vector BigIntVector BitVector DateDayVector DecimalVector Float4Vector Float8Vector IntVector IntervalMonthDayNanoVector NullVector SmallIntVector TimeNanoVector TimeStampMicroTZVector TinyIntVector VarBinaryVector VarCharVector)
            (org.apache.arrow.vector.complex DenseUnionVector ListVector StructVector)
            (org.apache.arrow.vector.types.pojo ArrowType FieldType)
-           (xtdb.types IntervalDayTime IntervalYearMonth RegClass RegProc)
+           xtdb.time.Interval
+           (xtdb.types RegClass RegProc)
            (xtdb.vector IVectorWriter)
-           (xtdb.vector.extensions KeywordVector RegClassVector RegProcVector TransitVector UriVector UuidVector)))
+           (xtdb.vector.extensions IntervalMonthDayMicroVector KeywordVector RegClassVector RegProcVector TransitVector UriVector UuidVector)))
 
 (t/use-fixtures :each tu/with-allocator)
 
@@ -51,11 +51,11 @@
                              (ByteBuffer/wrap (byte-array [1 2 3]))]))
         "binary types")
 
-  (t/is (= {:vs [(time/->zdt #inst "1999")
-                 (time/->zdt #inst "2021-09-02T13:54:35.809Z")
-                 (ZonedDateTime/ofInstant (time/->instant #inst "2021-09-02T13:54:35.809Z") #xt/zone "Europe/Stockholm")
-                 (ZonedDateTime/ofInstant (time/->instant #inst "2021-09-02T13:54:35.809Z") #xt/zone "+02:00")
-                 (ZonedDateTime/ofInstant (Instant/ofEpochSecond 3600 1000) #xt/zone "UTC")]
+  (t/is (= {:vs [#xt/zdt "1999-01-01Z[UTC]"
+                 #xt/zdt "2021-09-02T13:54:35.809Z[UTC]"
+                 #xt/zdt "2021-09-02T15:54:35.809+02:00[Europe/Stockholm]"
+                 #xt/zdt "2021-09-02T15:54:35.809+02:00"
+                 #xt/zdt "1970-01-01T01:00:00.000001Z[UTC]"]
             :vec-types (repeat 5 TimeStampMicroTZVector)}
            (test-round-trip [#inst "1999"
                              (time/->instant #inst "2021-09-02T13:54:35.809Z")
@@ -136,21 +136,26 @@
 
 (t/deftest interval-vector-test
   ;; for years/months we lose the years as a separate component, it has to be folded into months.
-  (let [iym #xt/interval-ym "P35M"]
+  (let [iym #xt/interval "P35M"]
     (t/is (= [iym]
              (:vs (test-read (constantly #xt.arrow/type [:interval :year-month])
-                             (fn [^IVectorWriter w, ^IntervalYearMonth v]
+                             (fn [^IVectorWriter w, ^Interval v]
                                (.writeObject w v))
                              [iym])))))
 
-  (let [idt #xt/interval-dt ["P1434D" "PT0.023S"]]
+  (let [idt #xt/interval "P1434DT0.023S"]
     (t/is (= [idt]
              (:vs (test-read (constantly #xt.arrow/type [:interval :day-time])
-                             (fn [^IVectorWriter w, ^IntervalDayTime v]
+                             (fn [^IVectorWriter w, ^Interval v]
                                (.writeObject w v))
                              [idt])))))
 
-  (let [imdn #xt/interval-mdn ["P33M244D" "PT0.003444443S"]]
+  (let [imdm #xt/interval "P33M244DT0.003443S"]
+    (t/is (= {:vs [imdm]
+              :vec-types [IntervalMonthDayMicroVector]}
+             (test-round-trip [imdm]))))
+
+  (let [imdn #xt/interval "P33M244DT0.003444443S"]
     (t/is (= {:vs [imdn]
               :vec-types [IntervalMonthDayNanoVector]}
              (test-round-trip [imdn])))))
@@ -358,17 +363,6 @@
 
              (types/merge-fields (types/col-type->field '[:struct {foo [:struct {bibble :bool}]}])
                                  (types/col-type->field '[:struct {foo :utf8 bar :i64}]))))))
-
-(t/deftest test-pg-datetime-binary-roundtrip
-  (doseq [{:keys [type val]} [{:val #xt/date "2018-07-25" :type :date}
-                              {:val #xt/date-time "1441-07-25T18:00:11.888842" :type :timestamp}
-                              {:val #xt/offset-date-time "1441-07-25T18:00:11.211142Z" :type :timestamptz}]]
-    (let [{:keys [write-binary read-binary]} (get types/pg-types type)]
-
-      (with-open [rdr (vr/vec->reader (vw/open-vec tu/*allocator* "val" [val]))
-                  l-rdr (.legReader rdr (.getLeg rdr 0))]
-
-        (t/is (= val (read-binary {} (write-binary {} l-rdr 0))))))))
 
 (t/deftest test-reg-rountrip
   (let [vs [(RegClass. 101)

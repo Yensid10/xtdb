@@ -11,7 +11,7 @@
             [xtdb.vector.writer :as vw])
   (:import (clojure.lang IPersistentMap Keyword MapEntry)
            (java.lang NumberFormatException)
-           [java.net URI]
+           (java.math RoundingMode)
            (java.nio ByteBuffer)
            (java.nio.charset StandardCharsets)
            (java.time Duration Instant InstantSource LocalDate LocalDateTime LocalTime OffsetDateTime ZoneId ZoneOffset ZonedDateTime)
@@ -23,15 +23,23 @@
            (xtdb.arrow ListValueReader RelationReader ValueReader VectorPosition VectorReader)
            xtdb.arrow.ValueBox
            (xtdb.operator ProjectionSpec SelectionSpec)
-           (xtdb.types IntervalDayTime IntervalMonthDayNano IntervalMonthDayMicro IntervalYearMonth)
+           xtdb.time.Interval
            (xtdb.util StringUtil)))
 
 (set! *unchecked-math* :warn-on-boxed)
 
+(def normalise-fn-name
+  (-> (fn [f]
+        (let [f (keyword (namespace f) (name f))]
+          (case f
+            (:. :.. :- :/) f
+            (util/kw->normal-form-kw f))))
+      memoize))
+
 #_{:clj-kondo/ignore [:unused-binding]}
 (defmulti parse-list-form
   (fn [[f & args] env]
-    f)
+    (symbol (normalise-fn-name f)))
   :default ::default)
 
 (def postgres-server-version "16")
@@ -54,6 +62,7 @@
 (defn form->expr [form {:keys [col-types param-types locals] :as env}]
   (cond
     (symbol? form) (cond
+                     (= 'xtdb/start-of-time form) {:op :literal, :literal time/start-of-time}
                      (= 'xtdb/end-of-time form) {:op :literal, :literal time/end-of-time}
                      (= 'xtdb/postgres-server-version form) {:op :literal, :literal (str "PostgreSQL " postgres-server-version)}
                      (= 'xtdb/xtdb-server-version form) {:op :literal, :literal (str "XTDB @ " (xtdb-server-version))}
@@ -164,6 +173,13 @@
    :target-type target-type
    :cast-opts cast-opts})
 
+(defmethod parse-list-form 'regexp_replace [[_ src pattern replacement start n flags] env]
+  {:op :call
+   :f :regexp-replace
+   :args [(form->expr src env)]
+   :pattern pattern, :replacement replacement
+   :start start, :n n, :flags flags})
+
 (defmethod parse-list-form ::default [[f & args] env]
   {:op :call
    :f (keyword (namespace f) (name f))
@@ -240,6 +256,33 @@
 (defmethod codegen-cast [:num :num] [{:keys [target-type]}]
   {:return-type target-type
    :->call-code #(do `(~(type->cast target-type) ~@%))})
+
+(defn- precision->bit-width [^long p]
+  (cond (<= p 32) (int 128)
+        (<= p 64) (int 256)
+        :else (throw (err/illegal-arg :xtdb.expression/unsupported-precision
+                                      {::err/message (format "Unsupported precision: %d" p)}))))
+
+(defmethod codegen-cast [:num :decimal] [{{:keys [precision scale]} :cast-opts}]
+  (let [scale (if precision (or scale 0) 9)
+        precision (or precision 64)]
+    {:return-type [:decimal precision scale (precision->bit-width precision)]
+     :->call-code #(do `(.setScale (bigdec ~@%) ~scale RoundingMode/HALF_EVEN))}))
+
+;; We don't apply the default cast (i.e. [:decimal 64 9 256]) to decimals themselves.
+;; This is to mainly preserve decimal scales passed via pgwire parameters with type annotations.
+(defmethod codegen-cast [:decimal :decimal] [{:keys [source-type] {:keys [precision scale]} :cast-opts}]
+  (if precision
+    {:return-type [:decimal precision (or scale 0) (precision->bit-width precision)]
+     :->call-code #(do `(.setScale (bigdec ~@%) ~scale RoundingMode/HALF_EVEN))}
+    {:return-type source-type
+     :->call-code first}))
+
+(defmethod codegen-cast [:utf8 :decimal] [{{:keys [precision scale]} :cast-opts}]
+  (let [scale (if precision (or scale 0) 9)
+        precision (or precision 64)]
+    {:return-type [:decimal precision scale (precision->bit-width precision)]
+     :->call-code #(do `(.setScale (bigdec (buf->str ~@%)) ~scale RoundingMode/HALF_EVEN))}))
 
 (defmethod codegen-cast [:num :utf8] [_]
   {:return-type :utf8, :->call-code #(do `(resolve-utf8-buf (str ~@%)))})
@@ -347,6 +390,7 @@
     (f col-type (apply read-value-code col-type reader-sym args))))
 
 (def ^:dynamic ^java.time.Instant *snapshot-time* nil)
+(def ^:dynamic ^{:tag 'long} *after-tx-id* -1)
 (def ^:dynamic ^java.time.InstantSource *clock* (InstantSource/system))
 (defn current-time ^java.time.Instant [] (.instant *clock*))
 (def ^:dynamic ^java.time.ZoneId *default-tz* (ZoneId/systemDefault))
@@ -365,7 +409,6 @@
 (defmethod emit-value LocalTime [_ code] `(.toNanoOfDay ~code))
 (defmethod emit-value Duration [_ code] `(quot (.toNanos ~code) 1000))
 (defmethod emit-value UUID [_ code] `(util/uuid->byte-buffer ~code))
-(defmethod emit-value URI [_ code] `(util/uri->byte-buffer ~code))
 
 ;; consider whether a bound hash map for literal parameters would be better
 ;; so this could be a runtime 'wrap the byte array' instead of this round trip through the clj compiler.
@@ -383,20 +426,9 @@
     `(.toEpochDay ~code)))
 
 ;; we emit these to PDs until the EE uses these types directly
-(defmethod emit-value IntervalYearMonth [_ code]
-  `(PeriodDuration. (.-period ~code) Duration/ZERO))
-
-(defmethod emit-value IntervalDayTime [_ code]
-  `(let [idt# ~code]
-     (PeriodDuration. (.-period idt#) (.-duration idt#))))
-
-(defmethod emit-value IntervalMonthDayNano [_ code]
-  `(let [imdn# ~code]
-     (PeriodDuration. (.-period imdn#) (.-duration imdn#))))
-
-(defmethod emit-value IntervalMonthDayMicro [_ code]
-  `(let [imdm# ~code]
-     (PeriodDuration. (.-period imdm#) (.-duration imdm#))))
+(defmethod emit-value Interval [_ code]
+  `(let [i# ~code]
+     (PeriodDuration. (.getPeriod i#) (.getDuration i#))))
 
 (defmethod codegen-expr :literal [{:keys [literal]} _]
   (let [return-type (vw/value->col-type literal)
@@ -531,14 +563,6 @@
                                             `(let [~local ~code]
                                                ~((:continue (get emitted-thens local-type)) f))))))}))
         (wrap-boxed-poly-return opts))))
-
-(def normalise-fn-name
-  (-> (fn [f]
-        (let [f (keyword (namespace f) (name f))]
-          (case f
-            (:- :/) f
-            (util/kw->normal-form-kw f))))
-      memoize))
 
 (defmulti codegen-call
   "Expects a map containing both the expression and an `:arg-types` key - a vector of col-types.
@@ -794,6 +818,34 @@
   {:return-type (types/least-upper-bound arg-types)
    :->call-code #(do `(* ~@%))})
 
+;; decimal
+
+(defn- combine-precision [^long p1 ^long p2]
+  (if (and (<= p1 32) (<= p2 32)) 32 64))
+
+(defmethod codegen-call [:+ :decimal :decimal] [{[[_ p1 ^long s1] [_ p2 ^long s2]] :arg-types}]
+  (let [precision (combine-precision p1 p2)]
+    {:return-type [:decimal precision (max s1 s2) (precision->bit-width precision)]
+     :->call-code #(do `(.add ^BigDecimal ~@%))}))
+
+(defmethod codegen-call [:- :decimal :decimal] [{[[_ p1 ^long s1] [_ p2 ^long s2]] :arg-types}]
+  (let [precision (combine-precision p1 p2)]
+    {:return-type [:decimal precision (max s1 s2) (precision->bit-width precision)]
+     :->call-code #(do `(.subtract ^BigDecimal ~@%))}))
+
+(defmethod codegen-call [:* :decimal :decimal] [{[[_ p1 ^long s1] [_ p2 ^long s2]] :arg-types}]
+  (let [precision (combine-precision p1 p2)]
+    {:return-type [:decimal precision (+ s1 s2) (precision->bit-width precision)]
+     :->call-code #(do `(.multiply ^BigDecimal ~@%))}))
+
+(defmethod codegen-call [:/ :decimal :decimal] [{[[_ p1 ^long s1] [_ p2 ^long s2]] :arg-types}]
+  (let [scale (max 6 (+ s1 s2 1))
+        precision (combine-precision p1 p2)]
+    {:return-type [:decimal precision scale (precision->bit-width precision)]
+     :->call-code #(do `(.divide ^BigDecimal ~@% ~scale RoundingMode/HALF_EVEN))}))
+
+;; least, greatest for decimals currently work by extension to `<` and `>`, see `expression/macro.clj`
+
 (defmethod codegen-call [:bit_not :int] [{[x-type] :arg-types}]
   {:return-type x-type
    :->call-code #(do `(bit-not ~@%))})
@@ -957,22 +1009,34 @@
                                         `(like->regex (binary->hex-like-pattern (buf->bytes ~needle-code))))
                                      (Hex/encodeHexString (buf->bytes ~haystack-code)))))})
 
+(defn compile-regex [pattern flags-str]
+  (let [flag-map {\s [Pattern/DOTALL]
+                  \i [Pattern/CASE_INSENSITIVE, Pattern/UNICODE_CASE]
+                  \m [Pattern/MULTILINE]}]
+    (Pattern/compile pattern (int (reduce bit-or 0 (mapcat flag-map flags-str))))))
+
 (defmethod codegen-call [:like_regex :utf8 :utf8 :utf8] [{:keys [args]}]
-  (let [[_ re-literal flags] (map :literal args)
-
-        flag-map
-        {\s [Pattern/DOTALL]
-         \i [Pattern/CASE_INSENSITIVE, Pattern/UNICODE_CASE]
-         \m [Pattern/MULTILINE]}
-
-        flag-int (int (reduce bit-or 0 (mapcat flag-map flags)))]
-
+  (let [[_ re-literal flags] (map :literal args)]
     {:return-type :bool
      :->call-code (fn [[haystack-code needle-code]]
-                    `(boolean (re-find ~(if re-literal
-                                          `(Pattern/compile ~re-literal ~flag-int)
-                                          `(Pattern/compile (resolve-string ~needle-code) ~flag-int))
+                    `(boolean (re-find (compile-regex ~(or re-literal `(resolve-string ~needle-code)) ~flags)
                                        (resolve-string ~haystack-code))))}))
+
+(defmethod codegen-call [:regexp_replace :utf8] [{:keys [pattern replacement start n flags]}]
+  (let [flag-map {\s [Pattern/DOTALL]
+                  \i [Pattern/CASE_INSENSITIVE, Pattern/UNICODE_CASE]
+                  \m [Pattern/MULTILINE]}
+
+        re-sym (gensym 're)]
+
+    (when (or start n)
+      (throw (err/illegal-arg ::unsupported
+                              {::err/message "regexp_replace does not yet support `start` or `n` arguments"})))
+
+    {:return-type :utf8
+     :batch-bindings [[re-sym `(Pattern/compile ~pattern ~(int (reduce bit-or 0 (mapcat flag-map flags))))]]
+     :->call-code (fn [[haystack-code]]
+                    `(resolve-utf8-buf (str/replace (resolve-string ~haystack-code) ~re-sym ~replacement)))}))
 
 ;;;; SQL Trim functions.
 ;; trim-char is a **SINGLE** unicode-character string e.g \" \".
@@ -1227,7 +1291,9 @@
 (defn current-setting [setting-name]
   (if (= setting-name "server_version_num")
     (parse-version (xtdb-server-version))
-    (throw (UnsupportedOperationException. "Setting not supported"))))
+    (throw (err/illegal-arg ::unsupported-setting
+                            {::err/message (str "Setting not supported: " setting-name)
+                             :setting-name setting-name}))))
 
 (defmethod codegen-call [:current_setting :utf8] [_]
   {:return-type :i64

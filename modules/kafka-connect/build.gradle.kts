@@ -20,12 +20,12 @@ dependencies {
     api(project(":xtdb-http-client-jvm"))
 
     api(kotlin("stdlib-jdk8"))
-    implementation("org.apache.kafka:connect-api:3.8.0")
+    implementation("org.apache.kafka:connect-api:4.0.0")
 
     api(libs.clojure.tools.logging)
     api("cheshire", "cheshire", "5.13.0")
-    api("com.github.seancorfield", "next.jdbc", "1.3.939")
-    api("org.postgresql", "postgresql", "42.7.3")
+    api(libs.next.jdbc)
+    api(libs.pgjdbc)
 
     testImplementation(project(":"))
     testImplementation(project(":xtdb-core"))

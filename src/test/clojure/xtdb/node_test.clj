@@ -6,6 +6,7 @@
             [xtdb.api :as xt]
             [xtdb.compactor :as c]
             [xtdb.logging :as logging]
+            [xtdb.next.jdbc :as xt-jdbc]
             [xtdb.node :as xtn]
             [xtdb.node.impl] ;;TODO probably move internal methods to main node interface
             [xtdb.protocols :as xtp]
@@ -15,6 +16,7 @@
             [xtdb.time :as time]
             [xtdb.util :as util])
   (:import [java.time ZonedDateTime]
+           [java.time.format DateTimeParseException]
            [xtdb.api ServerConfig Xtdb$Config]
            [xtdb.query IQuerySource]
            xtdb.types.RegClass))
@@ -170,7 +172,7 @@ VALUES (1, 'Happy 2024!', DATE '2024-01-01'),
            (xt/q tu/*node* "SELECT foo._id, foo.arr, foo.arr[1] AS fst, foo.arr[2] AS snd, foo.arr[4] AS lst FROM foo"))))
 
 (t/deftest test-interval-literal-cce-271
-  (t/is (= [{:a #xt/interval-ym "P12M"}]
+  (t/is (= [{:a #xt/interval "P1Y"}]
            (xt/q tu/*node* "select a.a from (values (INTERVAL '1' YEAR)) a (a)"))))
 
 (t/deftest test-overrides-range
@@ -283,12 +285,15 @@ WHERE foo._id = 1"]])
              (q2 {:snapshot-time #inst "2020-01-03"})))))
 
 (t/deftest test-error-handling-inserting-strings-into-app-time-cols-397
-  (t/is (= (serde/->tx-aborted 0 (time/->instant #inst "2020-01-01")
-                               #xt/runtime-err [:xtdb.expression/invalid-temporal-string "String '2018-01-01' has invalid format for type timestamp with timezone" {}])
-           (xt/execute-tx tu/*node* [[:sql "INSERT INTO foo (_id, _valid_from) VALUES (1, '2018-01-01')"]])))
+  ;; this is now supported
+  (xt/execute-tx tu/*node* [[:sql "INSERT INTO foo (_id, _valid_from) VALUES (1, '2018-01-01')"]])
 
-  ;; TODO check the rollback error when it's available, #401
-  (t/is (= [] (xt/q tu/*node* "SELECT foo._id FROM foo"))))
+  (t/is (= [{:xt/id 1, :xt/valid-from #xt/zdt "2018-01-01Z[UTC]"}]
+           (xt/q tu/*node* "SELECT _id, _valid_from FROM foo")))
+
+  (t/is (thrown-with-msg? DateTimeParseException
+                          #"Text 'nope-01-01' could not be parsed"
+                          (xt/execute-tx tu/*node* [[:sql "INSERT INTO foo (_id, _valid_from) VALUES (1, 'nope-01-01')"]]))))
 
 (t/deftest test-vector-type-mismatch-245
   (t/is (= [{:a [4 "2"]}]
@@ -384,8 +389,8 @@ VALUES(1, OBJECT (foo: OBJECT(bibble: true), bar: OBJECT(baz: 1001)))"]])
              (xt/execute-tx tu/*node* [[:put-docs :docs {:xt/id :bar}]])))
 
     (t/is (= (serde/->tx-aborted 3 #xt/instant "2020-01-04T00:00:00Z"
-                                 #xt/runtime-err [:xtdb/assert-failed "Assert failed" {}])
-             (-> (xt/execute-tx tu/*node* ["ASSERT 1 = 2"])
+                                 #xt/runtime-err [:xtdb/assert-failed "boom" {}])
+             (-> (xt/execute-tx tu/*node* ["ASSERT 1 = 2, 'boom'"])
 
                  ;; can't compare `:cause`, because Exceptions are identity-equal
                  (update :error (comp read-string pr-str)))))
@@ -399,16 +404,13 @@ VALUES(1, OBJECT (foo: OBJECT(bibble: true), bar: OBJECT(baz: 1001)))"]])
 
     (t/is (= [{:committed? false}]
              (xt/q tu/*node*
-                   '(from :xt/txs [{:xt/id $tx-id, :committed committed?}])
-                   {:args {:tx-id 1}})))
+                   ['#(from :xt/txs [{:xt/id %, :committed committed?}]) 1])))
 
     (t/is (thrown-with-msg?
            RuntimeException
-           #"Assert failed"
+           #"boom"
 
-           (throw (-> (xt/q tu/*node*
-                            '(from :xt/txs [{:xt/id $tx-id, :error err}])
-                            {:args {:tx-id 3}})
+           (throw (-> (xt/q tu/*node* ['#(from :xt/txs [{:xt/id %, :error err}]) 3])
                       first
                       :err))))))
 
@@ -426,8 +428,7 @@ VALUES(1, OBJECT (foo: OBJECT(bibble: true), bar: OBJECT(baz: 1001)))"]])
 
     (t/is (= [{:committed? false}]
              (xt/q tu/*node*
-                   '(from :xt/txs [{:xt/id $tx-id, :committed committed?}])
-                   {:args {:tx-id 0}})))))
+                   ['#(from :xt/txs [{:xt/id %, :committed committed?}]) 0])))))
 
 (t/deftest test-nulling-valid-time-columns-2504
   (xt/submit-tx tu/*node* [[:sql "INSERT INTO docs (_id, _valid_from, _valid_to) VALUES (1, NULL, ?), (2, ?, NULL), (3, NULL, NULL)"
@@ -553,6 +554,17 @@ VALUES(1, OBJECT (foo: OBJECT(bibble: true), bar: OBJECT(baz: 1001)))"]])
            (-> (xt/q tu/*node*
                      "SELECT u._id, u.foo FROM users u WHERE u.a + u.b = 12"
                      {:explain? true})
+               (update-in [0 :plan] str/trim))))
+
+  (t/is (= [{:plan (str/trim "
+[:project
+ [{_id u.1/_id} {foo u.1/foo}]
+ [:rename
+  u.1
+  [:select (= (+ a b) 12) [:scan {:table public/users} [a _id foo b]]]]]
+")}]
+           (-> (xt/q tu/*node*
+                     "EXPLAIN SELECT u._id, u.foo FROM users u WHERE u.a + u.b = 12")
                (update-in [0 :plan] str/trim)))))
 
 (t/deftest test-normalising-nested-cols-2483
@@ -592,8 +604,8 @@ VALUES(1, OBJECT (foo: OBJECT(bibble: true), bar: OBJECT(baz: 1001)))"]])
                                         field_name3: {baz: -4113466}})"])
 
   (t/is (= [{:data {:field-name3 {:baz -4113466}, :field-name1 {:field-name2 true}}}]
-           (jdbc/execute! tu/*conn* ["SELECT t1.data FROM t1"]
-                          tu/jdbc-qopts))
+           (jdbc/execute! tu/*node* ["SELECT t1.data FROM t1"]
+                          {:builder-fn xt-jdbc/builder-fn}))
         "testing insert worked")
 
   (t/is (= [{:field-name2 true}]
@@ -602,10 +614,10 @@ VALUES(1, OBJECT (foo: OBJECT(bibble: true), bar: OBJECT(baz: 1001)))"]])
         "testing insert worked")
 
   (t/is (= [{:field-name2 true}]
-           (jdbc/execute! tu/*conn*
+           (jdbc/execute! tu/*node*
                           ["SELECT (t2.field_name1).field_name2, t2.field$name4.baz
                             FROM (SELECT (t1.data).field_name1, (t1.data).field$name4 FROM t1) AS t2"]
-                          tu/jdbc-qopts))
+                          {:builder-fn xt-jdbc/builder-fn}))
         "testing insert worked (JDBC)"))
 
 (t/deftest test-get-field-on-duv-with-struct-2425
@@ -627,11 +639,8 @@ VALUES(1, OBJECT (foo: OBJECT(bibble: true), bar: OBJECT(baz: 1001)))"]])
 
 ;; TODO move this to api-test once #2937 is in
 (t/deftest throw-on-unknown-query-type
-  (t/is (thrown-with-msg?
-         xtdb.IllegalArgumentException
-         #"Illegal argument: 'unknown-query-type'"
-         (xt/q tu/*node* (Object.)))))
-
+  (t/is (thrown-with-msg? IllegalArgumentException #"Illegal argument: 'unknown-query-type'"
+                          (xt/q tu/*node* (Object.)))))
 
 (t/deftest test-array-agg-2946
   (xt/submit-tx tu/*node*
@@ -721,14 +730,13 @@ VALUES(1, OBJECT (foo: OBJECT(bibble: true), bar: OBJECT(baz: 1001)))"]])
                                [:put-docs :unrelated-table {:xt/id 1 :a "a-string"}]])
       (tu/then-await-tx tu/*node* #xt/duration "PT2S"))
 
-  (let [pq (xtp/prepare-sql tu/*node* "SELECT foo.*, ? FROM foo" {:param-types [:i64]})
+  (let [pq (xtp/prepare-sql tu/*node* "SELECT foo.*, ? FROM foo" {})
         column-fields [#xt.arrow/field ["_id" #xt.arrow/field-type [#xt.arrow/type :i64 false]]
                        #xt.arrow/field ["a" #xt.arrow/field-type [#xt.arrow/type :utf8 false]]
                        #xt.arrow/field ["b" #xt.arrow/field-type [#xt.arrow/type :i64 false]]]]
 
-    (t/is (= (conj column-fields
-                   #xt.arrow/field ["_column_2" #xt.arrow/field-type [#xt.arrow/type :i64 true]])
-             (.columnFields pq))
+    (t/is (= (conj column-fields #xt.arrow/field ["_column_2" #xt.arrow/field-type [#xt.arrow/type :i64 false]])
+             (.getColumnFields pq [#xt.arrow/field ["?_0" #xt.arrow/field-type [#xt.arrow/type :i64 false]]]))
           "param type is assumed to be nullable")
 
     (with-open [bq (.bind pq {:args (tu/open-args [42])})
@@ -736,7 +744,7 @@ VALUES(1, OBJECT (foo: OBJECT(bibble: true), bar: OBJECT(baz: 1001)))"]])
 
       (t/is (= (conj column-fields
                      #xt.arrow/field ["_column_2" #xt.arrow/field-type [#xt.arrow/type :i64 false]])
-               (.columnFields bq))
+               (.getColumnFields bq))
             "now param value has been supplied we know its type is non-null")
 
       (t/is (= [[{:xt/id 1, :a "one", :b 2, :xt/column-2 42}]]
@@ -748,7 +756,7 @@ VALUES(1, OBJECT (foo: OBJECT(bibble: true), bar: OBJECT(baz: 1001)))"]])
 
         (t/is (= (conj column-fields
                        #xt.arrow/field ["_column_2" #xt.arrow/field-type [#xt.arrow/type :utf8 false]])
-                 (.columnFields bq))
+                 (.getColumnFields bq))
               "now param value has been supplied we know its type is non-null")
 
         (t/is (= [[{:xt/id 1, :a "one", :b 2, :xt/column-2 "fish"}]]
@@ -824,25 +832,21 @@ VALUES(1, OBJECT (foo: OBJECT(bibble: true), bar: OBJECT(baz: 1001)))"]])
 
 (deftest test-default-param-types
   (let [pq (xtp/prepare-sql tu/*node* "SELECT ? v" {:param-types nil})]
-    (t/is (= [#xt.arrow/field ["?_0" #xt.arrow/field-type [#xt.arrow/type :utf8 true]]]
-             (.paramFields pq))
-          "unspecified param-types are assumed to be utf8")
+    (t/testing "preparedQuery rebound with args matching the assumed type"
 
-     (t/testing "preparedQuery rebound with args matching the assumed type"
+      (with-open [bq (.bind pq {:args (tu/open-args ["42"])})
+                  cursor (.openCursor bq)]
 
-       (with-open [bq (.bind pq {:args (tu/open-args ["42"])})
-                   cursor (.openCursor bq)]
+        (t/is (= [[{:v "42"}]]
+                 (tu/<-cursor cursor))))
 
-                   (t/is (= [[{:v "42"}]]
-                            (tu/<-cursor cursor))))
+      (t/testing "or can be rebound with a different type"
 
-       (t/testing "or can be rebound with a different type"
+        (with-open [bq (.bind pq {:args (tu/open-args [44])})
+                    cursor (.openCursor bq)]
 
-         (with-open [bq (.bind pq {:args (tu/open-args [44])})
-                     cursor (.openCursor bq)]
-
-           (t/is (= [[{:v 44}]]
-                    (tu/<-cursor cursor))))))))
+          (t/is (= [[{:v 44}]]
+                   (tu/<-cursor cursor))))))))
 
 (deftest test-schema-ee-entry-points
   ;;test is using regclass to verify that expected EE entrypoints have access

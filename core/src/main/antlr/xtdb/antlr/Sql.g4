@@ -22,14 +22,14 @@ directlyExecutableStatement
     | eraseStatementSearched #EraseStmt
     | prepareStatement #PrepareStmt
     | executeStatement #ExecuteStmt
-    | ASSERT searchCondition #AssertStatement
+    | ASSERT condition=expr (',' message=characterString)? #AssertStatement
     | (START TRANSACTION | BEGIN TRANSACTION?) transactionCharacteristics? # StartTransactionStatement
     | SET TRANSACTION ISOLATION LEVEL levelOfIsolation # SetTransactionStatement
     | COMMIT # CommitStatement
     | ROLLBACK # RollbackStatement
     | SET SESSION CHARACTERISTICS AS sessionCharacteristic (',' sessionCharacteristic)* # SetSessionCharacteristicsStatement
     | SET ROLE ( identifier | NONE ) # SetRoleStatement
-    | SET TIME ZONE characterString # SetTimeZoneStatement
+    | SET TIME ZONE zone=expr # SetTimeZoneStatement
     | SET WATERMARK ( TO | '=' ) literal # SetWatermarkStatement
     | SET identifier ( TO | '=' ) literal # SetSessionVariableStatement
     | SHOW showVariable # ShowVariableStatement
@@ -57,8 +57,8 @@ settingQueryVariables : 'SETTING' settingQueryVariable (',' settingQueryVariable
 settingQueryVariable
     : 'DEFAULT' 'VALID_TIME' 'TO'? tableTimePeriodSpecification # SettingDefaultValidTime
     | 'DEFAULT' 'SYSTEM_TIME' 'TO'? tableTimePeriodSpecification # SettingDefaultSystemTime
-    | SNAPSHOT_TIME ('TO' | '=') snapshotTime=literal # SettingSnapshotTime
-    | CLOCK_TIME ('TO' | '=') clockTime=literal # SettingClockTime
+    | SNAPSHOT_TIME ('TO' | '=') snapshotTime=expr # SettingSnapshotTime
+    | CLOCK_TIME ('TO' | '=') clockTime=expr # SettingClockTime
     ;
 
 //// §5 Lexical Elements
@@ -72,9 +72,11 @@ dateTimeLiteral
     | 'TIMESTAMP' withOrWithoutTimeZone? characterString #TimestampLiteral
     ;
 
+integerLiteral: ('+' | '-')? UNSIGNED_INTEGER ;
+
 literal
     : ('+' | '-')? UNSIGNED_FLOAT #FloatLiteral
-    | ('+' | '-')? UNSIGNED_INTEGER #IntegerLiteral
+    | integerLiteral #IntegerLiteral0
     | characterString #CharacterStringLiteral
     | BINARY_STRING #BinaryStringLiteral
     | dateTimeLiteral #DateTimeLiteral0
@@ -82,7 +84,7 @@ literal
     | intervalLiteral #IntervalLiteral0
     | 'DURATION' characterString #DurationLiteral
     | 'UUID' characterString #UUIDLiteral
-    | 'URI' characterString #URILiteral
+    | 'URI' characterString #UriLiteral
     | 'KEYWORD' characterString #KeywordLiteral
     | (TRUE | FALSE | ON | OFF) #BooleanLiteral
     | NULL #NullLiteral
@@ -163,6 +165,7 @@ dataType
     | 'UUID' #UuidType
     | 'VARBINARY' #VarbinaryType
     | 'BYTEA' #VarbinaryType
+    | 'URI' # UriType
     | dataType 'ARRAY' ('[' maximumCardinality ']')? # ArrayType
     ;
 
@@ -307,6 +310,14 @@ exprPrimary
     | 'NAMESPACE' '(' expr ')' # NamespaceFunction
     | 'STR' '(' expr (',' expr)* ')' # StrFunction
 
+    | 'URI_SCHEME' '(' expr ')' # UriSchemeFunction
+    | 'URI_USER_INFO' '(' expr ')' # UriUserInfoFunction
+    | 'URI_HOST' '(' expr ')' # UriHostFunction
+    | 'URI_PORT' '(' expr ')' # UriPortFunction
+    | 'URI_PATH' '(' expr ')' # UriPathFunction
+    | 'URI_QUERY' '(' expr ')' # UriQueryFunction
+    | 'URI_FRAGMENT' '(' expr ')' # UriFragmentFunction
+
     | 'OVERLAY' '('
         expr
         'PLACING' expr
@@ -315,7 +326,8 @@ exprPrimary
         ( 'USING' charLengthUnits )?
       ')' # OverlayFunction
 
-    | 'REPLACE' '(' expr ',' replaceTarget ',' replacement ')' # ReplaceFunction
+    | 'REPLACE' '(' source=expr ',' pattern=expr ',' replacement=expr ')' # ReplaceFunction
+    | 'REGEXP_REPLACE' '(' source=expr ',' pattern=characterString ',' replacement=characterString (',' start=integerLiteral ( ',' n=integerLiteral )? )? (',' flags=characterString)? ')' # RegexpReplaceFunction
 
     | (schemaName '.')? 'CURRENT_USER' # CurrentUserFunction
     | (schemaName '.')? 'CURRENT_SCHEMA' ('(' ')')? # CurrentSchemaFunction
@@ -344,9 +356,6 @@ exprPrimary
 
     | 'TRIM_ARRAY' '(' expr ',' expr ')' # TrimArrayFunction
     ;
-
-replaceTarget : expr;
-replacement : expr;
 
 currentInstantFunction
     : 'CURRENT_DATE' ( '(' ')' )? # CurrentDateFunction
@@ -568,16 +577,10 @@ queryValidTimePeriodSpecification
    ;
 
 tableTimePeriodSpecification
-    : 'AS' 'OF' periodSpecificationExpr # TableAsOf
+    : 'AS' 'OF' at=expr # TableAsOf
     | 'ALL' # TableAllTime
-    | 'BETWEEN' periodSpecificationExpr 'AND' periodSpecificationExpr # TableBetween
-    | 'FROM' periodSpecificationExpr 'TO' periodSpecificationExpr # TableFromTo
-    ;
-
-periodSpecificationExpr
-    : literal #PeriodSpecLiteral
-    | parameterSpecification #PeriodSpecParam
-    | ('NOW' | 'CURRENT_TIMESTAMP') #PeriodSpecNow
+    | 'BETWEEN' from=expr 'AND' to=expr # TableBetween
+    | 'FROM' from=expr 'TO' to=expr # TableFromTo
     ;
 
 tableOrQueryName : tableName ;
@@ -694,8 +697,11 @@ queryTerm
     | tableValueConstructor # ValuesQuery
     | recordsValueConstructor # RecordsQuery
     | '(' queryExpressionNoWith ')' # WrappedQuery
+    | 'XTQL' ( xtqlQuery=characterString | '(' xtqlQuery=characterString xtqlParams ')' ) # XtqlQuery
     | queryTerm 'INTERSECT' (ALL | DISTINCT)? queryTerm # IntersectQuery
     ;
+
+xtqlParams : ( ',' parameterSpecification )* ;
 
 queryTail
     : whereClause # WhereTail
@@ -817,9 +823,13 @@ dmlStatementValidTimeExtents
 
 patchStatement
   : PATCH INTO tableName
-    ('FOR' ('PORTION' 'OF')? 'VALID_TIME' 'FROM' validFrom=staticExpr ('TO' validTo=staticExpr)?)?
-    patchSource
-  ;
+    patchStatementValidTimeExtents?
+    patchSource;
+
+// could become dmlStatementValidTimeExtents
+patchStatementValidTimeExtents
+: 'FOR' ('PORTION' 'OF')? 'VALID_TIME' 'FROM' from=staticExpr ('TO' to=staticExpr)? # PatchStatementValidTimePortion
+;
 
 patchSource
   : recordsValueConstructor # PatchRecords
@@ -878,13 +888,18 @@ transactionMode
     | 'READ' 'WRITE' ('WITH' '(' readWriteTxOption? (',' readWriteTxOption?)* ')')? # ReadWriteTransaction
     ;
 
+txTzOption : ('TIMEZONE' | 'TIME' 'ZONE') '='? tz=expr ;
+
 readOnlyTxOption
-    : 'SNAPSHOT_TIME' ('=')? dateTimeLiteral # SnapshotTimeTxOption
-    | 'CLOCK_TIME' ('=')? dateTimeLiteral # ClockTimeTxOption
+    : 'SNAPSHOT_TIME' '='? snapshotTime=expr # SnapshotTimeTxOption
+    | 'CLOCK_TIME' '='? clockTime=expr # ClockTimeTxOption
+    | 'WATERMARK' '='? watermarkTx=expr # WatermarkTxOption
+    | txTzOption # TxTzOption0
     ;
 
 readWriteTxOption
-    : 'SYSTEM_TIME' ('=')? dateTimeLiteral # SystemTimeTxOption
+    : 'SYSTEM_TIME' '='? systemTime=expr # SystemTimeTxOption
+    | txTzOption # TxTzOption1
     ;
 
 levelOfIsolation

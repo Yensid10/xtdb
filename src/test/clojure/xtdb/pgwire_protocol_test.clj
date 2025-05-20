@@ -1,9 +1,12 @@
 (ns xtdb.pgwire-protocol-test
   (:require [clojure.test :as t :refer [deftest]]
+            [jsonista.core :as json]
+            [xtdb.authn :as authn]
             [xtdb.pgwire :as pgwire]
+            [xtdb.pgwire.io :as pgio]
+            [xtdb.pgwire.types :as pg-types]
             [xtdb.test-util :as tu]
-            [xtdb.types :as types]
-            [xtdb.authn :as authn])
+            [xtdb.util :as util])
   (:import [java.lang AutoCloseable]
            [java.nio.charset StandardCharsets]
            [java.time Clock]))
@@ -21,7 +24,7 @@
   (String. arr StandardCharsets/UTF_8))
 
 (defrecord RecordingFrontend [!in-msgs !out-msgs]
-  pgwire/Frontend
+  pgio/Frontend
   (send-client-msg! [_ msg-def]
     (swap! !in-msgs conj [(:name msg-def)])
     nil)
@@ -29,6 +32,12 @@
   (send-client-msg! [_ msg-def data]
     (let [data (case (:name msg-def)
                  :msg-data-row (update data :vals (partial mapv bytes->str))
+                 :msg-error-response (update-in data [:error-fields :detail]
+                                                (fn [detail]
+                                                  (if (bytes? detail)
+                                                    (json/read-value (String. ^bytes detail StandardCharsets/UTF_8)
+                                                                     json/keyword-keys-object-mapper)
+                                                    detail)))
                  data)]
       (swap! !in-msgs conj [(:name msg-def) data]))
     nil)
@@ -53,17 +62,26 @@
   (^java.lang.AutoCloseable [frontend startup-opts]
    (->conn frontend startup-opts [{:user nil, :method #xt.authn/method :trust, :address nil}]))
   (^java.lang.AutoCloseable [frontend startup-opts authn-rules]
-   (-> (pgwire/map->Connection {:server {:server-state (atom {:parameters {"server_encoding" "UTF8"
-                                                                           "client_encoding" "UTF8"
-                                                                           "DateStyle" "ISO"
-                                                                           "IntervalStyle" "ISO_8601"}})
-                                         :->node {"xtdb" tu/*node*}
-                                         :authn (authn/->UserTableAuthn authn-rules)}
-                                :frontend frontend
-                                :cid -1
-                                :!closing? (atom false)
-                                :conn-state (atom {:session {:clock (Clock/systemUTC)}})})
-       (pgwire/cmd-startup-pg30 startup-opts))))
+   (let [conn (pgwire/map->Connection {:server {:server-state (atom {:parameters {"server_encoding" "UTF8"
+                                                                                  "client_encoding" "UTF8"
+                                                                                  "DateStyle" "ISO"
+                                                                                  "IntervalStyle" "ISO_8601"}})
+                                                :->node {"xtdb" (-> tu/*node*
+                                                                    (assoc :authn (authn/->UserTableAuthn authn-rules
+                                                                                                          (util/component tu/*node* :xtdb.query/query-source))))}}
+                                       :frontend frontend
+                                       :cid -1
+                                       :!closing? (atom false)
+                                       :conn-state (atom {:session {:clock (Clock/systemUTC)}})})]
+     (try
+       (pgwire/cmd-startup-pg30 conn startup-opts)
+       (catch Exception e
+         (if (::pgwire/error-code (ex-data e))
+           (doto conn
+             (pgwire/send-ex e)
+             (pgwire/handle-msg* {:msg-name :msg-terminate}))
+
+           (throw e)))))))
 
 (deftest test-startup
   (let [{:keys [!in-msgs] :as frontend} (->recording-frontend [{:msg-name :msg-password :password "xtdb"}])]
@@ -92,7 +110,8 @@
                   {:severity "ERROR",
                    :localized-severity "ERROR",
                    :sql-state "28000",
-                   :message "password authentication failed for user: xtdb"}}]]
+                   :message "password authentication failed for user: xtdb"
+                   :detail nil}}]]
                @!in-msgs)))))
 
 
@@ -136,7 +155,7 @@
 
 (deftest test-extended-query
   (let [insert "INSERT INTO docs (_id, name) VALUES ('aln', $1)"
-        param-types [(-> types/pg-types :text :oid)]
+        param-types [(-> pg-types/pg-types :text :oid)]
         param-values ["alan"]
         query "SELECT * FROM docs"
         {:keys [!in-msgs] :as frontend} (->recording-frontend)]
@@ -182,7 +201,7 @@
                @!in-msgs)))))
 
 (deftest test-wrong-param-encoding-3653
-  (let [param-types [(-> types/pg-types :timestamp :oid)]
+  (let [param-types [(-> pg-types/pg-types :timestamp :oid)]
         param-values ["alan"]
         query "SELECT $1 as v"
         {:keys [!in-msgs] :as frontend} (->recording-frontend)]
@@ -197,7 +216,8 @@
                   {:severity "ERROR",
                    :localized-severity "ERROR",
                    :sql-state "22P02",
-                   :message "invalid timestamp: Text 'alan' could not be parsed at index 0"}}]
+                   :message "invalid timestamp: Text 'alan' could not be parsed at index 0"
+                   :detail nil}}]
                 [:msg-ready {:status :idle}]]
                @!in-msgs)))))
 
@@ -214,7 +234,8 @@
                   {:severity "ERROR",
                    :localized-severity "ERROR",
                    :sql-state "08P01",
-                   :message "Parameters not allowed in simple queries"}}]
+                   :message "Parameters not allowed in simple queries"
+                   :detail nil}}]
                 [:msg-ready {:status :idle}]]
                @!in-msgs)))))
 
@@ -266,7 +287,8 @@
                 [:msg-command-complete {:command "SELECT 1"}]
                 [:msg-error-response {:error-fields
                                       {:severity "ERROR", :localized-severity "ERROR", :sql-state "08P01",
-                                       :message "DML is not allowed in a READ ONLY transaction"}}]
+                                       :message "DML is not allowed in a READ ONLY transaction"
+                                       :detail nil}}]
                 [:msg-ready {:status :idle}]]
 
                (test "SELECT 1 one; INSERT INTO foo RECORDS {_id: 1}"))))
@@ -276,7 +298,8 @@
                 [:msg-row-description {:columns [(->utf8-col "one")]}]
                 [:msg-error-response {:error-fields
                                       {:severity "ERROR", :localized-severity "ERROR", :sql-state "08P01",
-                                       :message "Queries are unsupported in a DML transaction"}}]
+                                       :message "Queries are unsupported in a DML transaction"
+                                       :detail nil}}]
                 [:msg-ready {:status :idle}]]
 
                (test "INSERT INTO foo RECORDS {_id: 1}; SELECT 1 one"))))
@@ -294,7 +317,9 @@
                 [:msg-row-description {:columns [(->utf8-col "boom")]}]
                 [:msg-error-response {:error-fields
                                       {:severity "ERROR", :localized-severity "ERROR", :sql-state "08P01"
-                                       :message "data exception - division by zero"}}]
+                                       :message "data exception - division by zero"
+                                       :detail {:error-key "xtdb.expression/division-by-zero",
+                                                :message "data exception - division by zero"}}}]
                 [:msg-ready {:status :failed-transaction}]]
                (test "BEGIN; SELECT 1/0 boom;"))))
 
@@ -304,6 +329,7 @@
                 [:msg-command-complete {:command "SELECT 1"}]
                 [:msg-error-response {:error-fields
                                       {:severity "ERROR", :localized-severity "ERROR", :sql-state "08P01",
-                                       :message "transaction already started"}}]
+                                       :message "transaction already started"
+                                       :detail nil}}]
                 [:msg-ready {:status :idle}]]
                (test "SELECT 1 one; BEGIN"))))))

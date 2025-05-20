@@ -12,10 +12,7 @@
  xt/key-fn xtdb.serde/read-key-fn
 
  xt/period-duration xtdb.serde/period-duration-reader
- xt/interval-ym xtdb.serde/interval-ym-reader
- xt/interval-dt xtdb.serde/interval-dt-reader
- xt/interval-mdn xtdb.serde/interval-mdn-reader
- xt/interval-mdm xtdb.serde/interval-mdm-reader
+ xt/interval xtdb.serde/interval-reader
  xt/tstz-range xtdb.serde/tstz-range-reader
  xt/uri xtdb.serde/uri-reader
 
@@ -24,12 +21,17 @@
  xt/tx-op xtdb.tx-ops/parse-tx-op
 
  xt/period xtdb.mirrors.time-literals/period
+ xt/local-date xtdb.mirrors.time-literals/date
  xt/date xtdb.mirrors.time-literals/date
+ xt/local-date-time xtdb.mirrors.time-literals/date-time
  xt/date-time xtdb.mirrors.time-literals/date-time
+ xt/ldt xtdb.mirrors.time-literals/date-time
  xt/zoned-date-time xtdb.mirrors.time-literals/zoned-date-time
+ xt/zdt xtdb.mirrors.time-literals/zoned-date-time
  xt/offset-time xtdb.mirrors.time-literals/offset-time
  xt/instant xtdb.mirrors.time-literals/instant
  xt/offset-date-time xtdb.mirrors.time-literals/offset-date-time
+ xt/odt xtdb.mirrors.time-literals/offset-date-time
  xt/zone xtdb.mirrors.time-literals/zone
  xt/day-of-week xtdb.mirrors.time-literals/day-of-week
  xt/time xtdb.mirrors.time-literals/time

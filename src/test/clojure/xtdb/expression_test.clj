@@ -15,10 +15,10 @@
            (java.time Duration Instant InstantSource LocalDate LocalDateTime LocalTime Period ZoneId ZonedDateTime)
            (java.time.temporal ChronoUnit)
            (org.apache.arrow.vector DurationVector TimeStampVector ValueVector)
-           (org.apache.arrow.vector.types.pojo ArrowType$Duration ArrowType$Timestamp)
            org.apache.arrow.vector.types.TimeUnit
+           (org.apache.arrow.vector.types.pojo ArrowType$Duration ArrowType$Timestamp)
            xtdb.arrow.RelationReader
-           (xtdb.types IntervalMonthDayMicro)
+           (xtdb.time Interval)
            (xtdb.util StringUtil)
            xtdb.vector.IVectorReader))
 
@@ -204,25 +204,25 @@
 
 (t/deftest test-date-trunc-interval
   (let [test-doc {:_id :foo,
-                  :year-interval (IntervalMonthDayMicro. (Period/of 1111 4 8) (Duration/parse "PT1H1M1.111111S"))
-                  :interval (IntervalMonthDayMicro. (Period/of 0 4 8) (Duration/parse "PT1H1M1.111111S"))}]
+                  :year-interval (Interval. (Period/of 1111 4 8) (Duration/parse "PT1H1M1.111111S"))
+                  :interval (Interval. (Period/of 0 4 8) (Duration/parse "PT1H1M1.111111S"))}]
 
     (letfn [(trunc [time-unit] (project1 (list 'date-trunc time-unit 'interval) test-doc))]
-      (t/is (= #xt/interval-mdm ["P4M8D" "PT1H1M1.111111S"] (trunc "MICROSECOND")))
-      (t/is (= #xt/interval-mdm ["P4M8D" "PT1H1M1.111S"] (trunc "MILLISECOND")))
-      (t/is (= #xt/interval-mdm ["P4M8D" "PT1H1M1S"] (trunc "SECOND")))
-      (t/is (= #xt/interval-mdm ["P4M8D" "PT1H1M"] (trunc "MINUTE")))
-      (t/is (= #xt/interval-mdm ["P4M8D" "PT1H"] (trunc "HOUR")))
-      (t/is (= #xt/interval-mdm ["P4M8D" "PT0S"] (trunc "DAY")))
-      (t/is (= #xt/interval-mdm ["P4M7D" "PT0S"] (trunc "WEEK")))
-      (t/is (= #xt/interval-mdm ["P4M" "PT0S"] (trunc "MONTH")))
-      (t/is (= #xt/interval-mdm ["P3M" "PT0S"] (trunc "QUARTER"))))
+      (t/is (= #xt/interval "P4M8DT1H1M1.111111S" (trunc "MICROSECOND")))
+      (t/is (= #xt/interval "P4M8DT1H1M1.111S" (trunc "MILLISECOND")))
+      (t/is (= #xt/interval "P4M8DT1H1M1S" (trunc "SECOND")))
+      (t/is (= #xt/interval "P4M8DT1H1M" (trunc "MINUTE")))
+      (t/is (= #xt/interval "P4M8DT1H" (trunc "HOUR")))
+      (t/is (= #xt/interval "P4M8D" (trunc "DAY")))
+      (t/is (= #xt/interval "P4M7D" (trunc "WEEK")))
+      (t/is (= #xt/interval "P4M" (trunc "MONTH")))
+      (t/is (= #xt/interval "P3M" (trunc "QUARTER"))))
     
     (letfn [(trunc [time-unit] (project1 (list 'date-trunc time-unit 'year-interval) test-doc))] 
-      (t/is (= #xt/interval-mdm ["P13332M" "PT0S"] (trunc "YEAR")))
-      (t/is (= #xt/interval-mdm ["P13320M" "PT0S"] (trunc "DECADE")))
-      (t/is (= #xt/interval-mdm ["P13200M" "PT0S"] (trunc "CENTURY")))
-      (t/is (= #xt/interval-mdm ["P12000M" "PT0S"] (trunc "MILLENNIUM"))))))
+      (t/is (= #xt/interval "P13332M" (trunc "YEAR")))
+      (t/is (= #xt/interval "P13320M" (trunc "DECADE")))
+      (t/is (= #xt/interval "P13200M" (trunc "CENTURY")))
+      (t/is (= #xt/interval "P12000M" (trunc "MILLENNIUM"))))))
 
 (t/deftest test-date-extract
   (letfn [(extract [part date-like] (project1 (list 'extract part 'date) {:date date-like}))
@@ -258,7 +258,7 @@
     (t/testing "java.time.LocalDate"
       (let [ld (LocalDate/of 2022 03 21)]
         (t/is (thrown-with-msg?
-               UnsupportedOperationException
+               IllegalArgumentException
                #"Extract \"SECOND\" not supported for type date"
                (extract "SECOND" ld))) 
         (t/is (= 21 (extract "DAY" ld)))
@@ -276,7 +276,7 @@
 
 (t/deftest test-interval-extract
   (letfn [(extract [part interval-val] (project1 (list 'extract part 'interval) {:interval interval-val}))]
-    (let [itvl (IntervalMonthDayMicro. (Period/of 1 4 8) (Duration/parse "PT3H10M12.1S"))]
+    (let [itvl (Interval. (Period/of 1 4 8) (Duration/parse "PT3H10M12.1S"))]
       (t/is (= 12 (extract "SECOND" itvl)))
       (t/is (= 10 (extract "MINUTE" itvl)))
       (t/is (= 3 (extract "HOUR" itvl)))
@@ -292,12 +292,12 @@
       (t/is (= 3 (extract "HOUR" tm)))
 
       (t/is (thrown-with-msg?
-             UnsupportedOperationException
+             IllegalArgumentException
              #"Extract \"DAY\" not supported for type time without timezone"
              (extract "DAY" tm)))
       
       (t/is (thrown-with-msg?
-             UnsupportedOperationException
+             IllegalArgumentException
              #"Extract \"TIMEZONE_HOUR\" not supported for type time without timezone"
              (extract "TIMEZONE_HOUR" tm))))))
 
@@ -317,11 +317,11 @@
     (t/testing "type that doesn't support timezone fields"
       (let [ld (LocalDate/of 2022 03 21)]
         (t/is (thrown-with-msg?
-               UnsupportedOperationException
+               IllegalArgumentException
                #"Extract \"TIMEZONE_HOUR\" not supported for type date"
                (extract "TIMEZONE_HOUR" ld)))
         (t/is (thrown-with-msg?
-               UnsupportedOperationException
+               IllegalArgumentException
                #"Extract \"TIMEZONE_MINUTE\" not supported for type date"
                (extract "TIMEZONE_MINUTE" ld)))))))
 
@@ -1354,14 +1354,24 @@
     ;; standard ops
     (t/is (= {:res 2.0M, :res-type [:decimal 32 1 128]}
              (run-test '+ (bigdec 1.0) (bigdec 1.0))))
+
+    (t/is (= {:res 2.01M, :res-type [:decimal 32 2 128]}
+             (run-test '+  (bigdec 1.01) (bigdec 1.0)))
+          "differnt scales take the larger")
+
     (t/is (= {:res 0.0M, :res-type [:decimal 32 1 128]}
              (run-test '- (bigdec 1.0) (bigdec 1.0))))
-    (t/is (= {:res 0.5M, :res-type [:decimal 32 1 128]}
+    (t/is (= {:res 0.5M, :res-type [:decimal 32 6 128]}
              (run-test '/ (bigdec 1.0) (bigdec 2.0))))
-    (t/is (= {:res 2.0M, :res-type [:decimal 32 1 128]}
+    (t/is (= {:res 2.00M, :res-type [:decimal 32 2 128]}
              (run-test '* (bigdec 1.0) (bigdec 2.0))))
     (t/is (= {:res false, :res-type :bool}
              (run-test '> (bigdec 1.0) (bigdec 2.0))))
+
+    (t/is (= {:res 61954235709850086879078532699846656405640394575840079131297.39935M,
+              :res-type [:decimal 64 5 256]}
+             (run-test '+ (bigdec 1.0)
+                       61954235709850086879078532699846656405640394575840079131296.39935M)))
 
     ;; LUB
     (t/is (= {:res 2.0M, :res-type [:decimal 32 1 128]}
@@ -1393,23 +1403,74 @@
     (t/is (= {:res 3.0, :res-type [:union #{:f64 [:decimal 32 1 128]}]}
              (run-test 'greatest (double 3.0) (bigdec 2.0))))
 
-    ;; TODO decide on behaviour
-    ;; out of fixed precision range
-    ;; FIXME see #4331, this is not correct
+    (t/is (= {:res-type [:union #{[:decimal 32 2 128] [:decimal 32 1 128]}],
+              :res 1.0M}
+             (run-test 'least (bigdec 1.0M) (bigdec 2.02))))
+
+    ;; some edge cases
+
+    (t/is (= {:res 1.0000000000000000000000000000001E+32M,
+              :res-type [:decimal 32 -1 128]}
+             (run-test '+ (bigdec 1E+1M) (bigdec 1E+32M))))
+
+    (t/is (thrown? RuntimeException
+                   (run-test '+ (bigdec 1E+1M) (bigdec 1E+33M))))
+
+    (t/is (= {:res 1001E+125M, :res-type [:decimal 32 -125 128]}
+             (run-test '+  (bigdec 1E+128M)  (bigdec 1E+125M))))
+
     (t/is (= {:res 2E+128M, :res-type [:decimal 32 -128 128]}
-             (run-test '+ (bigdec 1E+128M) (bigdec 1E+128M))))
+             (run-test '+ (bigdec 1E+128M) (bigdec 1E+128M)))
+          "negative scale")
 
-    ;; rounding necessary
-    (t/is (thrown? RuntimeException
-                   (run-test '+ (bigdec 1E+1M) (bigdec 1E+64M))))
+    (t/testing "boundary cases"
+      (t/testing "overflow"
+        ;; largest power of 2 with 32 digits
+        (let [boundary (-> (BigDecimal/valueOf 2) (.pow 106))]
+          (t/is (thrown? RuntimeException
+                         (run-test '+ boundary boundary))))
+        (let [boundary (-> (BigDecimal/valueOf 2) (.pow 212))]
+          (t/is (thrown? RuntimeException
+                         (run-test '+ boundary boundary)))))
 
-    ;; overflow
-    (t/is (thrown? RuntimeException
-                   (run-test '+ (bigdec 1E+35M) (bigdec 1E-35M))))
+      (t/testing "underflow"
+        (let [boundary (/ 1.0M (-> (BigDecimal/valueOf 2) (.pow 91)))]
+          (t/is (thrown? RuntimeException
+                         (run-test '/ boundary 2.0M)))))
 
-    ;; underflow
-    (t/is (thrown? RuntimeException
-                   (run-test '/ (bigdec 1E-35M) (bigdec 1E+35M))))))
+      (t/testing "out of precision"
+        (t/is (thrown? RuntimeException
+                       (run-test '+ (bigdec 1E+1M) (bigdec 1E+65M))))))))
+
+(t/deftest test-mulit-decimal-arithmetic
+  (letfn [(run-test [f xs yz]
+            (with-open [rel (tu/open-rel [(tu/open-vec "x" xs)
+                                          (tu/open-vec "y" yz)])]
+              (run-projection rel (list f 'x 'y))))]
+
+    (t/is (= {:res [2.001M 2.0101M],
+              :res-type [:union #{[:decimal 32 3 128] [:decimal 32 4 128]}]}
+             (run-test '+
+                       [(bigdec 1.0) (bigdec 1.01)]
+                       [(bigdec 1.001) (bigdec 1.0001)])))
+
+    (t/is (= [:decimal 64 5 256]
+             (-> (run-test '+
+                           [(bigdec 1.0) (bigdec 1.01)]
+                           (repeat 2 61954235709850086879078532699846656405640394575840079131296.39935M))
+                 :res-type)))
+
+    (t/is (= {:res [0.0 0.010000000000000009], :res-type :f64}
+             (run-test '-
+                       [(bigdec 1.0) (bigdec 1.01)]
+                       (repeat 2 (double 1.0)))))
+
+    (t/is (= {:res-type [:union #{[:decimal 32 2 128] [:decimal 32 1 128]}],
+              :res [0.0M 0.01M]}
+             (run-test '-
+                       [(bigdec 1.0) (bigdec 1.01)]
+                       (repeat 2 1))))))
+
 
 (t/deftest test-throws-on-overflow
   (letfn [(run-unary-test [f x]

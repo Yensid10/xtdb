@@ -215,11 +215,11 @@
   (xt/submit-tx tu/*node* [[:sql "INSERT INTO xt_docs (_id) VALUES (2)"]])
   (xt/submit-tx tu/*node* [[:sql "DELETE FROM xt_docs FOR PORTION OF VALID_TIME FROM NULL TO ? WHERE xt_docs._id = 2"
                             [#inst "2011"]]])
-  ;; TODO what do we want to do about NULL here? atm it works like 'start of time'
   (t/is (= #{{:tx-id 0, :committed? false}
              {:tx-id 1, :committed? true}
              {:tx-id 2, :committed? true}}
            (set (xt/q tu/*node* '(from :xt/txs [{:xt/id tx-id, :committed committed?}])))))
+
   (xt/submit-tx tu/*node* [[:sql "INSERT INTO xt_docs (_id) VALUES (3)"]])
   (xt/submit-tx tu/*node* [[:sql "UPDATE xt_docs FOR PORTION OF VALID_TIME FROM NULL TO ? SET foo = 'bar' WHERE xt_docs._id = 3"
                             [#inst "2011"]]])
@@ -231,22 +231,24 @@
   (t/is (= [{:intersection
              #xt/tstz-range [#xt/zoned-date-time "2021-01-01T00:00Z"
                              #xt/zoned-date-time "2022-01-01T00:00Z"]}]
-           (xt/q tu/*node* "SELECT PERIOD(?, ?) * PERIOD(?, ?) AS intersection"
-                 {:args [(time/->zdt #inst "2020-01-01")
-                         (time/->zdt #inst "2022-01-01")
-                         (time/->zdt #inst "2021-01-01")
-                         (time/->zdt #inst "2023-01-01")]})))
+           (xt/q tu/*node* ["SELECT PERIOD(?, ?) * PERIOD(?, ?) AS intersection"
+
+                            (time/->zdt #inst "2020-01-01")
+                            (time/->zdt #inst "2022-01-01")
+                            (time/->zdt #inst "2021-01-01")
+                            (time/->zdt #inst "2023-01-01")])))
 
   (t/is (= [{:variadic
              #xt/tstz-range [#xt/zoned-date-time "2022-01-01T00:00Z"
                              #xt/zoned-date-time "2024-01-01T00:00Z"]}]
-           (xt/q tu/*node* "SELECT PERIOD(?, ?) * PERIOD(?, ?) * PERIOD(?, ?) AS variadic"
-                 {:args [(time/->zdt #inst "2020-01-01")
-                         (time/->zdt #inst "2024-01-01")
-                         (time/->zdt #inst "2021-01-01")
-                         (time/->zdt #inst "2025-01-01")
-                         (time/->zdt #inst "2022-01-01")
-                         (time/->zdt #inst "2026-01-01")]}))
+           (xt/q tu/*node* ["SELECT PERIOD(?, ?) * PERIOD(?, ?) * PERIOD(?, ?) AS variadic"
+
+                            (time/->zdt #inst "2020-01-01")
+                            (time/->zdt #inst "2024-01-01")
+                            (time/->zdt #inst "2021-01-01")
+                            (time/->zdt #inst "2025-01-01")
+                            (time/->zdt #inst "2022-01-01")
+                            (time/->zdt #inst "2026-01-01")]))
         "variadic")
 
   (xt/submit-tx tu/*node* [[:put-docs :foo {:xt/id 1}]])
@@ -263,10 +265,70 @@
            (xt/q tu/*node* "SELECT _id, _valid_time FROM bar FOR ALL VALID_TIME")))
 
   (t/is (= [{:xt/id 1,
-            :intersection
-            #xt/tstz-range [#xt/zoned-date-time "2020-01-02T00:00:00Z"
-                            #xt/zoned-date-time "2020-01-03T00:00:00Z"]}]
+             :intersection
+             #xt/tstz-range [#xt/zoned-date-time "2020-01-02T00:00:00Z"
+                             #xt/zoned-date-time "2020-01-03T00:00:00Z"]}]
            (xt/q tu/*node* "SETTING DEFAULT VALID_TIME ALL
                             SELECT _id, foo._valid_time * bar._valid_time AS intersection
                             FROM foo JOIN bar USING (_id)
                             WHERE foo._valid_time OVERLAPS bar._valid_time"))))
+
+(t/deftest update-delete-and-patch-explicit-null-behaviour
+  (xt/execute-tx tu/*node* [[:sql "INSERT INTO users RECORDS {_id: ?, _valid_from: ?, _valid_to: ?}" [1 #inst "2010" #inst "2040"]]])
+
+  (xt/execute-tx tu/*node* [[:sql "UPDATE users FOR PORTION OF VALID_TIME FROM NULL TO ? SET foo = 1 WHERE _id = 1"
+                             [#inst "2020"]]])
+
+  (xt/execute-tx tu/*node* [[:sql "UPDATE users FOR PORTION OF VALID_TIME FROM ? TO NULL SET foo = 2 WHERE _id = 1"
+                             [#inst "2030"]]])
+
+  (t/is (= #{{:xt/id 1, :foo 2, :xt/valid-from #xt/zdt "2030-01-01T00:00Z[UTC]", :xt/valid-to #xt/zdt "2040-01-01T00:00Z[UTC]"}
+             {:xt/id 1, :foo 1, :xt/valid-from #xt/zdt "2010-01-01T00:00Z[UTC]", :xt/valid-to #xt/zdt "2020-01-01T00:00Z[UTC]"}
+             {:xt/id 1, :xt/valid-from #xt/zdt "2020-01-01T00:00Z[UTC]", :xt/valid-to #xt/zdt "2030-01-01T00:00Z[UTC]"}}
+           (set (xt/q tu/*node* "SELECT *, _valid_from, _valid_to FROM users FOR ALL VALID_TIME WHERE _id = 1 "))))
+
+
+  (xt/execute-tx tu/*node* [[:sql "PATCH INTO users FOR PORTION OF VALID_TIME FROM NULL TO NULL RECORDS {_id: 1, foo: 3}"]])
+
+
+  (t/is (= [{:xt/id 1,
+             :foo 3,
+             :xt/valid-from #xt/zdt "-290308-12-21T19:59:05.224192Z[UTC]",
+             :xt/valid-to #xt/zdt "2010-01-01T00:00Z[UTC]"}
+            {:xt/id 1,
+             :foo 3,
+             :xt/valid-from #xt/zdt "2010-01-01T00:00Z[UTC]",
+             :xt/valid-to #xt/zdt "2020-01-01T00:00Z[UTC]"}
+            {:xt/id 1,
+             :foo 3,
+             :xt/valid-from #xt/zdt "2020-01-01T00:00Z[UTC]",
+             :xt/valid-to #xt/zdt "2030-01-01T00:00Z[UTC]"}
+            {:xt/id 1,
+             :foo 3,
+             :xt/valid-from #xt/zdt "2030-01-01T00:00Z[UTC]",
+             :xt/valid-to #xt/zdt "2040-01-01T00:00Z[UTC]"}
+            {:xt/id 1, :foo 3, :xt/valid-from #xt/zdt "2040-01-01T00:00Z[UTC]"}]
+           (xt/q tu/*node* "SELECT *, _valid_from, _valid_to FROM users FOR ALL VALID_TIME WHERE _id = 1 ORDER BY _valid_from")))
+
+  (xt/execute-tx tu/*node* ["DELETE FROM users FOR PORTION OF VALID_TIME FROM NULL TO NULL WHERE _id = 1"])
+
+  (t/is (= [] (xt/q tu/*node* "SELECT *, _valid_from, _valid_to FROM users FOR ALL VALID_TIME WHERE _id = 1 "))))
+
+(t/deftest from-explicit-null-behaviour
+  (xt/execute-tx tu/*node* [[:sql "INSERT INTO users RECORDS {_id: ?, version: 1, _valid_from: ?, _valid_to: ?}"
+                             [1 #inst "2010" #inst "2040"]]]
+                 {:system-time #inst "2000"})
+  (xt/execute-tx tu/*node* [[:sql "INSERT INTO users RECORDS {_id: ?, version: 2, _valid_from: ?, _valid_to: ?}"
+                             [1 #inst "2020" #inst "2030"]]]
+                 {:system-time #inst "2001"})
+
+  (t/is (= [{:xt/id 1, :version 2} {:xt/id 1, :version 1} {:xt/id 1, :version 1}]
+           (xt/q tu/*node* "SELECT * FROM users FOR VALID_TIME FROM NULL TO NULL" {:current-time #inst "2020"})
+           (xt/q tu/*node* ["SELECT * FROM users FOR VALID_TIME FROM ? TO NULL" nil] {:current-time #inst "2020"})))
+
+  (t/is (= [{:xt/id 1, :version 2}]
+           (xt/q tu/*node* "SELECT * FROM users" {:current-time #inst "2020"})))
+
+  (t/is (= [{:xt/id 1, :version 2, :xt/system-from #xt/zdt "2001-01-01T00:00Z[UTC]"}
+            {:xt/id 1, :version 1, :xt/system-from #xt/zdt "2000-01-01T00:00Z[UTC]", :xt/system-to #xt/zdt "2001-01-01T00:00Z[UTC]"}]
+           (xt/q tu/*node* "SELECT *, _system_from, _system_to FROM users FOR SYSTEM_TIME FROM NULL TO NULL" {:current-time #inst "2020"}))))

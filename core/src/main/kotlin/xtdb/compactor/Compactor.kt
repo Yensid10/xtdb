@@ -1,6 +1,8 @@
 package xtdb.compactor
 
+import io.micrometer.core.instrument.Gauge
 import io.micrometer.core.instrument.MeterRegistry
+import io.micrometer.core.instrument.Timer
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.BufferOverflow.DROP_OLDEST
 import kotlinx.coroutines.channels.Channel
@@ -134,8 +136,19 @@ interface Compactor : AutoCloseable {
         private var availableJobs = emptyMap<JobKey, Job>()
 
         private val queuedJobs = mutableSetOf<JobKey>()
+        private val jobTimer: Timer? = meterRegistry?.let {
+            Timer.builder("compactor.job.timer")
+                .publishPercentiles(0.75, 0.85, 0.95, 0.98, 0.99, 0.999)
+                .register(it)
+        }
 
         init {
+
+            meterRegistry?.let {
+                Gauge.builder("compactor.jobs.available") { jobCalculator.availableJobs().size.toDouble() }
+                    .register(it)
+            }
+
             scope.launch {
                 val doneCh = Channel<JobKey>()
 
@@ -154,11 +167,12 @@ interface Compactor : AutoCloseable {
                                 // check it's still required
                                 val job = availableJobs[jobKey]
                                 if (job != null) {
+                                    val timer = meterRegistry?.let { Timer.start(it) }
                                     val addedTries = runInterruptible { job.execute() }
-
+                                    jobTimer?.let { timer?.stop(it) }
                                     // add the trie to the catalog eagerly so that it's present
                                     // next time we run `availableJobs` (it's idempotent)
-                                    trieCatalog.addTries(addedTries)
+                                    trieCatalog.addTries(job.tableName, addedTries)
                                     log.appendMessage(TriesAdded(Storage.VERSION, addedTries)).await()
                                 }
 

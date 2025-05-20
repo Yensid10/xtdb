@@ -4,7 +4,6 @@
             [xtdb.compactor :as c]
             [xtdb.node :as xtn]
             [xtdb.operator.scan :as scan]
-            xtdb.query
             [xtdb.test-util :as tu]
             [xtdb.time :as time]
             [xtdb.trie-catalog :as cat]
@@ -372,67 +371,6 @@
 
     (t/is (= '{_id [:union #{:keyword :utf8}]}
              (->col-type '_id)))))
-
-#_ ; TODO adapt for scan/->temporal-bounds
-(t/deftest can-create-temporal-min-max-range
-  (let [μs-2018 (time/instant->micros (time/->instant #inst "2018"))
-        μs-2019 (time/instant->micros (time/->instant #inst "2019"))]
-    (letfn [(transpose [[mins maxs]]
-              (->> (map vector mins maxs)
-                   (zipmap [:sys-end :xt/id :sys-start :row-id :app-time-start :app-time-end])
-                   (into {} (remove (comp #{[Long/MIN_VALUE Long/MAX_VALUE]} val)))))]
-      (t/is (= {:app-time-start [Long/MIN_VALUE μs-2019]
-                :app-time-end [(inc μs-2019) Long/MAX_VALUE]}
-               (transpose (scan/->temporal-min-max-range
-                           nil nil nil
-                           {'xt/valid-from '(<= xt/valid-from #inst "2019")
-                            'xt/valid-to '(> xt/valid-to #inst "2019")}))))
-
-      (t/is (= {:app-time-start [μs-2019 μs-2019]}
-               (transpose (scan/->temporal-min-max-range
-                           nil nil nil
-                           {'xt/valid-from '(= xt/valid-from #inst "2019")}))))
-
-      (t/testing "symbol column name"
-        (t/is (= {:app-time-start [μs-2019 μs-2019]}
-                 (transpose (scan/->temporal-min-max-range
-                             nil nil nil
-                             {'xt/valid-from '(= xt/valid-from #inst "2019")})))))
-
-      (t/testing "conjunction"
-        (t/is (= {:app-time-start [Long/MIN_VALUE μs-2019]}
-                 (transpose (scan/->temporal-min-max-range
-                             nil nil nil
-                             {'xt/valid-from '(and (<= xt/valid-from #inst "2019")
-                                                   (<= xt/valid-from #inst "2020"))})))))
-
-      (t/testing "disjunction not supported"
-        (t/is (= {}
-                 (transpose (scan/->temporal-min-max-range
-                             nil nil nil
-                             {'xt/valid-from '(or (= xt/valid-from #inst "2019")
-                                                  (= xt/valid-from #inst "2020"))})))))
-
-      (t/testing "ignores non-ts literals"
-        (t/is (= {:app-time-start [μs-2019 μs-2019]}
-                 (transpose (scan/->temporal-min-max-range
-                             nil nil nil
-                             {'xt/valid-from '(and (= xt/valid-from #inst "2019")
-                                                   (= xt/valid-from nil))})))))
-
-      (t/testing "parameters"
-        (t/is (= {:app-time-start [μs-2018 Long/MAX_VALUE]
-                  :app-time-end [Long/MIN_VALUE (dec μs-2018)]
-                  :sys-start [Long/MIN_VALUE μs-2019]
-                  :sys-end [(inc μs-2019) Long/MAX_VALUE]}
-                 (with-open [args (tu/open-args {'?system-time (time/->instant #inst "2019")
-                                                 '?app-time (time/->instant #inst "2018")})]
-                   (transpose (scan/->temporal-min-max-range
-                               args nil nil
-                               {'xt/system-from '(>= ?system-time xt/system-from)
-                                'xt/system-to '(< ?system-time xt/system-to)
-                                'xt/valid-from '(<= ?app-time xt/valid-from)
-                                'xt/valid-to '(> ?app-time xt/valid-to)})))))))))
 
 (t/deftest test-content-pred
   (xt/submit-tx tu/*node* [[:put-docs :xt_docs {:xt/id :ivan, :first-name "Ivan", :last-name "Ivanov"}]
@@ -867,7 +805,7 @@
 
           (doseq [[idx {:keys [interval dir range1 range2]}] (map-indexed vector intervals)]
             (t/testing (format "%s interval: '%s'" (name dir) interval)
-              (let [dates (vec (into #{(Date. Long/MIN_VALUE) (Date. Long/MAX_VALUE)}
+              (let [dates (vec (into #{(Date. (long (/ Long/MIN_VALUE 1000))) (Date. (long (/ Long/MAX_VALUE 1000)))}
                                      (comp cat
                                            (mapcat (fn [^Date date]
                                                      (for [^long delta (range -2 3)]
@@ -880,9 +818,8 @@
                                "SELECT *, _valid_from, _valid_to, _system_from, _system_to
                                 FROM foo FOR VALID_TIME AS OF ? FOR SYSTEM_TIME ALL WHERE _id = ?"]]
                       (t/testing (format "query: '%s'" q)
-                        ;; params the wrong way around - see #4305
-                        (t/is (= (xt/q n1 [q idx date])
-                                 (xt/q n2 [q idx date])))))))
+                        (t/is (= (xt/q n1 [q date idx])
+                                 (xt/q n2 [q date idx])))))))
 
                 (doseq [to-i (range (count dates))
                         from-i (range to-i)
@@ -891,7 +828,8 @@
                   (let [q "SELECT *, _valid_from, _valid_to
                            FROM foo FOR VALID_TIME BETWEEN ? AND ? FOR SYSTEM_TIME BETWEEN ? AND ?
                            WHERE _id = ?"]
-                    (t/testing (format "query: '%s', vt-" q)
-                      ;; params the wrong way around - see #4305
-                      (t/is (= (xt/q n1 [q idx from-date to-date from-date to-date])
-                               (xt/q n2 [q idx from-date to-date from-date to-date]))))))))))))))
+                    (t/testing (format "query: '%s', from-i %d, to-i %d" q from-i to-i)
+                      (t/is (= (xt/q n1 [q from-date to-date from-date to-date idx]
+                                     {:default-tz #xt/zone "UTC"})
+                               (xt/q n2 [q from-date to-date from-date to-date idx]
+                                     {:default-tz #xt/zone "UTC"}))))))))))))))

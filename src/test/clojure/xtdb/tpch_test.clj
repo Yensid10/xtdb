@@ -7,7 +7,7 @@
             [xtdb.datasets.tpch.ra :as tpch-ra]
             [xtdb.datasets.tpch.xtql :as tpch-xtql]
             xtdb.sql-test
-            [xtdb.sql.plan :as plan]
+            [xtdb.sql :as sql]
             [xtdb.test-util :as tu]
             [xtdb.util :as util])
   (:import (java.nio.file Path)
@@ -113,9 +113,8 @@
 (defn test-xtql-query [n expected-res]
   (let [q (inc n)]
     (when (contains? *xtql-qs* q)
-      (let [query @(nth tpch-xtql/queries n)
-            {::tpch-xtql/keys [args]} (meta query)]
-        (t/is (is-equal? expected-res (xt/q *node* query {:args args, :key-fn :snake-case-keyword}))
+      (let [query+args @(nth tpch-xtql/queries n)]
+        (t/is (is-equal? expected-res (xt/q *node* query+args {:key-fn :snake-case-keyword}))
               (format "Q%02d" (inc n)))))))
 
 (t/deftest test-001-xtql
@@ -158,11 +157,9 @@
   (dotimes [n 22]
     (let [n (inc n)]
       (when (contains? *qs* n)
-        (t/is (=plan-file
-               (format "tpch/q%02d" n)
-               (-> (plan/plan-statement (slurp-sql-query n)
-                                        {:table-info tpch-table-info})
-                   plan/->logical-plan))
+        (t/is (=plan-file (format "tpch/q%02d" n)
+                          (sql/plan (slurp-sql-query n)
+                                    {:table-info tpch-table-info}))
               (format "Q%02d" n))))))
 
 (defn test-sql-query

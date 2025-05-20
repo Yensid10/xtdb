@@ -7,6 +7,7 @@
             [xtdb.expression :as expr]
             xtdb.expression.pg
             xtdb.expression.temporal
+            xtdb.expression.uri
             [xtdb.logical-plan :as lp]
             [xtdb.metadata :as meta]
             [xtdb.metrics :as metrics]
@@ -49,35 +50,11 @@
            (xtdb.antlr Sql$DirectlyExecutableStatementContext)
            (xtdb.api.query IKeyFn Query)
            xtdb.catalog.BlockCatalog
-           (xtdb.indexer Watermark$Source)
+           (xtdb.indexer Watermark Watermark$Source)
+           (xtdb.query PreparedQuery BoundQuery IQuerySource)
            xtdb.operator.scan.IScanEmitter
            xtdb.util.RefCounter
            [xtdb.vector IVectorReader RelationReader]))
-
-(definterface BoundQuery
-  (^java.util.List columnFields [])
-  (^xtdb.ICursor openCursor [])
-  (^void close []
-   "optional: if you close this BoundQuery it'll close any closed-over args relation"))
-
-(definterface PreparedQuery
-  (^java.util.List paramFields [])
-  (^java.util.List columnFields [])
-  (^java.util.List warnings [])
-  (^xtdb.query.BoundQuery bind [queryOpts]
-   "queryOpts :: {:args, :close-args?, :snapshot-time, :current-time, :default-tz}
-
-    close-args? :: boolean, default true
-
-    args :: RelationReader
-      N.B. `args` will be closed when this BoundQuery closes"))
-
-(definterface IQuerySource
-  (^xtdb.query.PreparedQuery prepareRaQuery [ra-query query-opts])
-  (^xtdb.query.PreparedQuery prepareRaQuery [ra-query wm-src query-opts])
-
-  (^clojure.lang.PersistentVector planQuery [query query-opts])
-  (^clojure.lang.PersistentVector planQuery [query wm-src query-opts]))
 
 (defn- wrap-cursor ^xtdb.IResultCursor [^ICursor cursor, ^AutoCloseable wm, ^BufferAllocator al,
                                         current-time, snapshot-time, default-tz, ^RefCounter ref-ctr, fields]
@@ -135,13 +112,27 @@
        (into {} (map (fn [^IVectorReader col]
                        (MapEntry/create (symbol (.getName col)) (.getField col)))))))
 
+(defn expr->instant [expr {:keys [^RelationReader args default-tz] :as opts}]
+  (if (symbol? expr)
+    (recur (-> args (.vectorFor (str expr)) (.getObject 0)) opts)
+    (time/->instant expr {:default-tz default-tz})))
+
+(defn- validate-snapshot-not-before [snapshot-time ^Watermark wm]
+  (let [wm-tx (.getTxBasis wm)]
+    (when (and snapshot-time (or (nil? wm-tx) (neg? (compare (.getSystemTime wm-tx) snapshot-time))))
+      (throw (err/illegal-arg :xtdb/unindexed-tx
+                              {::err/message (format "snapshot-time (%s) is after the latest completed tx (%s)"
+                                                     (str snapshot-time) (pr-str wm-tx))
+                               :latest-completed-tx wm-tx
+                               :snapshot-time snapshot-time})))))
+
 (defn prepare-ra
   (^xtdb.query.PreparedQuery [query deps] (prepare-ra query deps {}))
 
   (^xtdb.query.PreparedQuery [query
                               {:keys [^IScanEmitter scan-emitter, ^BufferAllocator allocator,
                                       ^RefCounter ref-ctr ^Watermark$Source wm-src] :as deps}
-                              {:keys [param-types default-tz table-info]}]
+                              {:keys [default-tz table-info]}]
 
    (let [conformed-query (s/conform ::lp/logical-plan query)]
      (when (s/invalid? conformed-query)
@@ -150,53 +141,56 @@
                            :explain (s/explain-data ::lp/logical-plan query)}))
        (throw (err/illegal-arg :malformed-query {::err/message "internal error conforming query plan", :plan query})))
 
-     (let [{:keys [ordered-outer-projection param-count warnings], :or {param-count 0}} (meta query)
-           param-types-with-defaults (->> (concat
-                                           (mapv #(if (= :default %) :utf8 %) param-types)
-                                           (repeat :utf8))
-                                          (take param-count))
-           tables (filter (comp #{:scan} :op) (lp/child-exprs conformed-query))
+     (let [tables (filter (comp #{:scan} :op) (lp/child-exprs conformed-query))
            scan-cols (->> tables
                           (into #{} (mapcat scan/->scan-cols)))
 
            _ (assert (or scan-emitter (empty? scan-cols)))
 
-           relevant-schema-at-prepare-time
-           (when (and table-info scan-emitter)
-             (with-open [wm (.openWatermark wm-src)]
-               (->> tables
-                    (map #(str (get-in % [:scan-opts :table])))
-                    (mapcat #(map (partial vector %) (get table-info %)))
-                    (.scanFields scan-emitter wm))))
+           relevant-schema-at-prepare-time (when (and table-info scan-emitter)
+                                             (with-open [wm (.openWatermark wm-src)]
+                                               (->> tables
+                                                    (map #(str (get-in % [:scan-opts :table])))
+                                                    (mapcat #(map (partial vector %) (get table-info %)))
+                                                    (.scanFields scan-emitter wm))))
 
            cache (ConcurrentHashMap.)
-           param-fields (->> param-types-with-defaults
-                             (into [] (comp (map (comp types/col-type->field types/col-type->nullable-col-type))
-                                            (map-indexed (fn [idx field]
-                                                           (types/field-with-name field (str "?_" idx)))))))
-           param-fields-by-name (into {} (map (juxt (comp symbol #(.getName ^Field %)) identity)) param-fields)
-           default-tz (or default-tz expr/*default-tz*)]
+
+           default-tz (or default-tz expr/*default-tz*)
+
+           {:keys [ordered-outer-projection warnings param-count], :or {param-count 0} :as plan-meta} (meta query)]
 
        (reify PreparedQuery
-         (paramFields [_] param-fields)
-         (columnFields [_]
-           (let [{:keys [fields]} (emit-expr cache deps conformed-query scan-cols default-tz param-fields-by-name)]
+         (getParamCount [_] param-count)
+         (getColumnNames [_] ordered-outer-projection)
+
+         (getColumnFields [_ param-fields]
+           (let [param-fields-by-name (->> param-fields
+                                           (into {} (map (juxt (comp symbol #(.getName ^Field %)) identity))))
+                 {:keys [fields]} (emit-expr cache deps conformed-query scan-cols default-tz param-fields-by-name)]
              ;; could store column-fields in the cache/map too
              (->column-fields ordered-outer-projection fields)))
-         (warnings [_] warnings)
 
-         (bind [_ {:keys [args current-time snapshot-time default-tz close-args?]
+         (getWarnings [_] warnings)
+
+         (bind [_ {:keys [args current-time snapshot-time default-tz close-args? after-tx-id]
                    :or {default-tz default-tz
                         close-args? true}}]
 
-           ;; TODO throw if basis is in the future?
-           (let [{:keys [fields ->cursor]} (emit-expr cache deps conformed-query scan-cols default-tz (->arg-fields args))
-                 current-time (or (some-> current-time time/->instant)
+           (let [^RelationReader args (cond
+                                        (instance? RelationReader args) args
+                                        (vector? args) (vw/open-args allocator args)
+                                        (nil? args) vw/empty-args
+                                        :else (throw (ex-info "invalid args"
+                                                              {:type (class args)})))
+                 {:keys [fields ->cursor]} (emit-expr cache deps conformed-query scan-cols default-tz (->arg-fields args))
+                 current-time (or (some-> (:current-time plan-meta) (expr->instant {:args args, :default-tz default-tz}))
+                                  (some-> current-time (expr->instant {:args args, :default-tz default-tz}))
                                   (expr/current-time))]
 
              (reify
                BoundQuery
-               (columnFields [_]
+               (getColumnFields [_]
                  (->column-fields ordered-outer-projection fields))
 
                (openCursor [_]
@@ -214,27 +208,33 @@
                                                ;;TODO consider adding the schema diff to the error, potentially quite large.
                                                {::err/message "Relevant table schema has changed since preparing query, please prepare again"})))))
                  (.acquire ref-ctr)
-                 (util/with-close-on-catch [^BufferAllocator allocator
-                                            (if allocator
-                                              (util/->child-allocator allocator "BoundQuery/openCursor")
-                                              (RootAllocator.))
-                                            wm (.openWatermark wm-src)]
-                   (try
+                 (try
+                   (util/with-close-on-catch [^BufferAllocator allocator
+                                              (if allocator
+                                                (util/->child-allocator allocator "BoundQuery/openCursor")
+                                                (RootAllocator.))
+                                              wm (.openWatermark wm-src)]
+
                      (binding [expr/*clock* (InstantSource/fixed current-time)
                                expr/*default-tz* default-tz
-                               expr/*snapshot-time* (or (some-> snapshot-time time/->instant)
-                                                        (some-> wm .getTxBasis .getSystemTime))]
+                               expr/*snapshot-time* (or (some-> (:snapshot-time plan-meta) (expr->instant {:args args, :default-tz default-tz}))
+                                                        (some-> snapshot-time (expr->instant {:args args, :default-tz default-tz}))
+                                                        (some-> wm .getTxBasis .getSystemTime))
+                               expr/*after-tx-id* (or after-tx-id -1)]
+
+                       (validate-snapshot-not-before expr/*snapshot-time* wm)
+
                        (-> (->cursor {:allocator allocator, :watermark wm
                                       :default-tz default-tz,
                                       :snapshot-time expr/*snapshot-time*
                                       :current-time current-time
                                       :args (or args vw/empty-args)
                                       :schema (scan/tables-with-cols wm-src)})
-                           (wrap-cursor wm allocator current-time expr/*snapshot-time* default-tz ref-ctr fields)))
+                           (wrap-cursor wm allocator current-time expr/*snapshot-time* default-tz ref-ctr fields))))
 
-                     (catch Throwable t
-                       (.release ref-ctr)
-                       (throw t)))))
+                   (catch Throwable t
+                     (.release ref-ctr)
+                     (throw t))))
 
                AutoCloseable
                (close [_]
@@ -262,19 +262,21 @@
       IQuerySource
       (prepareRaQuery [this query query-opts]
         (.prepareRaQuery this query live-idx query-opts))
+
       (prepareRaQuery [_ query wm-src query-opts]
         (let [prepared-query (prepare-ra query (assoc deps :wm-src wm-src) (assoc query-opts :table-info (scan/tables-with-cols wm-src)))]
-          (when (seq (.warnings prepared-query))
+          (when (seq (.getWarnings prepared-query))
             (.increment query-warning-counter))
           prepared-query))
+
       (planQuery [this query query-opts]
         (.planQuery this query live-idx query-opts))
+
       (planQuery [_ query wm-src query-opts]
         (let [table-info (scan/tables-with-cols wm-src)
               plan-query-opts
               (-> query-opts
-                  (select-keys
-                   [:decorrelate? :explain? :instrument-rules? :project-anonymous-columns? :validate-plan?])
+                  (select-keys [:decorrelate? :explain? :instrument-rules? :project-anonymous-columns? :validate-plan? :arg-fields])
                   (update :decorrelate? #(if (nil? %) true false))
                   (assoc :table-info table-info))]
 
@@ -284,7 +286,7 @@
                 (fn [_cache-key]
                   (let [plan (cond
                                (or (string? query) (instance? Sql$DirectlyExecutableStatementContext query))
-                               (sql/compile-query query plan-query-opts)
+                               (sql/plan query plan-query-opts)
 
                                (seq? query) (-> (xtql/parse-query query)
                                                 (xtql.plan/compile-query plan-query-opts))
@@ -292,7 +294,7 @@
                                (instance? Query query) (xtql.plan/compile-query query plan-query-opts)
 
                                :else (throw (err/illegal-arg :unknown-query-type {:query query, :type (type query)})))]
-                    (if (:explain? query-opts)
+                    (if (or (:explain? query-opts) (:explain? (meta plan)))
                       (with-meta [:table [{:plan (with-out-str (pp/pprint plan))}]]
                                  (-> (meta plan) (select-keys [:param-count :warnings])))
                       plan))))))

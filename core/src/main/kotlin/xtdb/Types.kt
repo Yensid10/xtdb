@@ -4,7 +4,6 @@ package xtdb
 
 import clojure.lang.Keyword
 import com.github.benmanes.caffeine.cache.Caffeine
-import org.apache.arrow.vector.PeriodDuration
 import org.apache.arrow.vector.types.DateUnit
 import org.apache.arrow.vector.types.DateUnit.DAY
 import org.apache.arrow.vector.types.FloatingPointPrecision
@@ -17,10 +16,15 @@ import org.apache.arrow.vector.types.Types.MinorType
 import org.apache.arrow.vector.types.pojo.ArrowType
 import org.apache.arrow.vector.types.pojo.ArrowType.ArrowTypeVisitor
 import org.apache.arrow.vector.types.pojo.FieldType
-import xtdb.types.*
+import xtdb.time.Interval
+import xtdb.time.MICRO_HZ
+import xtdb.time.NANO_HZ
+import xtdb.types.ClojureForm
+import xtdb.types.RegClass
+import xtdb.types.RegProc
+import xtdb.types.ZonedDateTimeRange
 import xtdb.vector.extensions.*
 import java.math.BigDecimal
-import java.math.BigInteger
 import java.net.URI
 import java.nio.ByteBuffer
 import java.time.*
@@ -103,7 +107,7 @@ private val DATE_DAY_TYPE = ArrowType.Date(DAY)
 private val DURATION_MICRO_TYPE = ArrowType.Duration(MICROSECOND)
 private val TIME_NANO_TYPE = ArrowType.Time(NANOSECOND, 64)
 
-fun valueToArrowType(obj: Any?) = when (obj) {
+fun valueToArrowType(obj: Any?): ArrowType = when (obj) {
     null -> MinorType.NULL.type
     is Boolean -> MinorType.BIT.type
     is Byte -> MinorType.TINYINT.type
@@ -118,7 +122,10 @@ fun valueToArrowType(obj: Any?) = when (obj) {
             // Java Arrow only supports 128 and 256 bit widths
             in 0..32 -> 32
             in 33..64 -> 64
-            else -> throw IllegalArgumentException("unsupported precision: ${obj.precision()}")
+            else -> throw IllegalArgumentException.createNoKey(
+                "Unsupported precision: ${obj.precision()}",
+                emptyMap<String, String>()
+            )
         }
         ArrowType.Decimal(precision, obj.scale(), precision * 4)
     }
@@ -150,10 +157,11 @@ fun valueToArrowType(obj: Any?) = when (obj) {
     // TODO support for Arrow maps
     is Map<*, *> -> MinorType.STRUCT.type
 
-    is IntervalYearMonth -> MinorType.INTERVALYEAR.type
-    is IntervalDayTime -> MinorType.INTERVALDAY.type
-    is IntervalMonthDayNano -> MinorType.INTERVALMONTHDAYNANO.type
-    is IntervalMonthDayMicro -> IntervalMDMType
+    is Interval -> when {
+        obj.nanos % (NANO_HZ / MICRO_HZ) != 0L -> MinorType.INTERVALMONTHDAYNANO.type
+        obj.nanos != 0L || obj.days != 0 -> IntervalMDMType
+        else -> MinorType.INTERVALYEAR.type
+    }
 
     is ZonedDateTimeRange -> TsTzRangeType
 

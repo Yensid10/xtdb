@@ -4,7 +4,7 @@
             [clojure.tools.logging :as log]
             [integrant.core :as ig]
             [xtdb.api :as xt]
-            [xtdb.authn :as authn]
+            [xtdb.authn.crypt :as authn.crypt]
             [xtdb.error :as err]
             [xtdb.indexer.live-index :as li]
             [xtdb.log :as xt-log]
@@ -15,12 +15,10 @@
             [xtdb.rewrite :as r :refer [zmatch]]
             [xtdb.serde :as serde]
             [xtdb.sql :as sql]
-            [xtdb.sql.plan :as plan]
             [xtdb.time :as time]
             [xtdb.types :as types]
             [xtdb.util :as util]
-            [xtdb.vector.reader :as vr]
-            [xtdb.xtql.plan :as xtql])
+            [xtdb.vector.reader :as vr])
   (:import (clojure.lang MapEntry)
            (io.micrometer.core.instrument Counter Timer)
            (java.io ByteArrayInputStream Closeable)
@@ -38,7 +36,6 @@
            xtdb.BufferPool
            (xtdb.indexer IIndexer LiveIndex LiveIndex$Tx LiveTable$Tx OpIndexer RelationIndexer Watermark Watermark$Source)
            (xtdb.query IQuerySource PreparedQuery)
-           xtdb.types.ClojureForm
            (xtdb.vector IVectorReader RelationAsStructReader RelationReader SingletonListReader)))
 
 (set! *unchecked-math* :warn-on-boxed)
@@ -77,7 +74,7 @@
   `(try
      ~@body
      (catch xtdb.RuntimeException e# (throw e#))
-     (catch xtdb.IllegalArgumentException e# (throw e#))
+     (catch IllegalArgumentException e# (throw e#))
      (catch InterruptedException e# (throw e#))
      (catch ClosedByInterruptException e# (throw e#))
      (catch Exception e#
@@ -300,7 +297,7 @@
                       (.logPut live-table-tx (util/->iid eid) valid-from valid-to #(.copyRow live-idx-table-copier idx))))
 
                   (catch xtdb.RuntimeException e (throw e))
-                  (catch xtdb.IllegalArgumentException e (throw e))
+                  (catch IllegalArgumentException e (throw e))
                   (catch InterruptedException e (throw e))
                   (catch ClosedByInterruptException e (throw e))
                   (catch Throwable t
@@ -351,10 +348,10 @@
               {:live-table-tx live-idx-tx, :query-rel in-rel}
 
             (let [iid (.getBytes iid-rdr idx)]
-            (-> (.liveTable live-idx-tx table)
-                (.logErase iid)))))))))
+              (-> (.liveTable live-idx-tx table)
+                  (.logErase iid)))))))))
 
-(defn- ->assert-idxer ^xtdb.indexer.RelationIndexer [^IQuerySource q-src, wm-src, query, tx-opts]
+(defn- ->assert-idxer ^xtdb.indexer.RelationIndexer [^IQuerySource q-src, wm-src, query, tx-opts, {:keys [message]}]
   (let [^PreparedQuery pq (.prepareRaQuery q-src query wm-src tx-opts)]
     (fn eval-query [^RelationReader args]
       (with-open [res (-> (.bind pq (-> (select-keys tx-opts [:snapshot-time :current-time :default-tz])
@@ -363,7 +360,7 @@
 
         (letfn [(throw-assert-failed []
                   (throw (err/runtime-err :xtdb/assert-failed
-                                          {::err/message "Assert failed"})))]
+                                          {::err/message (or message "Assert failed")})))]
           (or (.tryAdvance res
                            (reify Consumer
                              (accept [_ in-rel]
@@ -461,13 +458,13 @@
                                                   {:valid-from valid-from
                                                    :valid-to valid-to})))
 
-                        (let [pq (.prepareRaQuery q-src (-> (plan/plan-patch {:table-info (plan/xform-table-info (scan/tables-with-cols wm-src))}
-                                                                             {:table (symbol table-name)
-                                                                              :valid-from valid-from
-                                                                              :valid-to valid-to
-                                                                              :patch-rel (plan/->QueryExpr '[:table [_iid doc]
-                                                                                                             ?patch_docs]
-                                                                                                           '[_iid doc])})
+                        (let [pq (.prepareRaQuery q-src (-> (sql/plan-patch {:table-info (sql/xform-table-info (scan/tables-with-cols wm-src))}
+                                                                            {:table (symbol table-name)
+                                                                             :valid-from valid-from
+                                                                             :valid-to valid-to
+                                                                             :patch-rel (sql/->QueryExpr '[:table [_iid doc]
+                                                                                                           ?patch_docs]
+                                                                                                         '[_iid doc])})
                                                             (lp/rewrite-plan))
                                                   wm-src tx-opts)
                               args (vr/rel-reader [(SingletonListReader.
@@ -534,7 +531,7 @@
                  (.writeObject false))
 
                (doto (.vectorFor doc-writer "passwd" (FieldType/nullable #xt.arrow/type :utf8))
-                 (.writeObject (authn/encrypt-pw password)))
+                 (.writeObject (authn.crypt/encrypt-pw password)))
 
                (.endStruct doc-writer)))))
 
@@ -554,11 +551,8 @@
       (indexOp [_ tx-op-idx]
         (util/with-open [^ArrowReader args-arrow-rdr (open-args-rdr allocator args-rdr tx-op-idx)]
           (let [query-str (.getObject query-rdr tx-op-idx)
-                compiled-query (sql/compile-query query-str {:table-info (scan/tables-with-cols wm-src)
-                                                             :arg-fields (some-> args-arrow-rdr
-                                                                                 .getVectorSchemaRoot
-                                                                                 .getSchema
-                                                                                 (.getFields))})
+                compiled-query (.planQuery q-src query-str wm-src
+                                           {:arg-fields (some-> args-arrow-rdr (.getVectorSchemaRoot) (.getSchema) (.getFields))})
                 param-count (:param-count (meta compiled-query))]
 
             (zmatch (r/vector-zip compiled-query)
@@ -587,9 +581,9 @@
                                (-> (query-indexer q-src wm-src erase-idxer inner-query tx-opts query-opts)
                                    (wrap-sql-args param-count)))
 
-              [:assert _query-opts inner-query]
+              [:assert query-opts inner-query]
               (foreach-arg-row args-arrow-rdr
-                               (-> (->assert-idxer q-src wm-src inner-query tx-opts)
+                               (-> (->assert-idxer q-src wm-src inner-query tx-opts query-opts)
                                    (wrap-sql-args param-count)))
 
               [:create-user user password]
@@ -691,7 +685,7 @@
                     wm-src (reify Watermark$Source
                              (openWatermark [_]
                                (util/with-close-on-catch [live-index-wm (.openWatermark live-idx-tx)]
-                                 (Watermark. nil live-index-wm
+                                 (Watermark. tx-key live-index-wm
                                              (li/->schema live-index-wm table-catalog)))))
 
                     tx-opts {:snapshot-time system-time
@@ -728,7 +722,7 @@
                                                                                                             "see the release notes for more information."])}))
                                                    "abort" (throw abort-exn))))
                              (catch xtdb.RuntimeException e e)
-                             (catch xtdb.IllegalArgumentException e e))]
+                             (catch IllegalArgumentException e e))]
 
                   (do
                     (when-not (= e abort-exn)

@@ -8,13 +8,12 @@
             [honey.sql :as hsql]
             [next.jdbc :as jdbc]
             [next.jdbc.result-set :as result-set]
-            [pg.core :as pg]
             [xtdb.api :as xt]
-            [xtdb.authn :as authn]
             [xtdb.logging :as logging]
             [xtdb.next.jdbc :as xt-jdbc]
             [xtdb.node :as xtn]
             [xtdb.pgwire :as pgwire]
+            [xtdb.pgwire.types :as pg-types]
             [xtdb.serde :as serde]
             [xtdb.test-util :as tu]
             [xtdb.time :as time]
@@ -24,21 +23,36 @@
            (java.net Socket)
            (java.nio ByteBuffer)
            (java.sql Array Connection PreparedStatement ResultSet SQLWarning Statement Timestamp Types)
-           (java.time Clock Instant LocalDate LocalDateTime OffsetDateTime ZoneId ZoneOffset)
-           (java.util Arrays Calendar List TimeZone UUID)
+           (java.time Clock Instant LocalDate LocalDateTime OffsetDateTime ZoneId ZoneOffset ZonedDateTime)
+           (java.util Arrays Calendar List TimeZone)
            (java.util.concurrent CountDownLatch TimeUnit)
-           (org.pg.codec CodecParams)
-           (org.pg.enums OID)
-           (org.pg.error PGErrorResponse)
-           (org.postgresql.util PGInterval PGobject PSQLException)
-           xtdb.JsonSerde
+           (org.postgresql.util PGobject PSQLException)
+           (xtdb JsonSerde)
+           (xtdb.api DataSource$ConnectionBuilder)
            xtdb.pgwire.Server))
 
 (set! *warn-on-reflection* false) ; gagh! lazy. don't do this.
 (set! *unchecked-math* false)
 
 (def ^:dynamic ^:private *port* nil)
-(def ^:dynamic ^:private *server* nil)
+(def ^:dynamic ^:private ^xtdb.api.DataSource *server* nil)
+
+(defn- in-system-tz ^java.time.ZonedDateTime [^ZonedDateTime zdt]
+  (.withZoneSameInstant zdt (ZoneId/systemDefault)))
+
+(defn- read-ex [^PSQLException e]
+  (let [sem (.getServerErrorMessage e)]
+    {:sql-state (.getSQLState e)
+     :message (.getMessage sem)
+     :detail (some-> (.getDetail sem)
+                     not-empty
+                     (serde/read-transit :json))}))
+
+(defmacro reading-ex [& body]
+  `(try
+     ~@body
+     (catch PSQLException e#
+       (read-ex e#))))
 
 (t/use-fixtures :once
 
@@ -64,48 +78,36 @@
 (defn serve
   (^xtdb.pgwire.Server [] (serve {}))
   (^xtdb.pgwire.Server [opts] (pgwire/serve tu/*node* (merge {:num-threads 1
-                                                              :authn authn/default-authn
-                                                              :allocator tu/*allocator*}
-                                                             opts
-                                                             {:drain-wait 250}))))
+                                                              :allocator tu/*allocator*
+                                                              :drain-wait 250}
+                                                             opts))))
 
-(defn- pg-config [params]
-  (merge {:host "localhost"
-          :port *port*
-          :user "xtdb"
-          :database "xtdb"}
-         params))
+(defn- jdbc-conn
+  (^Connection [] (jdbc-conn nil))
+  (^Connection [opts]
+   (-> ^DataSource$ConnectionBuilder
+       (reduce (fn [^DataSource$ConnectionBuilder cb [k v]]
+                 (.option cb k v))
 
-;; connect to the database
-(defn- pg-conn ^org.pg.Connection [params]
-  (pg/connect (pg-config params)))
+               (-> (.createConnectionBuilder *server*)
+                   (.user "xtdb")
+                   (.port *port*))
 
-(defn- jdbc-url [& opts]
-  (let [opts (-> (into {} (partitionv 2 opts))
-                 (update "user" (fnil identity "xtdb")))
-        param-str (when (seq opts) (str "?" (str/join "&" (for [[k v] opts] (str k "=" v)))))]
-    (format "jdbc:xtdb://localhost:%s/xtdb%s" *port* (or param-str ""))))
+               opts)
 
-(defn- jdbc-conn ^Connection [& params]
-  (jdbc/get-connection (apply jdbc-url params)))
+       (.build))))
 
 (defn- exec [^Connection conn ^String sql]
   (.execute (.createStatement conn) sql))
 
-(defn- stmt->warnings [^Statement stmt]
-  (loop [warn (.getWarnings stmt) res []]
-    (if-not warn
-      res
-      (recur (.getNextWarning warn) (conj res warn)))))
-
 (deftest connect-with-next-jdbc-test
-  (with-open [_ (jdbc/get-connection (jdbc-url))])
+  (with-open [_ (jdbc-conn)])
   ;; connect a second time to make sure we are releasing server resources properly!
-  (with-open [_ (jdbc/get-connection (jdbc-url))]))
+  (with-open [_ (jdbc-conn)]))
 
 (defn- try-sslmode [sslmode]
   (try
-    (with-open [_ (jdbc/get-connection (jdbc-url "sslmode" sslmode))])
+    (with-open [_ (jdbc-conn {"sslmode" sslmode})])
     :ok
     (catch PSQLException e
       (if (= "The server does not support SSL." (.getMessage e))
@@ -140,7 +142,7 @@
 
 (defn- try-gssencmode [gssencmode]
   (try
-    (with-open [_ (jdbc/get-connection (jdbc-url "gssEncMode" gssencmode))])
+    (with-open [_ (jdbc-conn {"gssEncMode" gssencmode})])
     :ok
     (catch PSQLException e
       (if (= "The server does not support GSS Encoding." (.getMessage e))
@@ -148,12 +150,9 @@
         (throw e)))))
 
 (deftest gssenc-test
-  (t/are [gssencmode expect]
-      (= expect (try-gssencmode gssencmode))
-
-    "disable" :ok
-    "prefer" :ok
-    "require" :unsupported))
+  (t/is (= :ok (try-gssencmode "disable")))
+  (t/is (= :ok (try-gssencmode "prefer")))
+  (t/is (= :unsupported (try-gssencmode "require"))))
 
 (deftest query-test
   (with-open [conn (jdbc-conn)
@@ -163,7 +162,7 @@
     (is (= false (.next rs)))))
 
 (deftest simple-query-test
-  (with-open [conn (jdbc-conn "preferQueryMode" "simple")
+  (with-open [conn (jdbc-conn {"preferQueryMode" "simple"})
               stmt (.createStatement conn)
               rs (.executeQuery stmt "SELECT a.a FROM (VALUES ('hello, world')) a (a)")]
     (is (= [{"a" "hello, world"}]
@@ -171,14 +170,14 @@
 
 ;;TODO ADD support for multiple statments in a single simple query
 #_(deftest mulitiple-statement-simple-query-test
-    (with-open [conn (jdbc-conn "preferQueryMode" "simple")
+    (with-open [conn (jdbc-conn {"preferQueryMode" "simple"})
                 stmt (.createStatement conn)
                 rs (.executeQuery stmt "SELECT a.a FROM (VALUES ('hello, world')) a (a)")]
       (is (= true (.next rs)))
       (is (= false (.next rs)))))
 
 (deftest prepared-query-test
-  (with-open [conn (jdbc-conn "prepareThreshold" "1")
+  (with-open [conn (jdbc-conn {"prepareThreshold" 1})
               stmt (.prepareStatement conn "SELECT a.a FROM (VALUES ('hello, world')) a (a)")
               stmt2 (.prepareStatement conn "SELECT a.a FROM (VALUES ('hello, world2')) a (a)")]
 
@@ -284,6 +283,7 @@
 
 (deftest json-representation-test
   (with-open [conn (jdbc-conn)]
+    (jdbc/execute! conn ["SET FALLBACK_OUTPUT_FORMAT = 'json'"])
     (doseq [{:keys [sql, clj, clj-pred]} json-representation-examples]
       (testing (str "SQL expression " sql " should parse to " clj)
         (with-open [stmt (.prepareStatement conn (format "SELECT a FROM (VALUES (%s), (ARRAY [])) a (a)" sql))]
@@ -292,12 +292,8 @@
             ;; one row in result set
             (.next rs)
 
-            (testing "record set contains expected object"
-              (is (instance? PGobject (.getObject rs 1)))
-              (is (= "json" (.getType ^PGobject (.getObject rs 1)))))
-
             (testing "json parses to expected clj value"
-              (let [clj-value (JsonSerde/decode (str (.getObject rs 1)))]
+              (let [clj-value (.getObject rs 1)]
                 (when clj
                   (is (= clj clj-value) "parsed value should = :clj"))
                 (when clj-pred
@@ -321,7 +317,7 @@
       (check-server-resources-freed server))))
 
 (defn q [conn sql]
-  (jdbc/execute! conn sql tu/jdbc-qopts))
+  (jdbc/execute! conn sql {:builder-fn xt-jdbc/builder-fn}))
 
 (defn q-seq [conn sql]
   (->> (jdbc/execute! conn sql {:builder-fn result-set/as-arrays})
@@ -388,7 +384,7 @@
 
 (deftest server-close-closes-idle-conns-test
   (with-open [^Server server (serve {:drain-wait 0})]
-    (binding [*port* (:port server)]
+    (binding [*server* server, *port* (:port server)]
       (with-open [_client-conn (jdbc-conn)
                   server-conn (get-last-conn server)]
         (.close server)
@@ -399,36 +395,35 @@
   ;; quick test for now to confirm canned response mechanism at least doesn't crash!
   ;; this may later be replaced by client driver tests (e.g test sqlalchemy connect & query)
   (with-redefs [pgwire/canned-responses [{:q "hello!"
-                                          :cols [{:column-name "greet", :column-oid @#'pgwire/oid-json}]
+                                          :cols [{:column-name "greet",
+                                                  :column-oid (get-in pg-types/pg-types [:json :oid])}]
                                           :rows (fn [_] [["\"hey!\""]])}]]
     (with-open [conn (jdbc-conn)]
       (is (= [{:greet "hey!"}] (q conn ["hello!"]))))))
 
 (deftest concurrent-conns-test
   (with-open [server (serve {:num-threads 2})]
-    (binding [*port* (:port server)]
-      (let [results (atom [])
-            spawn (fn spawn []
-                    (future
-                      (with-open [conn (jdbc-conn)]
-                        (swap! results conj (ping conn)))))
-            futs (vec (repeatedly 10 spawn))]
+    (let [results (atom [])
+          spawn (fn spawn []
+                  (future
+                    (with-open [conn (jdbc-conn)]
+                      (swap! results conj (ping conn)))))
+          futs (vec (repeatedly 10 spawn))]
 
-        (is (every? #(not= :timeout (deref % 500 :timeout)) futs))
-        (is (= 10 (count @results)))
+      (is (every? #(not= :timeout (deref % 500 :timeout)) futs))
+      (is (= 10 (count @results)))
 
-        (.close server)
-        (check-server-resources-freed server)))))
+      (.close server)
+      (check-server-resources-freed server))))
 
 (deftest concurrent-conns-close-midway-test
   (with-open [server (serve {:num-threads 2 :accept-so-timeout 10})]
-    (binding [*port* (:port server)]
+    (binding [*server* server, *port* (:port server)]
       (logging/with-log-level 'xtdb.pgwire :off
         (let [spawn (fn spawn [i]
                       (future
                         (try
-                          (with-open [conn (jdbc-conn "loginTimeout" "1"
-                                                      "socketTimeout" "1")]
+                          (with-open [conn (jdbc-conn {"loginTimeout" 1, "socketTimeout" 1})]
                             (loop [query-til (+ (System/currentTimeMillis)
                                                 (* i 1000))]
                               (ping conn)
@@ -483,21 +478,24 @@
 ;;TODO no current support for cancelling queries
 
 (deftest jdbc-prepared-query-close-test
-  (with-open [conn (jdbc-conn "prepareThreshold" "1"
-                              "preparedStatementCacheQueries" 0
-                              "preparedStatementCacheMiB" 0)]
-    (dotimes [i 3]
+  (with-open [conn (jdbc-conn {"prepareThreshold" 1
+                               "preparedStatementCacheQueries" 0
+                               "preparedStatementCacheMiB" 0})]
+    ;; the Driver now creates a couple of statements.
+    ;; we do close this, but the PG driver appears to retain it
+    (t/is (= #{"", "S_1" "S_2"} (set (keys (:prepared-statements @(:conn-state (get-last-conn)))))))
 
+    (dotimes [i 3]
       (with-open [stmt (.prepareStatement conn (format "SELECT a.a FROM (VALUES (%s)) a (a)" i))]
         (.executeQuery stmt)))
 
-    (testing "no portal should remain, they are closed by sync, explicit close or rebinding the unamed portal"
-      (is (empty? (:portals @(:conn-state (get-last-conn))))))
+    (t/testing "no portal should remain, they are closed by sync, explicit close or rebinding the unnamed portal"
+      (t/is (empty? (:portals @(:conn-state (get-last-conn))))))
 
-    (testing "the last statement should still exist as they last the duration of the session and are only closed by
-              an explicit close message, which the pg driver sends between execs"
-      ;; S_3 because i == 3
-      (is (= #{"", "S_3"} (set (keys (:prepared-statements @(:conn-state (get-last-conn))))))))))
+    (t/testing "the last statement should still exist as they last the duration of the session and are only closed by
+                an explicit close message, which the pg driver sends between execs"
+      ;; S_5 because initial qs, then i == 3
+      (t/is (= #{"", "S_1" "S_2" "S_5"} (set (keys (:prepared-statements @(:conn-state (get-last-conn))))))))))
 
 (defn psql-available?
   "Returns true if psql is available in $PATH"
@@ -507,33 +505,35 @@
 (defn psql-session
   "Takes a function of two args (send, read).
 
-  Send puts a string in to psql stdin, reads the next string from psql stdout. You can use (read :err) if you wish to read from stderr instead."
+  Send puts a string in to psql stdin, reads the next string from psql stdout. You can use (read :stderr) if you wish to read from stderr instead."
   [f]
   ;; there are other ways to do this, but its a straightforward factoring that removes some boilerplate for now.
   (let [^List argv ["psql" "-h" "localhost" "-p" (str *port*) "--csv" "xtdb"]
         pb (ProcessBuilder. argv)
         p (.start pb)
-        in (.getInputStream p)
-        err (.getErrorStream p)
-        out (.getOutputStream p)
+        stdout (.getInputStream p)
+        stderr (.getErrorStream p)
+        stdin (.getOutputStream p)
 
         send
         (fn [^String s]
-          (.write out (.getBytes s "utf-8"))
-          (.flush out))
+          (.write stdin (.getBytes s "utf-8"))
+          (.flush stdin))
 
         read
         (fn read
-          ([] (read in))
+          ([] (read :stdout))
           ([stream]
-           (let [^InputStream stream (case stream :err err stream)]
+           (let [^InputStream in (case stream :stderr stderr :stdout stdout stream)]
              (loop [wait-until (+ (System/currentTimeMillis) 1000)]
-               (or (when (pos? (.available stream))
-                     (let [barr (byte-array (.available stream))]
-                       (.read stream barr)
+               (or (when (pos? (.available in))
+                     (let [barr (byte-array (.available in))]
+                       (.read in barr)
                        (let [read-str (String. barr)]
-                         (when-not (str/starts-with? read-str "Null display is")
-                           (csv/read-csv read-str)))))
+                         (case stream
+                           :stderr (str/split-lines read-str)
+                           :stdout (when-not (str/starts-with? read-str "Null display is")
+                                     (csv/read-csv read-str))))))
 
                    (when (< wait-until (System/currentTimeMillis))
                      :timeout)
@@ -548,9 +548,9 @@
         (is (.waitFor p 1000 TimeUnit/MILLISECONDS))
         (is (#{143, 0} (.exitValue p)))
 
-        (util/try-close in)
-        (util/try-close out)
-        (util/try-close err)))))
+        (util/try-close stdin)
+        (util/try-close stdin)
+        (util/try-close stderr)))))
 
 ;; define psql tests if psql is available on path
 ;; (will probably move to a selector)
@@ -574,7 +574,7 @@
   (with-open [node (xtn/start-node {:server {:ssl {:keystore (io/file (io/resource "xtdb/pgwire/xtdb.jks"))
                                                    :keystore-password "password123"}}})]
     (binding [*port* (.getServerPort node)]
-      (with-open [conn (jdbc/get-connection (jdbc-url "sslmode" "require"))]
+      (with-open [conn (jdbc-conn {"sslmode" "require"})]
         (jdbc/execute! conn ["INSERT INTO foo (_id) VALUES (1)"])
         (t/is (= [{:xt/id 1}]
                  (q conn ["SELECT * FROM foo"]))))
@@ -608,8 +608,8 @@
        (testing "error during plan"
          (with-redefs [clojure.tools.logging/logf (constantly nil)]
            (send "slect baz.a from baz;\n")
-           (is (str/includes? (->> (read :err) (map str/join) (str/join "\n"))
-                              "line 1:0 mismatched input 'slect' expecting")))
+           (is (-> (second (read :stderr))
+                   (str/includes? "line 1:0 mismatched input 'slect' expecting"))))
 
          (testing "query error allows session to continue"
            (send "select 'ping';\n")
@@ -618,7 +618,9 @@
        (testing "error during query execution"
          (with-redefs [clojure.tools.logging/logf (constantly nil)]
            (send "select (1 / 0) from (values (42)) a (a);\n")
-           (is (= [["ERROR:  data exception - division by zero"]] (read :err))))
+           (is (= ["ERROR:  data exception - division by zero"
+                   "DETAIL:  {\"error-key\":\"xtdb.expression\\/division-by-zero\",\"message\":\"data exception - division by zero\"}"]
+                  (read :stderr))))
 
          (testing "query error allows session to continue"
            (send "select 'ping';\n")
@@ -629,7 +631,9 @@
      (fn [send read]
        (testing "error query"
          (send "INSERT INTO foo (id, a) VALUES (1, 2);\n")
-         (is (= [["ERROR:  Illegal argument: 'missing-id'"]] (read :err)))
+         (is (= ["ERROR:  Illegal argument: 'missing-id'"
+                 "DETAIL:  {\"doc\":{\"id\":1,\"a\":2},\"error-key\":\"missing-id\",\"message\":\"Illegal argument: 'missing-id'\"}"]
+                (read :stderr)))
          ;; to drain the standard stream
          (read))
 
@@ -698,9 +702,6 @@
 
 (defn- session-variables [server-conn ks]
   (-> server-conn :conn-state deref :session (select-keys ks)))
-
-(defn- next-transaction-variables [server-conn ks]
-  (-> server-conn :conn-state deref :session :next-transaction (select-keys ks)))
 
 (deftest session-access-mode-default-test
   (with-open [_ (jdbc-conn)]
@@ -776,16 +777,15 @@
     (is (= [{:a "hello, world"}] (q conn ["SELECT a FROM foo where _id = 42"])))))
 
 (deftest test-current-time
-  ;; no support for setting current-time so need to interact with clock directly
-  (let [custom-clock (Clock/fixed (Instant/parse "2000-08-16T11:08:03Z") (ZoneId/of "GMT"))]
-
+  (let [custom-clock (Clock/fixed (Instant/parse "2000-08-16T11:08:03Z") (ZoneId/of "Z"))]
     (swap! (:server-state *server*) assoc :clock custom-clock)
 
     (with-open [conn (jdbc-conn)]
 
-      (let [current-time #(get (first (rs->maps (.executeQuery (.createStatement %) "SELECT CURRENT_TIMESTAMP ct"))) "ct")]
+      (letfn [(current-time [conn]
+                (:ct (jdbc/execute-one! conn ["SELECT CURRENT_TIMESTAMP ct"])))]
 
-        (t/is (= #inst "2000-08-16T11:08:03.000000000-00:00" (current-time conn)))
+        (t/is (= (-> #xt/zdt "2000-08-16T12:08:03+01:00" in-system-tz) (current-time conn)))
 
         (testing "current ts instant is pinned during a tx, regardless of what happens to the session clock"
 
@@ -793,7 +793,7 @@
             (swap! conn-state assoc-in [:session :clock] (Clock/fixed Instant/EPOCH ZoneOffset/UTC)))
 
           (jdbc/with-transaction [tx conn]
-            (let [epoch #inst "1970-01-01T00:00:00.000000000-00:00"]
+            (let [epoch #xt/zdt "1970-01-01Z"]
               (t/is (= epoch (current-time tx)))
               (Thread/sleep 10)
               (t/is (= epoch (current-time tx)))
@@ -805,51 +805,55 @@
 
 (deftest test-timezone
   (with-open [conn (jdbc-conn)]
-    (let [q-tz #(get (first (rs->maps (.executeQuery (.createStatement %) "SHOW TIMEZONE"))) "timezone")
-          exec #(.execute (.createStatement %1) %2)
-          default-tz (str (.getZone (Clock/systemDefaultZone)))]
+    (letfn [(q-tz [conn]
+              (:timezone (jdbc/execute-one! conn ["SHOW TIME ZONE"])))]
+      (let [default-tz (str (.getZone (Clock/systemDefaultZone)))]
 
-      (t/testing "expect server timezone"
-        (t/is (= default-tz (q-tz conn))))
+        (t/testing "expect server timezone"
+          (t/is (= default-tz (q-tz conn))))
 
-      (t/testing "utc"
-        (exec conn "SET TIME ZONE '+00:00'")
-        (t/is (= "Z" (q-tz conn))))
+        (t/testing "utc"
+          (jdbc/execute! conn ["SET TIME ZONE '+00:00'"])
+          (t/is (= "Z" (q-tz conn))))
 
-      (t/testing "random tz"
-        (exec conn "SET TIME ZONE '+07:44'")
-        (t/is (= "+07:44" (q-tz conn))))
+        (t/testing "param"
+          (jdbc/execute! conn ["SET TIME ZONE ?" "Europe/London"])
+          (t/is (= "Europe/London" (q-tz conn))))
 
-      (t/testing "tz is session scoped"
-        (with-open [conn2 (jdbc-conn)]
+        (t/testing "random tz"
+          (exec conn "SET TIME ZONE '+07:44'")
+          (t/is (= "+07:44" (q-tz conn))))
 
-          (t/is (= default-tz (q-tz conn2)))
-          (t/is (= "+07:44" (q-tz conn)))
+        (t/testing "tz is session scoped"
+          (with-open [conn2 (jdbc-conn)]
 
-          (exec conn2 "SET TIME ZONE '-00:01'")
+            (t/is (= default-tz (q-tz conn2)))
+            (t/is (= "+07:44" (q-tz conn)))
 
-          (t/is (= "-00:01" (q-tz conn2)))
-          (t/is (= "+07:44" (q-tz conn)))))
+            (exec conn2 "SET TIME ZONE '-00:01'")
 
-      (jdbc/with-transaction [tx conn]
+            (t/is (= "-00:01" (q-tz conn2)))
+            (t/is (= "+07:44" (q-tz conn)))))
 
-        (t/testing "in a transaction, inherits session tz"
-          (t/is (= "+07:44" (q-tz tx))))
+        (jdbc/with-transaction [tx conn]
 
-        (t/testing "tz can be modified in a transaction"
-          (exec tx "SET TIME ZONE 'Asia/Tokyo'")
-          (t/is (= "Asia/Tokyo" (q-tz tx)))))
+          (t/testing "in a transaction, inherits session tz"
+            (t/is (= "+07:44" (q-tz tx))))
 
-      (testing "SET is a session operator, so the tz still applied to the session"
-        (t/is (= "Asia/Tokyo" (q-tz conn)))))))
+          (t/testing "tz can be modified in a transaction"
+            (exec tx "SET TIME ZONE 'Asia/Tokyo'")
+            (t/is (= "Asia/Tokyo" (q-tz tx)))))
+
+        (testing "SET is a session operator, so the tz still applied to the session"
+          (t/is (= "Asia/Tokyo" (q-tz conn))))))))
 
 (deftest pg-begin-unsupported-syntax-error-test
-  (with-open [conn (jdbc-conn "autocommit" "false")]
+  (with-open [conn (jdbc-conn {"autocommit" "false"})]
     (is (thrown-with-msg? PSQLException #"line 1:6 mismatched input 'not'" (q conn ["BEGIN not valid sql!"])))
     (is (thrown-with-msg? PSQLException #"line 1:6 extraneous input 'SERIALIZABLE'" (q conn ["BEGIN SERIALIZABLE"])))))
 
 (deftest begin-with-access-mode-test
-  (with-open [conn (jdbc-conn "autocommit" "false")]
+  (with-open [conn (jdbc-conn {"autocommit" "false"})]
     (testing "DML enabled with BEGIN READ WRITE"
       (q conn ["BEGIN READ WRITE"])
       (q conn ["INSERT INTO foo (_id) VALUES (42)"])
@@ -862,7 +866,7 @@
       (q conn ["ROLLBACK"]))))
 
 (deftest start-transaction-test
-  (with-open [conn (jdbc-conn "autocommit" "false")]
+  (with-open [conn (jdbc-conn {"autocommit" "false"})]
     (let [sql #(q conn [%])]
 
       (sql "START TRANSACTION READ ONLY")
@@ -898,7 +902,7 @@
         (is (= #{{:xt/id 42} {:xt/id 43}} (set (q conn ["SELECT _id from foo"]))))))))
 
 (deftest set-session-characteristics-test
-  (with-open [conn (jdbc-conn "autocommit" "false")]
+  (with-open [conn (jdbc-conn {"autocommit" "false"})]
     (let [sql #(q conn [%])]
       (sql "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE")
       (sql "START TRANSACTION")
@@ -924,7 +928,7 @@
       (sql "COMMIT")
 
       (is (= [{:version 0,
-               :xt/valid-from #inst "2020-01-01T00:00:00.000000000-00:00"}]
+               :xt/valid-from #xt/zdt "2020-01-01Z[UTC]"}]
              (q conn ["SELECT version, _valid_from, _valid_to FROM foo"])))
 
       (sql "START TRANSACTION READ WRITE")
@@ -932,19 +936,19 @@
       (sql "COMMIT")
 
       (is (= [{:version 1,
-               :xt/valid-from #inst "2020-01-02T00:00:00.000000000-00:00"}]
+               :xt/valid-from #xt/zdt "2020-01-02Z[UTC]"}]
              (q conn ["SELECT version, _valid_from, _valid_to FROM foo"])))
 
       (is (= [{:version 0,
-               :xt/valid-from #inst "2020-01-01T00:00:00.000000000-00:00",
-               :xt/valid-to #inst "2020-01-02T00:00:00.000000000-00:00"}
+               :xt/valid-from #xt/zdt "2020-01-01Z[UTC]",
+               :xt/valid-to #xt/zdt "2020-01-02Z[UTC]"}
               {:version 1,
-               :xt/valid-from #inst "2020-01-02T00:00:00.000000000-00:00"}]
+               :xt/valid-from #xt/zdt "2020-01-02Z[UTC]"}]
              (q conn ["SETTING DEFAULT VALID_TIME ALL
                        SELECT version, _valid_from, _valid_to FROM foo ORDER BY version"])))
 
       (is (= [{:version 1,
-               :xt/valid-from #inst "2020-01-02T00:00:00.000000000-00:00"}]
+               :xt/valid-from #xt/zdt "2020-01-02Z[UTC]"}]
              (q conn ["SELECT version, _valid_from, _valid_to FROM foo"])))
 
       (sql "START TRANSACTION READ WRITE")
@@ -952,46 +956,73 @@
       (sql "COMMIT")
 
       (is (= [{:version 2,
-               :xt/valid-from #inst "2020-01-02T00:00:00.000000000-00:00"}]
+               :xt/valid-from #xt/zdt "2020-01-02Z[UTC]"}]
              (q conn ["SELECT version, _valid_from, _valid_to FROM foo"])))
 
       (is (= [{:version 2,
-               :xt/valid-from #inst "2020-01-01T00:00:00.000000000-00:00",
-               :xt/valid-to #inst "2020-01-02T00:00:00.000000000-00:00"}
+               :xt/valid-from #xt/zdt "2020-01-01Z[UTC]",
+               :xt/valid-to #xt/zdt "2020-01-02Z[UTC]"}
               {:version 2,
-               :xt/valid-from #inst "2020-01-02T00:00:00.000000000-00:00"}]
+               :xt/valid-from #xt/zdt "2020-01-02Z[UTC]"}]
              (q conn ["SETTING DEFAULT VALID_TIME ALL
                        SELECT version, _valid_from, _valid_to FROM foo"])))
 
       (is (= [{:version 2,
-               :xt/valid-from #inst "2020-01-02T00:00:00.000000000-00:00"}]
+               :xt/valid-from #xt/zdt "2020-01-02Z[UTC]"}]
              (q conn ["SETTING DEFAULT VALID_TIME AS OF NOW SELECT version, _valid_from, _valid_to FROM foo"]))))))
 
 (t/deftest test-setting-basis-current-time-3505
   (with-open [conn (jdbc-conn)]
-    (is (= [{:ts #inst "2020-01-01"}]
-           (q conn ["SETTING CLOCK_TIME = TIMESTAMP '2020-01-01T00:00:00Z'
+    (is (= [{:ts (-> #xt/zdt "2020-01-01Z[UTC]" in-system-tz)}]
+           (q conn ["SETTING CLOCK_TIME = '2020-01-01Z'
                      SELECT CURRENT_TIMESTAMP AS ts"])))
 
     (q conn ["INSERT INTO foo (_id, version) VALUES ('foo', 0)"])
 
-    (is (= [{:version 0,
-             :xt/valid-from #inst "2020-01-01T00:00:00.000000000-00:00"}]
+    (is (= [{:version 0, :xt/valid-from #xt/zdt "2020-01-01Z[UTC]"}]
            (q conn ["SELECT version, _valid_from, _valid_to FROM foo"])))
+
+    (t/is (= {:sql-state "0B000",
+             :message "snapshot-time (2024-01-01T00:00:00Z) is after the latest completed tx (#xt/tx-key {:tx-id 0, :system-time #xt/instant \"2020-01-01T00:00:00Z\"})",
+             :detail #xt/illegal-arg [:xtdb/unindexed-tx
+                                      "snapshot-time (2024-01-01T00:00:00Z) is after the latest completed tx (#xt/tx-key {:tx-id 0, :system-time #xt/instant \"2020-01-01T00:00:00Z\"})"
+                                      {:latest-completed-tx #xt/tx-key {:tx-id 0, :system-time #xt/instant "2020-01-01T00:00:00Z"},
+                                       :snapshot-time #xt/instant "2024-01-01T00:00:00Z"}]}
+             (reading-ex
+               (q conn ["SETTING SNAPSHOT_TIME = '2024-01-01Z'
+                         SELECT CURRENT_TIMESTAMP FROM foo"]))))
 
     (q conn ["UPDATE foo SET version = 1 WHERE _id = 'foo'"])
 
     (is (= [{:version 1
-             :xt/valid-from #inst "2020-01-02T00:00:00.000000000-00:00"}]
+             :xt/valid-from #xt/zdt "2020-01-02Z[UTC]"}]
            (q conn ["SELECT version, _valid_from, _valid_to FROM foo"])))
 
     (is (= [{:version 0
-             :xt/valid-from #inst "2020-01-01T00:00:00.000000000-00:00"
-             :ts #inst "2024-01-01"}]
-           (q conn ["SETTING SNAPSHOT_TIME = TIMESTAMP '2020-01-01T00:00:00Z',
-                             CLOCK_TIME = TIMESTAMP '2024-01-01T00:00:00Z'
+             :xt/valid-from #xt/zdt "2020-01-01Z[UTC]"
+             :ts (-> #xt/zdt "2024-01-01Z[UTC]" in-system-tz)}]
+           (q conn ["SETTING SNAPSHOT_TIME = '2020-01-01Z',
+                             CLOCK_TIME = '2024-01-01Z'
                      SELECT version, _valid_from, _valid_to, CURRENT_TIMESTAMP ts FROM foo"]))
         "both snapshot and current time")
+
+    (q conn ["SET TIME ZONE 'UTC'"])
+
+    (is (= [{:version 0
+             :xt/valid-from #xt/zdt "2020-01-01Z[UTC]"
+             :ts #xt/zdt "2024-01-01Z[UTC]"}]
+           (q conn ["SETTING SNAPSHOT_TIME = ?, CLOCK_TIME = ?
+                     SELECT version, _valid_from, _valid_to, CURRENT_TIMESTAMP ts FROM foo"
+                    #xt/zdt "2020-01-01Z[UTC]" #xt/zdt "2024-01-01Z[UTC]"]))
+        "both snapshot and current time, params")
+
+    (is (= [{:version 0
+             :xt/valid-from #xt/zdt "2020-01-01Z[UTC]"
+             :ts #xt/zdt "2024-01-01Z[UTC]"}]
+           (q conn ["SETTING SNAPSHOT_TIME = TIMESTAMP '2020-01-01Z', CLOCK_TIME = ?
+                     SELECT version, _valid_from, _valid_to, CURRENT_TIMESTAMP ts FROM foo WHERE _id = ?"
+                    #xt/zdt "2024-01-01Z[UTC]", "foo"]))
+        "gets correct param order")
 
     (q conn ["UPDATE foo SET version = 2 WHERE _id = 'foo'"])
 
@@ -1001,22 +1032,22 @@
     (t/testing "for system-time cannot override snapshot"
       (exec conn "SET TIME ZONE 'UTC'")
       (is (= [{:version 0}]
-             (q conn ["SETTING SNAPSHOT_TIME = TIMESTAMP '2020-01-01T00:00:00Z'
-                     SELECT version FROM foo FOR SYSTEM_TIME AS OF TIMESTAMP '2020-01-02T00:00:00Z'"]))
+             (q conn ["SETTING SNAPSHOT_TIME = TIMESTAMP '2020-01-01Z'
+                     SELECT version FROM foo FOR SYSTEM_TIME AS OF TIMESTAMP '2020-01-02Z'"]))
           "timestamp-tz")
 
       (is (= [{:version 0}]
              (q conn ["SETTING SNAPSHOT_TIME = TIMESTAMP '2020-01-01T00:00:00'
-                     SELECT version FROM foo FOR SYSTEM_TIME AS OF TIMESTAMP '2020-01-02T00:00:00Z'"]))
+                     SELECT version FROM foo FOR SYSTEM_TIME AS OF TIMESTAMP '2020-01-02Z'"]))
           "timestamp-local")
 
       (is (= [{:version 0}]
              (q conn ["SETTING SNAPSHOT_TIME = DATE '2020-01-01'
-                     SELECT version FROM foo FOR SYSTEM_TIME AS OF TIMESTAMP '2020-01-02T00:00:00Z'"]))
+                     SELECT version FROM foo FOR SYSTEM_TIME AS OF TIMESTAMP '2020-01-02Z'"]))
           "date - #4034"))
 
     (is (= [{:version 1}]
-           (q conn ["SELECT version FROM foo FOR SYSTEM_TIME AS OF TIMESTAMP '2020-01-02T00:00:00Z'"]))
+           (q conn ["SELECT version FROM foo FOR SYSTEM_TIME AS OF TIMESTAMP '2020-01-02Z'"]))
         "version would have been 1 if snapshot was not set")))
 
 (t/deftest test-setting-import-system-time-3616
@@ -1029,22 +1060,22 @@
         (sql "COMMIT")
 
         (is (= [{:version 0,
-                 :xt/system-from #inst "2021-07-31T23:00:00.000000000-00:00"}]
+                 :xt/system-from #xt/zdt "2021-07-31T23:00:00Z[UTC]"}]
                (q conn ["SELECT version, _system_from FROM foo"]))))
 
       (t/testing "with BEGIN"
-        (sql "BEGIN READ WRITE WITH (SYSTEM_TIME = TIMESTAMP '2021-08-03T00:00:00')")
+        (sql "BEGIN READ WRITE WITH (SYSTEM_TIME = '2021-08-03T00:00:00')")
         (sql "INSERT INTO foo (_id, version) VALUES ('foo', 1)")
         (sql "COMMIT")
 
         (is (= [{:version 0,
-                 :xt/system-from #inst "2021-07-31T23:00:00.000000000-00:00"}
+                 :xt/system-from #xt/zdt "2021-07-31T23:00:00Z[UTC]"}
                 {:version 1,
-                 :xt/system-from #inst "2021-08-02T23:00:00.000000000-00:00"}]
+                 :xt/system-from #xt/zdt "2021-08-02T23:00:00Z[UTC]"}]
                (q conn ["SELECT version, _system_from FROM foo FOR ALL VALID_TIME ORDER BY version"]))))
 
       (t/testing "past system time"
-        (sql "BEGIN READ WRITE WITH (SYSTEM_TIME TIMESTAMP '2021-08-02T00:00:00Z')")
+        (q conn ["BEGIN READ WRITE WITH (SYSTEM_TIME ?)" "2021-08-02Z"])
         (sql "INSERT INTO foo (_id, version) VALUES ('foo', 2)")
         (t/is (thrown-with-msg? PSQLException #"specified system-time older than current tx"
                                 (sql "COMMIT")))))))
@@ -1052,7 +1083,7 @@
 ;; this demonstrates that session / set variables do not change the next statement
 ;; its undefined - but we can say what it is _not_.
 (deftest implicit-transaction-stop-gap-test
-  (with-open [conn (jdbc-conn "autocommit" "false")]
+  (with-open [conn (jdbc-conn {"autocommit" "false"})]
     (let [sql #(q conn [%])]
 
       (testing "read only"
@@ -1094,7 +1125,7 @@
     (psql-session
      (fn [send read]
        (send "SLECT 1 FROM foo;\n")
-       (let [s (read :err)]
+       (let [s (read :stderr)]
          (is (not= :timeout s))
          (is (str/includes? (->> s (map str/join) (str/join "\n"))
                             "line 1:0 mismatched input 'SLECT' expecting")))
@@ -1107,9 +1138,10 @@
        (read)
 
        (send "COMMIT;\n")
-       (let [error (read :err)]
+       (let [error (read :stderr)]
          (is (not= :timeout error))
-         (is (= [["ERROR:  Illegal argument: 'missing-id'"]] error)))
+         (is (= "ERROR:  Illegal argument: 'missing-id'"
+                (first error))))
 
        (send "ROLLBACK;\n")
        (let [s (read)]
@@ -1157,11 +1189,11 @@
 ;; List of types/oids that support binary format
 
 (deftest test-postgres-types
-  (with-open [conn (jdbc-conn "prepareThreshold" 1 "binaryTransfer" false)]
+  (with-open [conn (jdbc-conn {"prepareThreshold" 1 "binaryTransfer" false})]
     (q-seq conn ["INSERT INTO foo(_id, int8, int4, int2, float8 , var_char, bool) VALUES (?, ?, ?, ?, ?, ?, ?)"
                  #uuid "9e8b41a0-723f-4e6b-babb-c4e6afd17ef2" Long/MIN_VALUE Integer/MAX_VALUE Short/MIN_VALUE Double/MAX_VALUE "aa" true]))
   ;; no float4 for text format due to a bug in pgjdbc where it sends it as a float8 causing a union type.
-  (with-open [conn (jdbc-conn "prepareThreshold" 1 "binaryTransfer" true)]
+  (with-open [conn (jdbc-conn {"prepareThreshold" 1 "binaryTransfer" true})]
     (q-seq conn ["INSERT INTO foo(_id, int8, int4, int2, float8, float4, var_char, bool) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
                  #uuid "7dd2ed62-bb05-43c8-b289-5503d9b19ee6" Long/MAX_VALUE Integer/MIN_VALUE Short/MAX_VALUE Double/MIN_VALUE Float/MAX_VALUE "bb" false])
     ;;binary format is only requested for server side preparedStatements in pgjdbc
@@ -1219,20 +1251,9 @@
               {:xt/id 0, :a 1, :b 2}]
              (q conn ["SELECT _id, (json).a, (json).b, (json).c, (json).c.d FROM foo"])))
 
-    ;; we don't currently support JSON as a _query_ param-type, because we have to prepare the statement
-    ;; without the dynamic arg values, and we can't know the type of the JSON arg until we see the value
-    (t/is (thrown-with-msg? PSQLException
-                            #"ERROR: Unsupported param-types in query: \[\"json\"\]"
-                            (q conn ["SELECT * FROM foo WHERE json = ?"
-                                     (as-json-param {:a 2, :c {:d 3}})])))))
-
-(deftest txs-error-as-json-3866
-  (with-open [conn (pg-conn {})]
-    (is (thrown-with-msg? PGErrorResponse
-                          #"code=08P01, message=Cannot put documents with columns: #\{\"_system_time\"\}"
-                          (pg/execute conn "INSERT INTO docs (_id, _system_time) VALUES (1, DATE '2020-01-01')")))
-    (testing "xt.txs.error column renders as json without errors"
-      (pg/execute conn "SELECT * FROM xt.txs"))))
+    (t/is (= [{:json {:a 2, :c {:d 3}}}]
+             (q conn ["SELECT ? json"
+                      (as-json-param {:a 2, :c {:d 3}})])))))
 
 (deftest test-odbc-queries
   (with-open [conn (jdbc-conn)]
@@ -1266,13 +1287,13 @@
              (q conn ["SELECT COUNT(*) row_count FROM foo"])))
 
     (t/is (= [{:xt/id 2, :committed false,
-               :error {:error-key "xtdb/assert-failed", :message "Assert failed"}}
+               :error #xt/runtime-err [:xtdb/assert-failed "Assert failed" {}]}
               {:xt/id 1, :committed true}
               {:xt/id 0, :committed true}]
              (q conn ["SELECT * EXCLUDE system_time FROM xt.txs"])))))
 
 (deftest test-untyped-null-type
-  (with-open [conn (jdbc-conn "prepareThreshold" -1)
+  (with-open [conn (jdbc-conn {"prepareThreshold" -1})
               stmt (.prepareStatement conn "SELECT ?")]
 
     (t/testing "untyped null param"
@@ -1298,7 +1319,7 @@
         (t/is (= [{"_column_1" 4}] (rs->maps rs)))))))
 
 (deftest test-typed-null-type
-  (with-open [conn (jdbc-conn "prepareThreshold" -1)
+  (with-open [conn (jdbc-conn {"prepareThreshold" -1})
               stmt (.prepareStatement conn "SELECT ?")]
 
     (t/testing "typed null param"
@@ -1320,7 +1341,7 @@
         (t/is (= [{"_column_1" nil}] (rs->maps rs)))))))
 
 (deftest test-prepared-statements-with-unknown-params
-  (with-open [conn (jdbc-conn "prepareThreshold" -1)
+  (with-open [conn (jdbc-conn {"prepareThreshold" -1})
               stmt (.prepareStatement conn "SELECT ?")]
 
     (t/testing "unknown param types are assumed to be of type text"
@@ -1338,12 +1359,40 @@
         (t/is (= [{"_column_1" "uuid"}] (result-metadata stmt) (result-metadata rs)))
         (t/is (= [{"_column_1" #uuid "7dd2ed62-bb05-43c8-b289-5503d9b19ee6"}] (rs->maps rs)))))))
 
+(t/deftest test-transit-params-4455
+  (with-open [conn (jdbc-conn {"prepareThreshold" 0})]
+    (with-open [stmt (.prepareStatement conn "SELECT ? vec")]
+      (.setObject stmt 1 [{:a 1, :b 2}, {:a 3, :b 4}])
+      (t/is (= ["transit"] (param-metadata stmt)))
+      (t/is (= [{"vec" "transit"}] (result-metadata stmt)))
+
+      (t/is (= [{:vec [{"a" 1, "b" 2} {"a" 3, "b" 4}]}]
+               (vec (resultset-seq (.executeQuery stmt)))))
+
+      (.setObject stmt 1 [{:a "foo"} {:a "bar"}])
+      (t/is (= [{:vec [{"a" "foo"} {"a" "bar"}]}]
+               (vec (resultset-seq (.executeQuery stmt))))
+            "re-run with different type for `a` (although overall param still transit)"))
+
+    (t/is (= [{:vec [{:a 1, :b 2} {:a 3, :b 4}]}]
+             (jdbc/execute! conn ["SELECT ? vec" [{:a 1, :b 2} {:a 3, :b 4}]]
+                            {:builder-fn xt-jdbc/builder-fn}))
+          "transit param in query")
+
+    (t/is (= [{:a 1}]
+             (jdbc/execute! conn ["SELECT (?[1]).a a" [{:a 1, :b 2} {:a 3, :b 4}]]
+                            {:builder-fn xt-jdbc/builder-fn}))
+          "transit param in query")
+
+    (t/is (= [{:a "foo"}]
+             (jdbc/execute! conn ["SELECT (?[1]).a a" [{:a "foo"} {:a "bar"}]]
+                            {:builder-fn xt-jdbc/builder-fn}))
+          "re-run with different type (still transit though)")))
+
 (deftest test-prepared-statments
-  (with-open [conn (jdbc-conn "prepareThreshold" -1)]
+  (with-open [conn (jdbc-conn {"prepareThreshold" -1})]
     (.execute (.prepareStatement conn "INSERT INTO foo(_id, a, b) VALUES (1, 'one', 2)"))
     (with-open [stmt (.prepareStatement conn "SELECT foo.*, ? FROM foo")]
-
-
       (t/testing "server side prepared statments where param types are known"
 
         (.setObject stmt 1 true Types/BOOLEAN)
@@ -1353,7 +1402,6 @@
           (t/is (= [{"_id" "int8"} {"a" "text"} {"b" "int8"} {"_column_2" "bool"}]
                    (result-metadata stmt)
                    (result-metadata rs)))
-
 
           (t/is (=
                  [{"_id" 1, "a" "one", "b" 2, "_column_2" true}]
@@ -1387,7 +1435,7 @@
                (with-open [_rs (.executeQuery stmt)])))))))
 
 (deftest test-nulls-in-monomorphic-types
-  (with-open [conn (jdbc-conn "prepareThreshold" -1)]
+  (with-open [conn (jdbc-conn {"prepareThreshold" -1})]
     (.execute (.prepareStatement conn "INSERT INTO foo(_id, a) VALUES (1, NULL), (2, 22.2)"))
     (with-open [stmt (.prepareStatement conn "SELECT a FROM foo ORDER BY _id")]
 
@@ -1401,23 +1449,20 @@
                  (rs->maps rs)))))))
 
 (deftest test-nulls-in-polymorphic-types
-  (with-open [conn (jdbc-conn "prepareThreshold" -1)]
+  (with-open [conn (jdbc-conn {"prepareThreshold" -1})]
     (.execute (.prepareStatement conn "INSERT INTO foo(_id, a) VALUES (1, 'one'), (2, 1), (3, NULL)"))
-    (with-open [stmt (.prepareStatement conn "SELECT a FROM foo ORDER BY _id")]
+    (with-open [stmt (.prepareStatement conn "SELECT a FROM foo ORDER BY _id")
+                rs (.executeQuery stmt)]
+      (t/is (= [{"a" "transit"}]
+               (result-metadata stmt)
+               (result-metadata rs)))
 
-      (with-open [rs (.executeQuery stmt)]
+      (let [[x y z :as res] (mapv #(get % "a") (rs->maps rs))]
+        (t/is (= 3 (count res)))
 
-        (t/is (= [{"a" "json"}]
-                 (result-metadata stmt)
-                 (result-metadata rs)))
-
-        (let [[x y z :as res] (mapv #(get % "a") (rs->maps rs))]
-
-          (t/is (= 3 (count res)))
-
-          (t/is (= "\"one\"" (.getValue x)))
-          (t/is (= "1" (.getValue y)))
-          (t/is (nil? z)))))))
+        (t/is (= "one" x))
+        (t/is (= 1 y))
+        (t/is (nil? z))))))
 
 (deftest test-datetime-types
   (doseq [{:keys [^Class type val pg-type]} [{:type LocalDate :val #xt/date "2018-07-25" :pg-type "date"}
@@ -1428,7 +1473,7 @@
 
     (t/testing (format "binary?: %s, type: %s, pg-type: %s, val: %s" binary? type pg-type val)
 
-      (with-open [conn (jdbc-conn "prepareThreshold" -1 "binaryTransfer" binary?)
+      (with-open [conn (jdbc-conn {"prepareThreshold" -1 "binaryTransfer" binary?})
                   stmt (.prepareStatement conn "SELECT ? AS val")]
 
         (.execute (.createStatement conn) "SET TIME ZONE '+05:00'")
@@ -1451,7 +1496,7 @@
         val2 #xt/offset-date-time "2024-07-03T19:01:34.695959+03:00"]
     (doseq [binary? [true false]]
 
-      (with-open [conn (jdbc-conn "prepareThreshold" -1 "binaryTransfer" binary?)
+      (with-open [conn (jdbc-conn {"prepareThreshold" -1 "binaryTransfer" binary?})
                   stmt (.prepareStatement conn "SELECT val FROM (VALUES ?, ?, TIMESTAMP '2099-04-15T20:40:31[Asia/Tokyo]') AS foo(val)")]
 
         (.execute (.createStatement conn) "SET TIME ZONE '+04:00'")
@@ -1481,13 +1526,11 @@
     (jdbc/execute! conn ["INSERT INTO foo RECORDS {_id: 1, v: 2}"])
 
     (t/is (= [{:xt/id 1, :v 2,
-               :xt/valid-time {:type "tstz-range", :value "[2020-01-02 00:00:00+00:00,)"}}
+               :xt/valid-time #xt/tstz-range [#xt/zdt "2020-01-02T00:00Z" nil]}
               {:xt/id 1, :v 1,
-               :xt/valid-time {:type "tstz-range", :value "[2020-01-01 00:00:00+00:00,2020-01-02 00:00:00+00:00)"}}]
-             (->> (jdbc/execute! conn ["SELECT *, _valid_time FROM foo FOR ALL VALID_TIME"] tu/jdbc-qopts)
-                  (mapv #(update % :xt/valid-time (fn [^PGobject vt]
-                                                    {:type (.getType vt)
-                                                     :value (.getValue vt)})))))))
+               :xt/valid-time #xt/tstz-range [#xt/zdt "2020-01-01T00:00Z" #xt/zdt "2020-01-02T00:00Z"]}]
+             (->> (jdbc/execute! conn ["SELECT *, _valid_time FROM foo FOR ALL VALID_TIME"]
+                                 {:builder-fn xt-jdbc/builder-fn})))))
 
   (when (psql-available?)
     (psql-session
@@ -1559,7 +1602,7 @@
                 (read))))))))
 
 (deftest test-prepare-select
-  (with-open [conn (jdbc-conn "prepareThreshold" -1)]
+  (with-open [conn (jdbc-conn {"prepareThreshold" -1})]
     ;; real Postgres does this too - it's like it defaults the type of $1 on `PREPARE`
     ;; so we need the cast
     (jdbc/execute! conn ["PREPARE foo AS SELECT $1::bigint forty_two"])
@@ -1578,7 +1621,7 @@
        (t/is (= [["forty_two"] ["42"]] (read)))))))
 
 (t/deftest test-prepare-insert
-  (with-open [conn (jdbc-conn "prepareThreshold" -1)]
+  (with-open [conn (jdbc-conn {"prepareThreshold" -1})]
     (jdbc/execute! conn ["PREPARE foo AS INSERT INTO foo (_id, a) VALUES ($1, $2)"])
     (jdbc/execute! conn ["EXECUTE foo (1, 'one')"])
     (jdbc/execute! conn ["EXECUTE foo (?, ?)" 2 "two"])
@@ -1600,10 +1643,10 @@
 (t/deftest test-combines-dml
   (with-open [conn (jdbc-conn)]
     (jdbc/with-transaction [tx conn]
-      (jdbc/execute! tx ["INSERT INTO foo RECORDS ?" (xt-jdbc/->pg-obj {:xt/id 1, :a "one"})])
-      (jdbc/execute! tx ["INSERT INTO foo RECORDS ?" (xt-jdbc/->pg-obj {:xt/id 2, :a "two"})])
+      (jdbc/execute! tx ["INSERT INTO foo RECORDS ?" {:xt/id 1, :a "one"}])
+      (jdbc/execute! tx ["INSERT INTO foo RECORDS ?" {:xt/id 2, :a "two"}])
       (jdbc/execute! tx ["INSERT INTO foo RECORDS {_id: ?, a: ?}" 3, "three"])
-      (jdbc/execute! tx ["INSERT INTO foo RECORDS ?" (xt-jdbc/->pg-obj {:xt/id 4, :a "four"})])
+      (jdbc/execute! tx ["INSERT INTO foo RECORDS ?" {:xt/id 4, :a "four"}])
 
       ;; HACK.
       (t/is (= [[:sql "INSERT INTO foo RECORDS $1"
@@ -1612,7 +1655,7 @@
                 [:sql "INSERT INTO foo RECORDS {_id: $1, a: $2}" [3 "three"]]
                 [:sql "INSERT INTO foo RECORDS $1" [{:_id 4, :a "four"}]]]
                (-> @(:server-state *server*)
-                   (get-in [:connections 2 :conn-state])
+                   (get-in [:connections 1 :conn-state])
                    deref
                    (get-in [:transaction :dml-buf])))))
 
@@ -1622,74 +1665,9 @@
               {:xt/id 4, :a "four"}]
              (q conn ["SELECT * FROM foo ORDER BY _id"])))))
 
-(deftest test-pg
-  (with-open [conn (pg-conn {})]
-    (t/is (= [{:v 1}]
-             (pg/query conn "SELECT 1 v")))))
-
-(deftest test-unspecified-param-types
-  (with-open [conn (pg-conn {})]
-
-    (t/testing "params with unspecified types are assumed to be text"
-
-      (t/is (= [{:v "1"}]
-               (pg/execute conn "SELECT $1 v" {:params ["1"]}))
-            "given text params query is executable")
-
-      #_#_(t/is (= [{:v "1"}]
-               (pg/execute conn "SELECT $1 v" {:params ["1"]
-                                               :oids [OID/DEFAULT]}))
-            "params declared with the default oid (0) by clients are
-             treated as unspecified and therefore considered text")
-
-      (t/is (thrown-with-msg?
-             PGError #"cannot text-encode, oid: 25, type: java.lang.Long, value: 1"
-             (pg/execute conn "SELECT $1 v" {:params [1]}))
-            "non text params error"))
-
-    #_(testing "params with unspecified types in DML error"
-      ;;postgres is able to infer the type of the param from context such as the column type
-      ;;of base tables referenced in the query and the operations present. However we are currently
-      ;;not able to do this, because the EE isn't yet powerful enough to work in reverese and requires
-      ;;all param types to be known, but also because we can't guarentee the types of any base tables
-      ;;before executing a DML statement, as this isn't fixed until the indexer has indexed the tx.
-      ;;
-      ;;Therefore we choose to error in this case to avoid any surprising and unexecpted behaviour
-      (t/is (thrown?
-             PGError
-             (pg/execute conn "INSERT INTO foo(_id, v) VALUES (1, $1)" {:params ["1"]}))
-            "dml with unspecified params error")
-
-
-      (t/is (thrown-with-msg?
-             PGErrorResponse
-             #"Missing types for args - client must specify types for all params in DML statements"
-             (pg/execute conn "INSERT INTO foo(_id, v) VALUES (1, $1)" {:params ["1"]
-                                                                        :oids [OID/DEFAULT]}))
-            "params declared with the default oid (0) by clients are
-             treated as unspecified and therefore also error"))))
-
-(deftest test-postgres-native-params
-  (with-open [conn (pg-conn {})]
-
-    (t/is (= [{:v 1}]
-             (pg/execute conn "SELECT $1 v" {:params [1]
-                                             :oids [OID/INT8]}))
-          "Users can execute queries with explicit param types")
-
-    (t/testing "Users can execute dml with explicit param types"
-
-      (pg/execute conn
-                  "INSERT INTO foo(_id, v) VALUES (1, $1)"
-                  {:params [1]
-                   :oids [OID/INT8]})
-
-      (t/is (= [{:_id 1, :v 1}]
-               (pg/query conn "SELECT * FROM foo"))))))
-
 (deftest test-java-sql-timestamp
   (testing "java.sql.Timestamp"
-    (with-open [conn (jdbc-conn "prepareThreshold" -1)
+    (with-open [conn (jdbc-conn {"prepareThreshold" -1})
                 stmt (.prepareStatement conn "SELECT ? AS v")]
 
       (.setTimestamp
@@ -1709,48 +1687,11 @@
 
         (t/is (= [{"v" "2030-01-04 12:44:55+00"}] (rs->maps rs)))))))
 
-(deftest test-java-time-instant-ts
-  ;;NOTE https://github.com/igrishaev/pg2/issues/46
-  (with-open [conn (pg-conn {})]
-    (t/is (= [{:v #xt/date-time "2030-01-04T12:44:55"}]
-             (pg/execute conn "SELECT $1 v" {:params [#xt/instant "2030-01-04T12:44:55Z"]
-                                             :oids [OID/TIMESTAMP]}))
-          "when reading param, zone is ignored and instant is treated as a timestamp")))
-
-(deftest test-java-time-instant-tstz
-  ;;NOTE https://github.com/igrishaev/pg2/issues/46
-  (with-open [conn (pg-conn {})]
-    (t/is (= [{:v #xt/offset-date-time "2030-01-04T12:44:55Z"}]
-             (pg/execute conn "SELECT $1 v" {:params [#xt/instant "2030-01-04T12:44:55Z"]
-                                             :oids [OID/TIMESTAMPTZ]}))
-          "when reading param, zone is honored (UTC) and instant is treated as a timestamptz")))
-
-(deftest test-java-uuid
-  (let [uuid (UUID/randomUUID)]
-    (with-open [conn (pg-conn {})]
-      (t/is (= [{:v #uuid "7dd2ed62-bb05-43c8-b289-5503d9b19ee6"}]
-               (pg/execute conn "SELECT $1 v" {:params [#uuid "7dd2ed62-bb05-43c8-b289-5503d9b19ee6"]
-                                               :oids [OID/UUID]})))
-      (t/is (= [{:v uuid}]
-               (pg/execute conn "SELECT $1 v" {:params [uuid]
-                                               :oids [OID/UUID]})))
-      (testing "insert uuid as id and select by it"
-        (pg/execute conn "INSERT INTO foouuid (_id, v) values ($1, $2)" {:params [uuid "foo"]
-                                                                         :oids [OID/UUID OID/VARCHAR]})
-        (t/is (= [{:_id uuid, :v "foo"}]
-                 (pg/query conn (str "SELECT * FROM foouuid WHERE _id = UUID '" uuid "'"))))
-        (with-open [conn (jdbc-conn)]
-          (t/is (= [{:xt/id uuid, :v "foo"}]
-                   (q conn ["SELECT * FROM foouuid WHERE _id = ?", uuid])))))
-      (testing "cast text to UUID"
-        (t/is (= [{:v uuid}]
-                 (pg/execute conn (str "SELECT '" uuid "'::uuid v"))))))))
-
 (deftest test-declared-param-types-are-honored
   (t/testing "Declared param type VARCHAR is honored, even though it maps to utf8 which XTDB maps to text"
     ;;case applies anytime we have multiple pg types that map to the same xt type, as we choose a single pg type
     ;;for the return type.
-    (with-open [conn (jdbc-conn "prepareThreshold" -1)
+    (with-open [conn (jdbc-conn {"prepareThreshold" -1})
                 stmt (.prepareStatement conn "SELECT ? x, ? y")]
 
       (.setString stmt 1 "foo")
@@ -1768,7 +1709,7 @@
 
 (deftest test-show-watermark
   (with-open [conn (jdbc-conn)]
-    (t/is (= [] (q conn ["SHOW WATERMARK"])))
+    (t/is (= [{}] (q conn ["SHOW WATERMARK"])))
 
     (jdbc/execute! conn ["INSERT INTO foo (_id) VALUES (1)"])
 
@@ -1792,7 +1733,7 @@
 
 (t/deftest test-show-session-variable-3804
   (with-open [conn (jdbc-conn)]
-    (t/is (= [{:datestyle "ISO"}]
+    (t/is (= [{:datestyle "iso8601"}]
              (q conn ["SHOW DateStyle"])))
 
     (t/is (= [{:intervalstyle "ISO_8601"}]
@@ -1811,11 +1752,6 @@
        (read)
        (send "SELECT * FROM tbl1 WHERE _id = $1 \\bind 'a' \\g")
        (t/is (= [["_id" "foo"] ["a" "b"]] (read)))))))
-
-(deftest test-cast-text-data-type
-  (with-open [conn (pg-conn {})]
-    (t/is (= [{:v "101"}]
-             (pg/execute conn "SELECT 101::text v")))))
 
 (deftest test-resolve-result-format
   (letfn [(resolve-result-format [fmt type-count]
@@ -1842,18 +1778,6 @@
     (t/is (nil? (resolve-result-format [:text :binary] 3))
           "if more than 1 format is provided and it doesn't match the field count this is invalid")))
 
-(deftest test-pg-boolean-param
-  (doseq [binary? [true false]
-          v [true false]]
-
-    (t/testing (format "binary?: %s, value?: %s" binary? v)
-
-      (with-open [conn (pg-conn {:binary-encode? binary? :binary-decode? binary?})]
-
-        (t/is (= [{:v v}]
-                 (pg/execute conn "SELECT ? v" {:oids [OID/BOOL]
-                                                :params [v]})))))))
-
 (deftest test-pgjdbc-boolean-param
   (doseq [binary? [true false]
           v [true false]]
@@ -1861,7 +1785,7 @@
     ;;but it claims to and might someday
     (t/testing (format "binary?: %s, value?: %s" binary? v)
 
-      (with-open [conn (jdbc-conn "prepareThreshold" -1 "binaryTransfer" binary?)
+      (with-open [conn (jdbc-conn {"prepareThreshold" -1 "binaryTransfer" binary?})
                   stmt (.prepareStatement conn "SELECT ? AS v")]
 
         (.setBoolean stmt 1 v)
@@ -1883,49 +1807,40 @@
 SELECT t.oid, t.typname
 FROM pg_catalog.pg_type t
   JOIN pg_catalog.pg_namespace n ON t.typnamespace = n.oid
-WHERE t.typname = $1 AND (n.nspname = $2 OR $3 AND n.nspname = ANY (current_schemas(true)))
+WHERE t.typname = ? AND (n.nspname = ? OR ? AND n.nspname = ANY (current_schemas(true)))
 ORDER BY t.oid DESC LIMIT 1"
                            "transit" nil true])))))
 
-  (with-open [conn (jdbc-conn "prepareThreshold" -1)]
-    (jdbc/execute! conn ["INSERT INTO foo (_id, v) VALUES (1, ?)" (xt-jdbc/->pg-obj {:a 1, :b 2})])
+  (with-open [conn (jdbc-conn {"prepareThreshold" -1})]
+    (jdbc/execute! conn ["INSERT INTO foo (_id, v) VALUES (1, ?)" {:a 1, :b 2}])
 
     (with-open [stmt (.prepareStatement conn "SELECT v FROM foo")
                 rs (.executeQuery stmt)]
 
-      (t/is (= [{"v" "json"}]
+      (t/is (= [{"v" "transit"}]
                (result-metadata stmt)
                (result-metadata rs)))
 
       (.next rs)
-      (t/is (= "{\"a\":1,\"b\":2}"
-               (.getValue ^PGobject (.getObject rs 1)))))
+      (t/is (= {"a" 1, "b" 2}
+               (.getObject rs 1))))
 
     (t/testing "qualified names"
       (jdbc/execute! conn ["INSERT INTO users RECORDS ?"
-                           (xt-jdbc/->pg-obj {:xt/id "jms",
-                                              :user/first-name "James"})])
+                           {:xt/id "jms", :user/first-name "James"}])
 
       (jdbc/execute! conn ["INSERT INTO users RECORDS ?"
-                           (xt-jdbc/->pg-obj {:_id "jdt",
-                                              :user$first_name "Jeremy"})])
+                           {:_id "jdt", :user$first_name "Jeremy"}])
 
       (t/is (= #{{:_id "jdt", :user$first_name "Jeremy"}
                  {:_id "jms", :user$first_name "James"}}
                (set (jdbc/execute! conn (hsql/format {:select [:_id :user$first_name]
                                                       :from :users}))))
-            "no transformers")
+            "no transformers"))))
 
-      (t/is (= #{{:xt/id "jdt", :user/first-name "Jeremy"}
-                 {:xt/id "jms", :user/first-name "James"}}
-               (set (q conn (hsql/format {:select (->> [:xt/id :user/first-name]
-                                                       (mapv xt-jdbc/->sql-col))
-                                          :from :users}))))
-            "using our transformers"))))
-
-(deftest test-fallback-transit
-  (with-open [conn (jdbc-conn "options" "-c fallback_output_format=transit")]
-    (jdbc/execute! conn ["INSERT INTO foo RECORDS {_id: 1, nest: {ts: TIMESTAMP '2020-01-01T00:00:00Z'}}"])
+(deftest test-nested-transit
+  (with-open [conn (jdbc-conn)]
+    (jdbc/execute! conn ["INSERT INTO foo RECORDS {_id: 1, nest: {ts: TIMESTAMP '2020-01-01Z'}}"])
 
     (with-open [stmt (.prepareStatement conn "SELECT * FROM foo")]
       (t/is (= [{"_id" "int8"} {"nest" "transit"}] (result-metadata stmt))))
@@ -1935,63 +1850,6 @@ ORDER BY t.oid DESC LIMIT 1"
 
              (q conn ["SELECT * FROM foo"])))))
 
-(t/deftest test-pg2-begin-4182
-  (with-open [conn (pg-conn {})]
-    (pg/begin conn)
-    (pg/execute conn "INSERT INTO foo RECORDS {_id: 1}")
-    (pg/commit conn)
-
-    (pg/with-transaction [tx conn]
-      (pg/execute conn "INSERT INTO foo RECORDS {_id: 2}"))
-
-    (t/is (= (pg/execute conn "SELECT * FROM foo ORDER BY _id")
-             [{:_id 1} {:_id 2}]))))
-
-(deftest test-pg2-transit-param
-  (with-open [conn (pg-conn {})]
-    (pg/execute conn
-      "INSERT INTO foo (_id, v) VALUES (1, $1)"
-      {:params [(String. (serde/write-transit {:a 1, :b 2} :json))]
-       :oids [(int 16384)]})
-    (t/is (= (pg/execute conn "SELECT v FROM foo")
-             [{:v {:a 1, :b 2}}]))))
-
-(defn remaining-bytes ^bytes [^ByteBuffer buf]
-  (let [res (byte-array (.remaining buf))]
-    (.get buf res)
-    res))
-
-(def pg2-transit-processor
-  (reify org.pg.processor.IProcessor
-    (^String encodeTxt [_this ^Object obj ^CodecParams _codecParams]
-      (String. (serde/write-transit obj :json)))
-    (^Object decodeTxt [_this ^String s ^CodecParams _codecParams]
-      (serde/read-transit (.getBytes s) :json))
-    (^ByteBuffer encodeBin [_this ^Object obj ^CodecParams _codecParams]
-      (ByteBuffer/wrap (serde/write-transit obj :json)))
-    (^Object decodeBin [_this ^ByteBuffer buf ^CodecParams _codecParams]
-      (serde/read-transit (remaining-bytes buf) :json))))
-
-(deftest test-pg2-transit-param-using-custom-type
-  (with-open [conn (pg-conn {:type-map {:pg_catalog/transit pg2-transit-processor}
-                             :pg-params {"fallback_output_format" "transit"}})]
-    (pg/execute conn
-      "INSERT INTO foo (_id, v) VALUES (1, $1)"
-      {:params [{:a 1, :b 2}]
-       :oids [(int 16384)]})
-    (t/is (= (pg/execute conn "SELECT v FROM foo")
-             [{:v {"a" 1, "b" 2}}])))
-  (with-open [conn (pg-conn {:binary-encode? true
-                             :binary-decode? true
-                             :type-map {:pg_catalog/transit pg2-transit-processor}
-                             :pg-params {"fallback_output_format" "transit"}})]
-    (pg/execute conn
-      "INSERT INTO foo (_id, v) VALUES (1, $1)"
-      {:params [{:a 1, :b 2}]
-       :oids [(int 16384)]})
-    (t/is (= (pg/execute conn "SELECT v FROM foo")
-             [{:v {"a" 1, "b" 2}}]))))
-
 (deftest insert-select-test-3684
   (with-open [conn (jdbc-conn)]
     (jdbc/execute! conn ["INSERT INTO docs (_id) VALUES (1), (2)"])
@@ -2000,21 +1858,11 @@ ORDER BY t.oid DESC LIMIT 1"
     (t/is (= #{{:xt/id 1, :foo "hi"} {:xt/id 2}}
              (set (q conn ["SELECT * FROM docs"]))))))
 
-(deftest test-startup-params
-  ;;TODO test should really explicitly set the default clock of the node and/or pgwire server
-  ;;to something other than the param value in the test. But this currently isn't possible.
-  (t/testing "TimeZone"
-    (with-open [conn (pg-conn {:pg-params {"TimeZone" "Pacific/Tarawa"}})]
-
-      (t/is (= [{:timezone "Pacific/Tarawa"}]
-               (pg/execute conn "SHOW TIME ZONE"))
-            "Exact case"))
-
-    (with-open [conn (pg-conn {:pg-params {"TiMEzONe" "Pacific/Tarawa"}})]
-
-      (t/is (= [{:timezone "Pacific/Tarawa"}]
-               (pg/execute conn "SHOW TIME ZONE"))
-            "arbitrary case"))))
+(defn- stmt->warnings [^Statement stmt]
+  (loop [warn (.getWarnings stmt) res []]
+    (if-not warn
+      res
+      (recur (.getNextWarning warn) (conj res warn)))))
 
 (deftest error-propagation
   (with-open [conn (jdbc-conn)
@@ -2022,15 +1870,7 @@ ORDER BY t.oid DESC LIMIT 1"
     (.execute stmt)
 
     (t/is (= #{"Table not found: docs" "Column not found: b"}
-             (set (map #(.getMessage ^SQLWarning %) (stmt->warnings stmt))))))
-
-  (let [warns (atom [])]
-    (with-open [conn (pg-conn {:fn-notice (fn [notice] (swap! warns conj (:message notice)))})]
-      (pg/execute conn "SELECT 2 AS b FROM docs GROUP BY b")
-      ;; the fn-notice runs in a separate executor pool
-      (Thread/sleep 100)
-      (t/is (= #{"Table not found: docs" "Column not found: b"}
-               (set @warns))))))
+             (set (map #(.getMessage ^SQLWarning %) (stmt->warnings stmt)))))))
 
 (deftest test-ignore-returning-keys-3668
   (with-open [conn (jdbc-conn)
@@ -2041,17 +1881,17 @@ ORDER BY t.oid DESC LIMIT 1"
 
 (deftest test-interval-encoding-3697
   (with-open [conn (jdbc-conn)]
-    (t/is (= [{:i (PGInterval. "P1DT1H1M1.111111S")}]
+    (t/is (= [{:i #xt/interval "P1DT1H1M1.111111S"}]
              (jdbc/execute! conn ["SELECT INTERVAL 'P1DT1H1M1.111111S' AS i"])))
 
-    (t/is (= [{:i (PGInterval. "P12MT0S")}]
+    (t/is (= [{:i #xt/interval "P12M"}]
              (jdbc/execute! conn ["SELECT INTERVAL 'P12MT0S' AS i"])))
 
-    (t/is (= [{:i (PGInterval. "P-22MT0S")}]
+    (t/is (= [{:i #xt/interval "P-22M"}]
              (jdbc/execute! conn ["SELECT INTERVAL 'P-22MT0S' AS i"])))
 
     (t/testing "mdn implicitly truncated and returned with micro precision"
-      (t/is (= [{:i (PGInterval. "PT10M10.123456S")}]
+      (t/is (= [{:i #xt/interval "PT10M10.123456S"}]
                (jdbc/execute! conn ["SELECT INTERVAL '10:10.123456789' MINUTE TO SECOND(9) i"]))))))
 
 (deftest test-playground
@@ -2080,14 +1920,6 @@ ORDER BY t.oid DESC LIMIT 1"
          PSQLException
          #"FATAL: database 'nope' does not exist"
          (jdbc/get-connection (format "jdbc:xtdb://localhost:%d/nope" *port*)))))
-
-(deftest test-time
-  (with-open [conn (pg-conn {})]
-
-    (t/is (=
-           [{:v "20:40:31.932254"}]
-           (pg/execute conn "SELECT TIME '20:40:31.932254' v"))
-          "time is returned as json")))
 
 (deftest set-role
   (with-open [conn (jdbc-conn {})]
@@ -2231,36 +2063,36 @@ ORDER BY t.oid DESC LIMIT 1"
   (with-open [node (xtn/start-node {:authn [:user-table {:rules [{:user "xtdb", :method :password, :address "127.0.0.1"}]}]})]
     (binding [*port* (.getServerPort node)]
       (t/is (thrown-with-msg? PSQLException #"ERROR: no authentication record found for user: fin"
-                              (with-open [_ (jdbc-conn "user" "fin" "password" "foobar")]))
+                              (with-open [_ (jdbc-conn {"user" "fin", "password" "foobar"})]))
             "users without record are blocked")
 
       ;; user xtdb should be fine
-      (with-open [_ (jdbc-conn "user" "xtdb" "password" "xtdb")])
+      (with-open [_ (jdbc-conn {"user" "xtdb", "password" "xtdb"})])
       (t/is (thrown-with-msg? PSQLException #"ERROR: password authentication failed for user: xtdb"
-                              (with-open [_ (jdbc-conn "user" "xtdb" "password" "foobar")]))
+                              (with-open [_ (jdbc-conn {"user" "xtdb", "password" "foobar"})]))
             "user with a wrong password gets blocked")))
 
   (t/testing "users with a trusted record are allowed"
     (with-open [node (xtn/start-node {:authn [:user-table {:rules [{:user "fin", :method :trust, :address "127.0.0.1"}]}]})]
       (binding [*port* (.getServerPort node)]
-        (with-open [_ (jdbc-conn "user" "fin")]))))
+        (with-open [_ (jdbc-conn {"user" "fin"})]))))
 
   (with-open [node (xtn/start-node {:authn [:user-table {:rules [{:user "xtdb", :method :password, :address "127.0.0.1"}
                                                                  {:user "fin", :method :password, :address "127.0.0.1"}]}]})]
 
     (binding [*port* (.getServerPort node)]
       (t/is (thrown-with-msg? PSQLException #"ERROR: password authentication failed for user: fin"
-                              (with-open [_ (jdbc-conn "user" "fin" "password" "foobar")]))
+                              (with-open [_ (jdbc-conn {"user" "fin", "password" "foobar"})]))
             "users with a authentication record but not in the database")
 
-      (with-open [conn (jdbc-conn "user" "xtdb" "password" "xtdb")]
+      (with-open [conn (jdbc-conn {"user" "xtdb" "password" "xtdb"})]
         (jdbc/execute! conn ["CREATE USER fin WITH PASSWORD 'foobar'"])
         (with-open [stmt (.createStatement conn)
                     rs (.executeQuery stmt "SELECT username FROM pg_user")]
           (is (= (set [{"username" "xtdb"} {"username" "fin"}])
                  (set (rs->maps rs))))))
 
-      (with-open [_ (jdbc-conn "user" "fin" "password" "foobar")]))))
+      (with-open [_ (jdbc-conn {"user" "fin" "password" "foobar"})]))))
 
 (t/deftest test-keywordize-nested-values-3910
   (with-open [conn (jdbc-conn)]
@@ -2275,18 +2107,18 @@ ORDER BY t.oid DESC LIMIT 1"
   (with-open [conn (jdbc-conn)
               ps (jdbc/prepare conn ["INSERT INTO foo RECORDS ?, ?"])]
     (jdbc/execute-batch! ps
-                         [[(xt-jdbc/->pg-obj {:xt/id 1, :v 1})
-                           (xt-jdbc/->pg-obj {:xt/id 2, :v 1})]
-                          [(xt-jdbc/->pg-obj {:xt/id 1, :v 2})
-                           (xt-jdbc/->pg-obj {:xt/id 3, :v 1})]])))
+                         [[{:xt/id 1, :v 1}
+                           {:xt/id 2, :v 1}]
+                          [{:xt/id 1, :v 2}
+                           {:xt/id 3, :v 1}]])))
 
 (t/deftest test-multiple-tzs-3723
   (with-open [conn (jdbc-conn)]
     (jdbc/execute! conn ["INSERT INTO docs (_id, foo) VALUES (1, TIMESTAMP '2023-03-15 12:00:00+01:00')"])
     (jdbc/execute! conn ["INSERT INTO docs (_id, foo) VALUES (2, TIMESTAMP '2023-03-15 12:00:00+03:00')"])
 
-    (t/is (= [{:xt/id 1, :foo #inst "2023-03-15T11"}
-              {:xt/id 2, :foo #inst "2023-03-15T09"}]
+    (t/is (= [{:xt/id 1, :foo #xt/zdt "2023-03-15T12:00:00+01:00"}
+              {:xt/id 2, :foo #xt/zdt "2023-03-15T12:00:00+03:00"}]
              (jdbc/execute! conn ["SELECT _id, foo FROM docs ORDER BY _id"]
                             {:builder-fn xt-jdbc/builder-fn})))
 
@@ -2322,11 +2154,6 @@ ORDER BY t.oid DESC LIMIT 1"
 
 (deftest test-scalar-types
   (let [^bytes ba (byte-array [0 -16])]
-    (with-open [conn (pg-conn {})]
-      (t/is (Arrays/equals ba ^bytes (:v (first (pg/execute conn "SELECT $1 v" {:params [ba]
-                                                                                :oids [OID/BYTEA]}))))
-            "reading varbinary parameter"))
-
     (with-open [conn (jdbc-conn)]
       (t/is (Arrays/equals ba ^bytes (:v (first (jdbc/execute! conn ["SELECT X('00f0') AS v"]))))
             "reading varbinary result")
@@ -2336,21 +2163,22 @@ ORDER BY t.oid DESC LIMIT 1"
         (t/is (Arrays/equals ba ^bytes (:v (first (jdbc/execute! conn ["SELECT '00f0'::bytea AS v"]))))))
 
       (t/testing "nested varbinary"
-        (t/is (= [{:v {:ba "0x00f0"}}] (q conn ["SELECT OBJECT(ba: X('00f0')) AS v"]))
+        (t/is (= [{:v {:ba (ByteBuffer/wrap (byte-array [0x00 0xf0]))}}]
+                 (q conn ["SELECT OBJECT(ba: X('00f0')) AS v"]))
               "reading nested varbinary result")))
 
-    (with-open [conn (jdbc-conn "options" "-c fallback_output_format=transit")]
+    (with-open [conn (jdbc-conn {"options" "-c fallback_output_format=transit"})]
       (let [res (:v (first  (q conn ["SELECT OBJECT(ba: X('00f0')) AS v"])))]
         (t/is (Arrays/equals  ba (.array ^ByteBuffer (:ba res)))))))
 
   (t/testing "uri literals"
     (with-open [conn (jdbc-conn)]
-      (t/is (= "http://xtdb.com" (:v (first (jdbc/execute! conn ["SELECT URI 'http://xtdb.com' AS v"])))))
+      (t/is (= #xt/uri "http://xtdb.com" (:v (first (jdbc/execute! conn ["SELECT URI 'http://xtdb.com' AS v"])))))
 
-      (t/is (= [{:v {:uri "http://xtdb.com"}}] (q conn ["SELECT OBJECT(uri: URI 'http://xtdb.com') AS v"]))
+      (t/is (= [{:v {:uri #xt/uri "http://xtdb.com"}}] (q conn ["SELECT OBJECT(uri: URI 'http://xtdb.com') AS v"]))
             "nested uri"))
 
-    (with-open [conn (jdbc-conn "options" "-c fallback_output_format=transit")]
+    (with-open [conn (jdbc-conn {"options" "-c fallback_output_format=transit"})]
       ;; TODO transit has it's own implementation of URI
       (t/is (= "http://xtdb.com" (str (:v (first  (q conn ["SELECT URI 'http://xtdb.com' AS v"]))))))))
 
@@ -2372,20 +2200,20 @@ ORDER BY t.oid DESC LIMIT 1"
       (q conn ["INSERT INTO foo RECORDS {_id: 1, a: 1, b: 2}"])
       (q conn ["PATCH INTO foo RECORDS {_id: 1, c: 3}, {_id: 2, a: 4, b: 5}"])
 
-      (t/is (= [[{:xt/id 1, :a 1, :b 2} #inst "2020-01-01" #inst "2020-01-02"]
-                [{:xt/id 1, :a 1, :b 2, :c 3} #inst "2020-01-02" nil]
-                [{:xt/id 2, :a 4, :b 5} #inst "2020-01-02" nil]]
+      (t/is (= [[{:xt/id 1, :a 1, :b 2} #xt/zdt "2020-01-01Z[UTC]" #xt/zdt "2020-01-02Z[UTC]"]
+                [{:xt/id 1, :a 1, :b 2, :c 3} #xt/zdt "2020-01-02Z[UTC]" nil]
+                [{:xt/id 2, :a 4, :b 5} #xt/zdt "2020-01-02Z[UTC]" nil]]
                (q* "SELECT *, _valid_from, _valid_to FROM foo FOR ALL VALID_TIME ORDER BY _id, _valid_from")))
 
       (t/testing "for portion of valid_time"
         (q conn ["INSERT INTO bar RECORDS {_id: 1, a: 1, b: 2}"])
         (q conn ["PATCH INTO bar FOR VALID_TIME FROM DATE '2020-01-05' TO DATE '2020-01-07' RECORDS {_id: 1, tmp: 'hi!'}"])
-        (q conn ["PATCH INTO bar FOR VALID_TIME FROM ? RECORDS {_id: 2, a: 6, b: 8}" #inst "2020-01-08"])
+        (q conn ["PATCH INTO bar FOR VALID_TIME FROM ? RECORDS {_id: 2, a: 6, b: 8}" #xt/zdt "2020-01-08Z"])
 
-        (let [expected [[{:xt/id 1, :a 1, :b 2} #inst "2020-01-03" #inst "2020-01-05"]
-                        [{:xt/id 1, :a 1, :b 2, :tmp "hi!"} #inst "2020-01-05" #inst "2020-01-07"]
-                        [{:xt/id 1, :a 1, :b 2} #inst "2020-01-07" nil]
-                        [{:xt/id 2, :a 6, :b 8} #inst "2020-01-08" nil]]]
+        (let [expected [[{:xt/id 1, :a 1, :b 2} #xt/zdt "2020-01-03Z[UTC]" #xt/zdt "2020-01-05Z[UTC]"]
+                        [{:xt/id 1, :a 1, :b 2, :tmp "hi!"} #xt/zdt "2020-01-05Z[UTC]" #xt/zdt "2020-01-07Z[UTC]"]
+                        [{:xt/id 1, :a 1, :b 2} #xt/zdt "2020-01-07Z[UTC]" nil]
+                        [{:xt/id 2, :a 6, :b 8} #xt/zdt "2020-01-08Z[UTC]" nil]]]
           (t/is (= expected
                    (q* "SELECT *, _valid_from, _valid_to FROM bar FOR ALL VALID_TIME ORDER BY _id, _valid_from")))
 
@@ -2399,16 +2227,16 @@ ORDER BY t.oid DESC LIMIT 1"
                   "node continues"))))
 
       (t/testing "out-of-order updates"
-        (q conn ["PATCH INTO baz FOR VALID_TIME FROM TIMESTAMP '2020-01-01T00:00:00Z' RECORDS {_id: 1, version: 1}"])
-        (q conn ["PATCH INTO baz FOR VALID_TIME FROM TIMESTAMP '2022-01-01T00:00:00Z' RECORDS {_id: 1, version: 2, patched: 2022}"]) ;
-        (q conn ["PATCH INTO baz FOR VALID_TIME FROM TIMESTAMP '2021-01-01T00:00:00Z' RECORDS {_id: 1, patched: 2021}"])
+        (q conn ["PATCH INTO baz FOR VALID_TIME FROM TIMESTAMP '2020-01-01Z' RECORDS {_id: 1, version: 1}"])
+        (q conn ["PATCH INTO baz FOR VALID_TIME FROM TIMESTAMP '2022-01-01Z' RECORDS {_id: 1, version: 2, patched: 2022}"]) ;
+        (q conn ["PATCH INTO baz FOR VALID_TIME FROM TIMESTAMP '2021-01-01Z' RECORDS {_id: 1, patched: 2021}"])
 
         (t/is (= [{:xt/id 1, :version 1,
-                   :xt/valid-from #inst "2020", :xt/valid-to #inst "2021"}
+                   :xt/valid-from #xt/zdt "2020-01-01Z[UTC]", :xt/valid-to #xt/zdt "2021-01-01Z[UTC]"}
                   {:xt/id 1, :patched 2021, :version 1,
-                   :xt/valid-from #inst "2021", :xt/valid-to #inst "2022"}
+                   :xt/valid-from #xt/zdt "2021-01-01Z[UTC]", :xt/valid-to #xt/zdt "2022-01-01Z[UTC]"}
                   {:xt/id 1, :patched 2021, :version 2,
-                   :xt/valid-from #inst "2022-01-01T00:00:00.000000000-00:00"}]
+                   :xt/valid-from #xt/zdt "2022-01-01Z[UTC]"}]
                  (q conn ["SELECT *, _valid_from, _valid_to FROM baz FOR ALL VALID_TIME ORDER BY _valid_from"])))))))
 
 (t/deftest set-standard-conforming-strings-on-3972
@@ -2466,15 +2294,14 @@ ORDER BY t.oid DESC LIMIT 1"
 
     (t/is (= [{:xt/id 0,
                :committed true,
-               :error nil,
-               :system-time #inst "2020-01-01T00:00:00.000000000-00:00"}
+               :system-time (time/->zdt #inst "2020-01-01")}
               {:xt/id 1,
                :committed false,
-               :error {:tx-key {:tx-id 1, :system-time "2019-01-01T00:00Z"},
-                       :latest-completed-tx {:tx-id 0, :system-time "2020-01-01T00:00Z"},
-                       :error-key "invalid-system-time",
-                       :message "specified system-time older than current tx"},
-               :system-time #inst "2020-01-02T00:00:00.000000000-00:00"}]
+               :error #xt/illegal-arg [:invalid-system-time
+                                       "specified system-time older than current tx"
+                                       {:tx-key #xt/tx-key {:tx-id 1, :system-time #xt/instant "2019-01-01T00:00:00Z"}
+                                        :latest-completed-tx #xt/tx-key {:tx-id 0, :system-time #xt/instant "2020-01-01T00:00:00Z"}}],
+               :system-time (time/->zdt #inst "2020-01-02")}]
 
              (jdbc/execute! conn ["SELECT * FROM xt.txs ORDER BY _id"]
                             {:builder-fn xt-jdbc/builder-fn})))))
@@ -2487,22 +2314,6 @@ ORDER BY t.oid DESC LIMIT 1"
                             (jdbc/execute! conn ["SELECT 1 / 0;"])))
     (t/is (thrown-with-msg? PSQLException #"ERROR: Negative substring length"
                             (jdbc/execute! conn ["SELECT SUBSTRING('asf' FROM 0 FOR -1);"])))))
-
-(deftest pg-sleep-test
-  (with-open [conn (pg-conn {})]
-    (let [start (System/currentTimeMillis)]
-      (pg/execute conn "SELECT pg_sleep(0.1)")
-      (t/is (< 100 (- (System/currentTimeMillis) start)))
-      (pg/execute conn "SELECT pg_sleep(0.1+0.1)")
-      (t/is (< 300 (- (System/currentTimeMillis) start))))))
-
-(deftest pg-sleep-for-test
-  (with-open [conn (pg-conn {})]
-    (let [start (System/currentTimeMillis)]
-      (pg/execute conn "SELECT pg_sleep_for('0.100 second')")
-      (t/is (< 100 (- (System/currentTimeMillis) start)))
-      (pg/execute conn "SELECT pg_sleep_for('0.01 minute')")
-      (t/is (< 160 (- (System/currentTimeMillis) start))))))
 
 (def display-tables-query
   "
@@ -2549,33 +2360,34 @@ ORDER BY 1,2;")
 
     (xt/execute-tx tu/*node* [[:put-docs :docs {:xt/id 1, :x 3}]])
 
-    (t/is (= [{:ts #inst "2020-01-01"}]
+    (t/is (= [{:ts #xt/zdt "2020-01-01Z[UTC]"}]
              (jdbc/execute! conn ["SELECT SNAPSHOT_TIME ts"])))
 
     (xt/execute-tx tu/*node* [[:put-docs :docs {:xt/id 2, :x 5}]])
 
-    (t/is (= [{:snapshot_time #inst "2020-01-02"}]
+    (t/is (= [{:snapshot_time #xt/zdt "2020-01-02Z[UTC]"}]
              (jdbc/execute! conn ["SHOW SNAPSHOT_TIME"])))
 
     (let [sql "SELECT SNAPSHOT_TIME ts, * FROM docs ORDER BY _id"]
-      (t/is (= [{:ts #inst "2020-01-02", :_id 1, :x 3}
-                {:ts #inst "2020-01-02", :_id 2, :x 5}]
+      (t/is (= [{:ts #xt/zdt "2020-01-02Z[UTC]", :_id 1, :x 3}
+                {:ts #xt/zdt "2020-01-02Z[UTC]", :_id 2, :x 5}]
                (jdbc/execute! conn [sql])))
 
-      (t/is (= [{:ts #inst "2020-01-01", :_id 1, :x 3}]
-               (jdbc/execute! conn [(str "SETTING SNAPSHOT_TIME = TIMESTAMP '2020-01-01T00:00:00Z' " sql)])))
+      (t/is (= [{:ts #xt/zdt "2020-01-01Z[UTC]", :_id 1, :x 3}]
+               (jdbc/execute! conn [(str "SETTING SNAPSHOT_TIME = '2020-01-01Z' " sql)])))
 
       (t/testing "in tx"
-        (jdbc/execute! conn ["BEGIN READ ONLY WITH (SNAPSHOT_TIME = TIMESTAMP '2020-01-01T00:00:00Z', CLOCK_TIME = TIMESTAMP '2020-01-04T00:00:00Z')"])
+        (jdbc/execute! conn ["BEGIN READ ONLY WITH (SNAPSHOT_TIME = '2020-01-01Z', CLOCK_TIME = ?)" "2020-01-04Z"])
         (try
-          (t/is (= [{:ts #inst "2020-01-01", :_id 1, :x 3}]
+          (t/is (= [{:ts #xt/zdt "2020-01-01Z[UTC]", :_id 1, :x 3}]
                    (jdbc/execute! conn [sql])))
 
-          (t/is (= [{:ts #inst "2020-01-01", :_id 1, :x 3}]
+          (t/is (= [{:ts #xt/zdt "2020-01-01Z[UTC]", :_id 1, :x 3}]
                    (jdbc/execute! conn [sql]))
                 "once more for luck")
 
-          (t/is (= {:clock_time #inst "2020-01-04"} (jdbc/execute-one! conn ["SHOW CLOCK_TIME"])))
+          (t/is (= {:clock_time (-> #xt/zdt "2020-01-04Z[UTC]" in-system-tz)}
+                   (jdbc/execute-one! conn ["SHOW CLOCK_TIME"])))
 
           (finally
             (jdbc/execute! conn ["ROLLBACK"])))))))
@@ -2592,13 +2404,13 @@ ORDER BY 1,2;")
         (t/is (.isAfter after ct))))
 
     (t/testing "setting on tx"
-      (jdbc/execute! conn ["BEGIN READ ONLY WITH (CLOCK_TIME = TIMESTAMP '2024-01-01T00:00:00Z')"])
+      (jdbc/execute! conn ["BEGIN READ ONLY WITH (CLOCK_TIME = TIMESTAMP '2024-01-01Z')"])
       (try
-          (t/is (= [{:clock_time #inst "2024-01-01"}]
-                   (jdbc/execute! conn ["SHOW CLOCK_TIME"])))
+        (t/is (= [{:clock_time (-> #xt/zdt "2024-01-01Z[UTC]" in-system-tz)}]
+                 (jdbc/execute! conn ["SHOW CLOCK_TIME"])))
 
-          (finally
-            (jdbc/execute! conn ["ROLLBACK"]))))))
+        (finally
+          (jdbc/execute! conn ["ROLLBACK"]))))))
 
 (t/deftest test-explain
   ;; this one might be a little brittle, let's revisit if it fails a lot.
@@ -2626,11 +2438,6 @@ ORDER BY 1,2;")
            (t/is (nil? more-rows))
            (t/is (= expected-plan (read-string plan)))))))))
 
-(t/deftest test-explain-query-with-params
-  (with-open [conn (pg-conn {})]
-    (let [[{:keys [plan]}] (pg/execute conn "EXPLAIN SELECT $1" {:params [""]})]
-      (t/is (some? plan)))))
-
 (t/deftest test-ro-server-4043
   (with-open [node (xtn/start-node {:server {:read-only-port 0, :port 0}})]
     (binding [*port* (.getServerPort node)]
@@ -2646,35 +2453,238 @@ ORDER BY 1,2;")
         (t/is (= [{:_id 1}] (jdbc/execute! ro-conn ["SELECT * FROM foo"])))))))
 
 (t/deftest test-return-nano-ts-as-micro-ts
-  ;;pgjdbc appears to use binary format for ts results but not tstz...
+  ;; we now have more precision for text than we do for binary
   (doseq [binary? [false true]
-          {:keys [type val input]}
-          [{:type LocalDateTime :val #xt/date-time "2024-01-01T00:00:01.123456" :input "'2024-01-01T00:00:01.123456789'::TIMESTAMP(9)"}
-           {:type OffsetDateTime :val #xt/offset-date-time "2024-01-01T00:00:01.123456Z" :input "'2024-01-01T00:00:01.123456789Z'::TIMESTAMP(9) WITH TIME ZONE"}]
+          {:keys [^Class type binary-val text-val input]} [{:input "'2024-01-01T00:00:01.123456789'::TIMESTAMP(9)"
+                                                            :type LocalDateTime
+                                                            :binary-val #xt/date-time "2024-01-01T00:00:01.123456"
+                                                            :text-val #xt/date-time "2024-01-01T00:00:01.123456789"}
+                                                           {:input "'2024-01-01T00:00:01.123456789Z'::TIMESTAMP(9) WITH TIME ZONE"
+                                                            :type OffsetDateTime,
+                                                            :binary-val (-> #xt/zdt "2024-01-01T00:00:01.123456Z" in-system-tz (.toOffsetDateTime))
+                                                            :text-val (-> #xt/zdt "2024-01-01T00:00:01.123456789Z" in-system-tz (.toOffsetDateTime))}]
           :let [q (format "SELECT %s v" input)]]
 
-      (t/testing (format "pgjdbc - binary?: %s, type: %s, pg-type: %s, val: %s" binary? type val input)
-        (with-open [conn (jdbc-conn "prepareThreshold" -1 "binaryTransfer" binary?)
-                    stmt (.prepareStatement conn q)]
-          (with-open [rs (.executeQuery stmt)]
-            (.next rs)
-            (t/is (= val (.getObject rs 1 type))))))))
+    (t/testing (format "pgjdbc - binary?: %s, type: %s, pg-type: %s, val: %s" binary? type val input)
+      (with-open [conn (jdbc-conn {"prepareThreshold" -1 "binaryTransfer" binary?})
+                  stmt (.prepareStatement conn q)]
+        (with-open [rs (.executeQuery stmt)]
+          (.next rs)
+          (t/is (= (if binary? binary-val text-val)
+                   (.getObject rs 1 type))))))))
 
-
-
-(t/deftest test-sql-with-leading-whitespace
-  (with-open [conn (pg-conn {})]
-    (pg/execute conn "     INSERT INTO test RECORDS {_id: 0, value: 'hi'}")))
+(defn- compare-decimals-with-scale [^BigDecimal d1 ^BigDecimal d2]
+  (and (= (.scale d1) (.scale d2))
+       (= (.unscaledValue d1) (.unscaledValue d2))))
 
 (deftest test-pgwire-decimal-support
   (doseq [binary? [false true]]
-    (with-open [conn (jdbc-conn "prepareThreshold" -1 "binaryTransfer" binary?)
+    (with-open [conn (jdbc-conn {"prepareThreshold" -1 "binaryTransfer" binary?})
                 ps (jdbc/prepare conn ["INSERT INTO table RECORDS {_id: ?, data: ?}"])]
       (jdbc/execute-batch! ps [[1 0.1M] [2 24580955505371094.000001M]])
       (jdbc/execute! conn ["INSERT INTO table RECORDS {_id: ?, data: ?}"
                            3 61954235709850086879078532699846656405640394575840079131296.39935M])
 
-      (t/is (= [{:_id 1, :data 0.1M}
-                {:_id 2, :data 24580955505371094.000001M}
-                {:_id 3, :data 61954235709850086879078532699846656405640394575840079131296.39935M}]
-               (jdbc/execute! conn ["SELECT * FROM table ORDER BY _id"]))))))
+      (let [expected-res [{:_id 1, :data 0.1M}
+                          {:_id 2, :data 24580955505371094.000001M}
+                          {:_id 3, :data 61954235709850086879078532699846656405640394575840079131296.39935M}]
+            res (jdbc/execute! conn ["SELECT * FROM table ORDER BY _id"])]
+        (t/is (= expected-res res))
+        (t/is (true? (->>
+                      (map vector expected-res res)
+                      (every? #(compare-decimals-with-scale (:data (first %)) (:data (second %))))))
+              "correct scale")))))
+
+(deftest test-pgwire-numeric-type-annotation
+  (with-open [conn (jdbc-conn)]
+    (jdbc/execute! conn ["INSERT INTO table RECORDS {_id: 1, data: ?::decimal}" 1.111111111111M])
+    (jdbc/execute! conn ["INSERT INTO table RECORDS {_id: 2, data: ?::decimal}" 1.1M])
+    ;; but explicit precision and scale overrides the default
+    (jdbc/execute! conn ["INSERT INTO table RECORDS {_id: 3, data: ?::decimal(3,2)}" 1.11111M])
+
+    (let [expected-res [{:_id 1, :data 1.111111111111M}
+                        {:_id 2, :data 1.1M}
+                        {:_id 3, :data 1.11M}]
+          res (jdbc/execute! conn ["SELECT * FROM table ORDER BY _id"])]
+      (t/is (= expected-res res))
+      (t/is (true? (->>
+                    (map vector expected-res res)
+                    (every? #(compare-decimals-with-scale (:data (first %)) (:data (second %))))))
+            "correct scale"))))
+
+(deftest keyword-roundtripping-4237
+  (with-open [conn (jdbc-conn)]
+    (jdbc/execute! conn ["INSERT INTO docs RECORDS ?" {:xt/id 1, :foo :bar}])
+
+    (with-open [ps (jdbc/prepare conn ["FROM docs"])]
+
+      (t/is (= [{"_id" "int8"} {"foo" "keyword"}]
+               (result-metadata ps)))
+
+      (t/is (= [{:_id 1, :foo :bar}] (jdbc/execute! ps))))
+
+    (t/is (= [{:_id 1, :foo :bar}]
+             (jdbc/execute! conn ["FROM docs"])))
+
+    (t/is (= [{:xt/id 1, :foo :bar}]
+             (jdbc/execute! conn ["FROM docs"]
+                            {:builder-fn xt-jdbc/builder-fn})))))
+
+(deftest better-assert-error-code-and-message-3878
+  (with-open [conn (jdbc-conn {"autocommit" "false"})]
+    (testing "outside transaction"
+      (t/is (= {:sql-state "P0004",
+                :message "boom",
+                :detail #xt/runtime-err [:xtdb/assert-failed "boom" {}]}
+               (reading-ex
+                 (q conn ["ASSERT 2 < 1, 'boom'"])))))
+
+    (testing "inside transaction"
+      (q conn ["BEGIN READ WRITE"])
+      (q conn ["ASSERT 2 < 1, 'boom'"])
+      (t/is (= {:sql-state "P0004",
+                :message "boom",
+                :detail #xt/runtime-err [:xtdb/assert-failed "boom" {}]}
+               (reading-ex
+                 (q conn ["COMMIT"]))))
+      (q conn ["ROLLBACK"]))
+
+    (testing "no error message"
+      (q conn ["BEGIN READ WRITE"])
+      (q conn ["ASSERT 2 < 1"])
+      (t/is (thrown-with-msg? PSQLException
+                              #"ERROR: Assert failed"
+                              (q conn ["COMMIT"]))))))
+
+(t/deftest test-datestyle
+  (with-open [conn (jdbc-conn)]
+    (t/is (= {:ts #xt/zoned-date-time "2020-01-01Z"} (jdbc/execute-one! conn ["SELECT TIMESTAMP '2020-01-01Z' ts"])))
+
+    (jdbc/execute! conn ["SET datestyle = 'iso8601'"])
+    (t/is (= {:ts #xt/zoned-date-time "2020-05-01T00:00:00+01:00[Europe/London]"}
+             (jdbc/execute-one! conn ["SELECT TIMESTAMP '2020-05-01+01:00[Europe/London]' ts"])))
+
+    (t/is (= {:ts #xt/zoned-date-time "2020-05-01T00:00:00-08:00"} (jdbc/execute-one! conn ["SELECT TIMESTAMP '2020-05-01T00:00:00-08:00' ts"])))
+
+    (jdbc/execute! conn ["SET datestyle = 'iso'"])
+    (t/is (= {:ts #xt/zoned-date-time "2020-05-01T00:00:00-08:00"} (jdbc/execute-one! conn ["SELECT TIMESTAMP '2020-05-01T00:00:00-08:00' ts"]))))
+
+  (when (psql-available?)
+    (psql-session
+     (fn [send read]
+       (send "SELECT TIMESTAMP '2020-01-01Z' ts;\n")
+       (t/is (= [["ts"] ["2020-01-01 00:00:00+00:00"]] (read)))
+
+       (send "SET datestyle = 'iso8601';\n")
+       (t/is (= [["SET"]] (read)))
+
+       (send "SELECT TIMESTAMP '2020-05-01+01:00[Europe/London]' ts;\n")
+       (t/is (= [["ts"] ["2020-05-01T00:00+01:00[Europe/London]"]] (read)))
+
+       (send "SELECT TIMESTAMP '2020-05-01T00:00:00-08:00' ts;\n")
+       (t/is (= [["ts"] ["2020-05-01T00:00-08:00"]] (read)))
+
+       (send "SET datestyle = 'iso';\n")
+       (t/is (= [["SET"]] (read)))
+
+       (send "SELECT TIMESTAMP '2020-05-01T00:00:00-08:00' ts;\n")
+       (t/is (= [["ts"] ["2020-05-01 00:00:00-08:00"]] (read)))))))
+
+(t/deftest in-tx-default-tz
+  (with-open [conn (jdbc-conn)]
+    (jdbc/execute! conn ["SET TIME ZONE 'Asia/Tokyo'"])
+
+    (t/testing "DML tx"
+      (jdbc/execute! conn ["BEGIN READ WRITE WITH (TIMEZONE = ?)" "America/New_York"])
+      (try
+        (jdbc/execute! conn ["INSERT INTO foo RECORDS {_id: 1, ts: (TIMESTAMP '2020-01-01'::timestamptz)}"])
+        (jdbc/execute! conn ["COMMIT"])
+        (finally
+          (jdbc/execute! conn ["ROLLBACK"])))
+
+      (t/is (= {:_id 1, :ts #xt/zdt "2020-01-01T00:00-05:00[America/New_York]"}
+               (jdbc/execute-one! conn ["SELECT * FROM foo"]))))
+
+    (t/is (= {:timezone "Asia/Tokyo"}
+             (jdbc/execute-one! conn ["SHOW TIME ZONE"]))
+          "reset tz")
+
+    (t/testing "DQL tx"
+      (jdbc/execute! conn ["BEGIN READ ONLY WITH (TIMEZONE = ?)" "America/New_York"])
+      (try
+        (t/is (= {:timezone "America/New_York"} (jdbc/execute-one! conn ["SHOW TIME ZONE"])))
+        (t/is (= {:ts #xt/zdt "2020-01-01T00:00-05:00[America/New_York]"} (jdbc/execute-one! conn ["SELECT TIMESTAMP '2020-01-01'::timestamptz ts"])))
+        (jdbc/execute! conn ["COMMIT"])
+        (finally
+          (jdbc/execute! conn ["ROLLBACK"]))))
+
+    (t/is (= {:timezone "Asia/Tokyo"}
+             (jdbc/execute-one! conn ["SHOW TIME ZONE"]))
+          "reset tz")))
+
+(t/deftest in-tx-watermark
+  (with-open [conn (jdbc-conn)]
+    (jdbc/execute! conn ["INSERT INTO foo RECORDS {_id: 1}"])
+    (t/is (= {:watermark 0} (jdbc/execute-one! conn ["SHOW WATERMARK"])))
+
+    (jdbc/execute! conn ["INSERT INTO foo RECORDS {_id: 2}"])
+    (t/is (= {:watermark 1} (jdbc/execute-one! conn ["SHOW WATERMARK"])))
+
+    (jdbc/execute! conn ["BEGIN READ ONLY WITH (watermark = ?)" 0])
+    (try
+      (t/is (= {:watermark 0} (jdbc/execute-one! conn ["SHOW WATERMARK"])))
+      (finally
+        (jdbc/execute! conn ["ROLLBACK"])))
+
+    (t/is (= {:watermark 1} (jdbc/execute-one! conn ["SHOW WATERMARK"])))))
+
+(t/deftest watermark+snapshot-time
+  (xt/submit-tx tu/*node* [[:put-docs :foo {:xt/id 1, :version 0}]])
+  (xt/submit-tx tu/*node* [[:put-docs :foo {:xt/id 1, :version 1}]])
+
+  (with-open [conn (jdbc-conn)]
+    (xt/submit-tx tu/*node* [[:put-docs :foo {:xt/id 1, :version 2}]])
+    (xt/submit-tx tu/*node* [[:put-docs :foo {:xt/id 1, :version 3}]])
+
+    (jdbc/execute! conn ["BEGIN READ ONLY WITH (watermark = 3)"])
+    (try
+      (t/is (= {:_id 1, :version 3}
+               (jdbc/execute-one! conn ["SELECT * FROM foo"])))
+      (finally
+        (jdbc/execute! conn ["ROLLBACK"])))))
+
+(t/deftest ex-cause-in-detail-message
+  (with-open [conn (jdbc-conn)]
+    (t/is (= {:sql-state "0B000",
+              :message "snapshot-time (2020-01-02T00:00:00Z) is after the latest completed tx (nil)",
+              :detail #xt/illegal-arg [:xtdb/unindexed-tx
+                                       "snapshot-time (2020-01-02T00:00:00Z) is after the latest completed tx (nil)"
+                                       {:latest-completed-tx nil, :snapshot-time #xt/instant "2020-01-02T00:00:00Z"}]}
+             (reading-ex
+               (jdbc/execute! conn ["SETTING snapshot_time = '2020-01-02Z' SELECT 1"]))))
+
+    (t/is (= {:sql-state "08P01",
+              :message "Queries are unsupported in a DML transaction",
+              :detail nil}
+             (reading-ex
+               (jdbc/with-transaction [tx conn]
+                 (q tx ["INSERT INTO foo(_id, a) values(42, 42)"])
+                 (q conn ["SELECT a FROM foo"])))))))
+
+(t/deftest test-patch-records-4403
+  (with-open [conn (jdbc-conn)]
+    (jdbc/execute! conn ["INSERT INTO users RECORDS {_id: 'jms', first_name: 'James'}"])
+
+    (jdbc/execute! conn ["INSERT INTO users RECORDS ?" {:xt/id "joe", :first-name "Joe"}])
+
+    (jdbc/execute! conn ["PATCH INTO users RECORDS ?" {:xt/id "joe", :likes "chocolate"}])
+
+    (t/is (= [{:xt/id "jms", :first-name "James",
+               :xt/valid-from #xt/zdt "2020-01-01Z[UTC]"}
+              {:xt/id "joe", :first-name "Joe",
+               :xt/valid-from #xt/zdt "2020-01-02Z[UTC]",
+               :xt/valid-to #xt/zdt "2020-01-03Z[UTC]"}
+              {:xt/id "joe", :first-name "Joe", :likes "chocolate",
+               :xt/valid-from #xt/zdt "2020-01-03Z[UTC]"}]
+             (jdbc/execute! conn ["SELECT *, _valid_from, _valid_to FROM users FOR ALL VALID_TIME ORDER BY _id, _valid_from"]
+                            {:builder-fn xt-jdbc/builder-fn})))))

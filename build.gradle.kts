@@ -13,8 +13,8 @@ buildscript {
 
 plugins {
     `java-library`
-    id("dev.clojurephant.clojure") version "0.8.0-beta.7"
-    id("io.freefair.aggregate-javadoc-legacy") version "8.12.2"
+    id("dev.clojurephant.clojure") version "0.8.0"
+    id("io.freefair.aggregate-javadoc-legacy") version "8.13.1"
     kotlin("jvm")
     kotlin("plugin.serialization")
     id("org.jetbrains.dokka")
@@ -26,7 +26,9 @@ val defaultJvmArgs = listOf(
     "-Djdk.attach.allowAttachSelf",
     "-Darrow.memory.debug.allocator=false",
     "-XX:-OmitStackTraceInFastThrow",
-    "-Dlogback.configurationFile=${rootDir.resolve("src/main/resources/logback-test.xml")}"
+    "-Dlogback.configurationFile=${rootDir.resolve("src/main/resources/logback-test.xml")}",
+    "-Dxtdb.rootDir=$rootDir",
+    "-Djunit.jupiter.extensions.autodetection.enabled=true"
 )
 
 val sixGBJvmArgs = listOf(
@@ -124,8 +126,9 @@ allprojects {
             devRuntimeOnly(libs.slf4j.jpl)
             testRuntimeOnly(libs.slf4j.jpl)
 
-            testImplementation("org.junit.jupiter", "junit-jupiter-api", "5.8.1")
-            testRuntimeOnly("org.junit.jupiter", "junit-jupiter-engine", "5.8.1")
+            testImplementation(libs.junit.jupiter.api)
+            testRuntimeOnly(libs.junit.jupiter.engine)
+            testRuntimeOnly(libs.junit.platform.launcher)
             testImplementation(libs.testcontainers)
             testImplementation(libs.testcontainers.kafka)
             testImplementation(libs.testcontainers.minio)
@@ -270,7 +273,6 @@ dependencies {
 
     projectDep(":xtdb-api")
     projectDep(":xtdb-core")
-    projectDep(":xtdb-jdbc")
 
     projectDep(":xtdb-http-server")
     projectDep(":xtdb-http-client-jvm")
@@ -293,13 +295,19 @@ dependencies {
 
     api(libs.next.jdbc)
     testImplementation(libs.honeysql)
-    api("org.postgresql", "postgresql", "42.7.3")
     api(libs.integrant)
     api(project(":xtdb-core"))
-    api(project(":xtdb-jdbc"))
+
+    api(libs.pgjdbc)
+    testImplementation(libs.exposed.core)
+    testImplementation(libs.exposed.jdbc)
+    testImplementation(libs.exposed.java.time)
+
+    implementation(libs.junit.jupiter.api)
 
     testImplementation(libs.clojure.`data`.csv)
     testImplementation(libs.clojure.tools.cli)
+
 
     devImplementation("integrant", "repl", "0.3.2")
     devImplementation("com.azure", "azure-identity", "1.9.0")
@@ -436,7 +444,12 @@ fun createBench(benchName: String, properties: Map<String, String>) {
         jvmArgs(defaultJvmArgs + sixGBJvmArgs + listOf("-Darrow.enable_unsafe_memory_access=true"))
         val args = mutableListOf("-m", "xtdb.bench", benchName)
 
-        (properties + ("dir" to "--node-dir")).forEach { (k, v) ->
+        val extraProps = properties + mapOf(
+            "dir" to "--node-dir",
+            "configFile" to "--config-file"
+        )
+
+        extraProps.forEach { (k, v) ->
             if (project.hasProperty(k)) {
                 args.add(v)
                 args.add(project.properties[k] as String)
@@ -465,6 +478,8 @@ createBench("products", mapOf("limit" to "--limit"))
 
 // can't seem to have an arg with the same name as a task
 createBench("readings", mapOf("readingCount" to "--readings", "deviceCount" to "--devices"))
+
+createBench("tsbs-iot", mapOf("file" to "--file"))
 
 tasks.dokkaHtmlMultiModule {
     moduleName.set("")

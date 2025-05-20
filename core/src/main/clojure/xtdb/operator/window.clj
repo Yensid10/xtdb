@@ -89,7 +89,7 @@
                   row-count (.getValueCount group-mapping)]
               (.setValueCount out-vec (+ offset row-count))
               (dotimes [idx row-count]
-                (.set out-vec (+ offset idx) (.putOrAdd group-to-cnt (.get group-mapping (aget sortMapping idx)) 0 1)))
+                (.set out-vec (+ offset idx) (.putOrAdd group-to-cnt (.get group-mapping (aget sortMapping idx)) 1 1)))
               (vr/vec->reader out-vec)))
 
           Closeable
@@ -136,9 +136,7 @@
   (characteristics [_] Spliterator/IMMUTABLE)
 
   (close [_]
-    (util/close in-cursor)
-    (util/close window-specs)
-    (util/close group-mapper)))
+    (util/close [window-specs group-mapper in-cursor])))
 
 (defmethod lp/emit-expr :window [{:keys [specs relation]} args]
   (let [{:keys [projections windows]} specs

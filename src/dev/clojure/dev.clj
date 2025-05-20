@@ -41,19 +41,18 @@
   (alter-var-root #'node (constantly nil)))
 
 (def standalone-config
-  {::xtdb {:node-opts {:server {:port 0
+  {::xtdb {:node-opts {:server {:port 5432
                                 :ssl {:keystore (io/file (io/resource "xtdb/pgwire/xtdb.jks"))
                                       :keystore-password "password123"}}
                        :log [:local {:path (io/file dev-node-dir "log")}]
                        :storage [:local {:path (io/file dev-node-dir "objects")}]
                        :healthz {:port 8080}
-                       :http-server {}
                        :flight-sql-server {:port 52358}}}})
 
 (comment
   (do
     (halt)
-    (util/delete-dir (util/->path dev-node-dir))
+    #_(util/delete-dir (util/->path dev-node-dir))
     (go)))
 
 (def playground-config
@@ -167,7 +166,7 @@
                                                (table-cat/->table-block-metadata-obj-key block-idx))))]
     (-> (TableBlock/parseFrom in)
         (table-cat/<-table-block)
-        (update :current-tries
+        (update :tries
                 (fn [tries]
                   (->> tries
                        (mapv (fn [^TrieDetails td]

@@ -13,7 +13,8 @@
             [xtdb.trie :as trie]
             [xtdb.trie-catalog :as cat]
             [xtdb.types :as types]
-            [xtdb.util :as util])
+            [xtdb.util :as util]
+            [xtdb.vector.writer :as vw])
   (:import (clojure.lang MapEntry)
            java.nio.ByteBuffer
            java.time.Instant
@@ -55,30 +56,44 @@
 
 (def ^:dynamic *column->pushdown-bloom* {})
 
-(defn- ->temporal-bounds [^RelationReader args, {:keys [for-valid-time for-system-time]}, ^Instant snapshot-time]
-  (letfn [(->time-μs [[tag arg]]
-            (case tag
-              :literal (-> arg
-                           (time/sql-temporal->micros expr/*default-tz*))
-              :param (some-> (-> (.vectorForOrNull args (name arg))
-                                 (.getObject 0))
-                             (time/sql-temporal->micros expr/*default-tz*))
-              :now (-> (expr/current-time)
-                       (time/instant->micros))))
+(defn ->temporal-bounds [^BufferAllocator alloc, ^RelationReader args,
+                         {:keys [for-valid-time for-system-time]}, ^Instant snapshot-time]
+  (letfn [(->time-μs
+            ([arg] (->time-μs arg nil))
+            ([[tag arg] default]
+             (case tag
+               :literal (or (some-> arg
+                                    (time/sql-temporal->micros expr/*default-tz*))
+                            default)
+               :param (or (some-> (-> (.vectorForOrNull args (name arg)) (.getObject 0))
+                                  (time/sql-temporal->micros expr/*default-tz*))
+                          default)
+               :now (-> (expr/current-time) (time/instant->micros))
+               :expr (let [param-types (expr/->param-types args)
+                           projection (expr/->expression-projection-spec "_temporal_expression"
+                                                                         (expr/form->expr (list 'cast_tstz arg) {:param-types param-types})
+                                                                         {:param-types param-types})]
+                       (util/with-open [res (.project projection alloc vw/empty-args {} args)]
+                         (if-let [inst-like (.getObject res 0)]
+                           (do
+                             (time/expect-instant inst-like)
+                             (-> inst-like time/->instant time/instant->micros))
+                           default))))))
           (apply-constraint [constraint]
             (if-let [[tag & args] constraint]
               (case tag
                 :at (let [[at] args
-                          at-μs (->time-μs at)]
+                          at-μs (->time-μs at (-> (expr/current-time) (time/instant->micros)))]
                       (TemporalDimension/at at-μs))
 
                 ;; overlaps [time-from time-to]
                 :in (let [[from to] args]
-                      (TemporalDimension/in (->time-μs (or from [:now]))
+                      ;; TODO asymmetry of defaulting start-of-time-here and end-of-time in TemporalBounds
+                      (TemporalDimension/in (->time-μs from time/start-of-time-as-micros)
                                             (some-> to ->time-μs)))
 
                 :between (let [[from to] args]
-                           (TemporalDimension/between (->time-μs (or from [:now]))
+                           (TemporalDimension/between (->time-μs from time/start-of-time-as-micros)
                                                       (some-> to ->time-μs)))
 
                 :all-time (TemporalDimension.))
@@ -152,10 +167,11 @@
           :metadata-mgr (ig/ref ::meta/metadata-manager)
           :buffer-pool (ig/ref :xtdb/buffer-pool)
           :table-catalog (ig/ref :xtdb/table-catalog)
-          :trie-catalog (ig/ref :xtdb/trie-catalog)}))
+          :trie-catalog (ig/ref :xtdb/trie-catalog)
+          :info-schema (ig/ref :xtdb/information-schema)}))
 
 (defmethod ig/init-key ::scan-emitter [_ {:keys [^BufferAllocator allocator, ^PageMetadata$Factory metadata-mgr, ^BufferPool buffer-pool,
-                                                 ^TrieCatalog trie-catalog, table-catalog]}]
+                                                 info-schema ^TrieCatalog trie-catalog, table-catalog]}]
   (let [table->template-rel+trie (info-schema/table->template-rel+tries allocator)]
     (reify IScanEmitter
       (close [_] (->> table->template-rel+trie vals (map first) util/close))
@@ -216,7 +232,7 @@
            :->cursor (fn [{:keys [allocator, ^Watermark watermark, snapshot-time, schema, args]}]
                        (if (and (info-schema/derived-tables table) (not (info-schema/template-tables table)))
                          (let [derived-table-schema (info-schema/derived-tables table)]
-                           (info-schema/->cursor allocator derived-table-schema table col-names col-preds schema args table-catalog trie-catalog watermark))
+                           (info-schema/->cursor info-schema allocator watermark derived-table-schema table col-names col-preds schema args))
 
                          (let [template-table? (info-schema/template-tables table)
                                iid-bb (selects->iid-byte-buffer selects args)
@@ -226,9 +242,9 @@
                                scan-opts (-> scan-opts
                                              (update :for-valid-time
                                                      (fn [fvt]
-                                                       (or fvt [:at [:now :now]]))))
+                                                       (or fvt [:at [:now]]))))
                                ^LiveTable$Watermark live-table-wm (some-> (.getLiveIndex watermark) (.liveTable table-name))
-                               temporal-bounds (->temporal-bounds args scan-opts snapshot-time)]
+                               temporal-bounds (->temporal-bounds allocator args scan-opts snapshot-time)]
                            (util/with-open [iid-arrow-buf (when iid-bb (util/->arrow-buf-view allocator iid-bb))]
                              (let [merge-tasks (util/with-open [page-metadatas (LinkedList.)]
                                                  (let [segments (cond-> (mapv (fn [{:keys [trie-key]}]

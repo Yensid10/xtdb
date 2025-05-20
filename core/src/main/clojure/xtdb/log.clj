@@ -1,11 +1,12 @@
 (ns xtdb.log
   (:require [clojure.string :as str]
+            [clojure.tools.logging :as log]
             [integrant.core :as ig]
             [xtdb.api :as xt]
             [xtdb.error :as err]
             [xtdb.node :as xtn]
             xtdb.protocols
-            [xtdb.sql.plan :as plan]
+            [xtdb.sql :as sql]
             [xtdb.time :as time]
             [xtdb.types :as types]
             [xtdb.util :as util]
@@ -17,12 +18,14 @@
            (org.apache.arrow.vector VectorSchemaRoot)
            (org.apache.arrow.vector.types.pojo ArrowType$Union FieldType Schema)
            org.apache.arrow.vector.types.UnionMode
-           (xtdb.api Xtdb$Config)
+           (xtdb.api Xtdb$Config TransactionKey)
            (xtdb.api.log Log Log$Factory Log$Message$Tx)
            (xtdb.api.tx TxOp$Sql)
            (xtdb.arrow Relation VectorWriter)
+           xtdb.catalog.BlockCatalog
            xtdb.indexer.LogProcessor
-           (xtdb.tx_ops Abort DeleteDocs EraseDocs PatchDocs PutDocs SqlByteArgs)))
+           (xtdb.tx_ops Abort DeleteDocs EraseDocs PatchDocs PutDocs SqlByteArgs)
+           (xtdb.util TxIdUtil)))
 
 (set! *unchecked-math* :warn-on-boxed)
 
@@ -62,8 +65,8 @@
 
         (let [root (doto (VectorSchemaRoot. vecs) (.setRowCount (count arg-rows)))]
           (util/build-arrow-ipc-byte-buffer root :stream
-                                            (fn [write-page!]
-                                              (write-page!))))
+            (fn [write-page!]
+              (write-page!))))
 
         (finally
           (run! util/try-close vecs))))))
@@ -101,7 +104,7 @@
         valid-from-writer (.vectorFor op-writer "_valid_from" types/nullable-temporal-field-type)
         valid-to-writer (.vectorFor op-writer "_valid_to" types/nullable-temporal-field-type)
         table-doc-writers (HashMap.)]
-    (fn write-put! [{:keys [table-name docs valid-from valid-to]}]
+    (fn write-put! [{:keys [table-name docs valid-from valid-to]} opts]
       (let [table-name (str (symbol (util/with-default-schema table-name)))]
         (when (forbidden-table? table-name) (throw (forbidden-table-ex table-name)))
 
@@ -122,8 +125,8 @@
             (.writeBytes iid-writer (util/->iid eid)))
           (.endList iids-writer))
 
-        (.writeObject valid-from-writer valid-from)
-        (.writeObject valid-to-writer valid-to)
+        (.writeObject valid-from-writer (time/->instant valid-from opts))
+        (.writeObject valid-to-writer (time/->instant valid-to opts))
 
         (.endStruct op-writer)))))
 
@@ -191,15 +194,15 @@
     (doseq [tx-op tx-ops]
       (condp instance? tx-op
         TxOp$Sql (let [^TxOp$Sql tx-op tx-op]
-                   (if-let [put-docs-ops (plan/sql->static-ops (.sql tx-op) (.argRows tx-op) {:default-tz default-tz})]
+                   (if-let [put-docs-ops (sql/sql->static-ops (.sql tx-op) (.argRows tx-op))]
                      (doseq [op put-docs-ops]
-                       (@!write-put! op))
+                       (@!write-put! op {:default-tz default-tz}))
 
                      (@!write-sql! tx-op)))
 
         SqlByteArgs (@!write-sql-byte-args! tx-op)
-        PutDocs (@!write-put! tx-op)
-        PatchDocs (@!write-patch! tx-op)
+        PutDocs (@!write-put! tx-op {:default-tz default-tz})
+        PatchDocs (@!write-patch! tx-op {:default-tz default-tz})
         DeleteDocs (@!write-delete! tx-op)
         EraseDocs (@!write-erase! tx-op)
         Abort (@!write-abort! tx-op)
@@ -214,7 +217,8 @@
           user-writer (.get rel "user")]
 
       (when system-time
-        (.writeObject (.get rel "system-time") (time/->zdt system-time)))
+        (.writeObject (.get rel "system-time") (-> (time/->zdt system-time)
+                                                   (.withZoneSameInstant time/utc))))
 
       (when user
         (.writeObject user-writer user))
@@ -229,15 +233,17 @@
 
       (.getAsArrowStream rel))))
 
-(defmethod xtn/apply-config! ::memory-log [^Xtdb$Config config _ {:keys [instant-src]}]
+(defmethod xtn/apply-config! ::memory-log [^Xtdb$Config config _ {:keys [instant-src epoch]}]
   (doto config
     (.setLog (cond-> (Log/getInMemoryLog)
-                   instant-src (.instantSource instant-src)))))
+               instant-src (.instantSource instant-src)
+               epoch (.epoch epoch)))))
 
-(defmethod xtn/apply-config! ::local-directory-log [^Xtdb$Config config _ {:keys [path instant-src]}]
+(defmethod xtn/apply-config! ::local-directory-log [^Xtdb$Config config _ {:keys [path instant-src epoch]}]
   (doto config
     (.setLog (cond-> (Log/localLog (util/->path path))
-                   instant-src (.instantSource instant-src)))))
+               instant-src (.instantSource instant-src)
+               epoch (.epoch epoch)))))
 
 (defmethod xtn/apply-config! :xtdb/log [config _ [tag opts]]
   (xtn/apply-config! config
@@ -247,8 +253,38 @@
                        :kafka :xtdb.kafka/log)
                      opts))
 
-(defmethod ig/init-key :xtdb/log [_ ^Log$Factory factory]
-  (.openLog factory))
+(defmethod ig/prep-key :xtdb/log [_ factory]
+  {:block-cat (ig/ref :xtdb/block-catalog)
+   :factory factory})
+
+(def out-of-sync-log-message
+  "Node failed to start due to an invalid transaction log state (%s) that does not correspond with the latest indexed transaction (epoch=%s and offset=%s).
+   
+   Please see https://docs.xtdb.com/ops/ops/backup-and-restore/out-of-sync-log for more information and next steps.")
+
+(defn ->out-of-sync-exception [latest-completed-offset ^long latest-submitted-offset ^long epoch]
+  (let [log-state-str (if (= -1 latest-submitted-offset)
+                        "the log is empty"
+                        (format "epoch=%s, offset=%s" epoch latest-submitted-offset))]
+    (IllegalStateException.
+     (format out-of-sync-log-message log-state-str epoch latest-completed-offset))))
+
+(defn validate-offsets [^Log log ^TransactionKey latest-completed-tx]
+  (when latest-completed-tx
+    (let [latest-completed-tx-id (.getTxId latest-completed-tx)
+          latest-completed-offset (TxIdUtil/txIdToOffset latest-completed-tx-id)
+          latest-completed-epoch (TxIdUtil/txIdToEpoch latest-completed-tx-id)
+          epoch (.getEpoch log)
+          latest-submitted-offset (.getLatestSubmittedOffset log)]
+      (if (= latest-completed-epoch epoch)
+        (cond
+          (< latest-submitted-offset latest-completed-offset)
+          (throw (->out-of-sync-exception latest-completed-offset latest-submitted-offset epoch)))
+        (log/info "Starting node with a log that has a different epoch than the latest completed tx (This is expected if you are starting a new epoch) - Skipping offset validation.")))))
+
+(defmethod ig/init-key :xtdb/log [_ {:keys [^BlockCatalog block-cat ^Log$Factory factory]}]
+  (doto (.openLog factory)
+    (validate-offsets (.getLatestCompletedTx block-cat))))
 
 (defmethod ig/halt-key! :xtdb/log [_ ^Log log]
   (util/close log))

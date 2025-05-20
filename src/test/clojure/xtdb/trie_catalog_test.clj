@@ -294,7 +294,7 @@
 
       (with-open [node (tu/->local-node {:node-dir node-dir, :compactor-threads 0})]
         (let [cat (cat/trie-catalog node)]
-          (.addTries cat
+          (.addTries cat "public/foo"
                      (->> [["l00-rc-b00" 1] ["l00-rc-b01" 1] ["l00-rc-b02" 1] ["l00-rc-b03" 1]
                            ["l01-rc-b00" 2] ["l01-rc-b01" 2] ["l01-rc-b02" 2]
                            ["l02-rc-p0-b01" 4] ["l02-rc-p1-b01" 4] ["l02-rc-p2-b01" 4] ["l02-rc-p3-b01"4]]
@@ -317,3 +317,11 @@
   ;; (in practice, we always submit L1C after L1H - but this keeps the invariant definition simpler to understand)
   (t/is (= #{"l01-r20200101-b01" "l01-r20200102-b01" "l01-rc-b01"}
            (curr-tries ["l01-r20200101-b01" 5] ["l01-rc-b01" 15] ["l01-r20200102-b01" 5]))))
+
+(t/deftest stack-overflow-exception-creating-tries-4377
+  (t/is (= #{"l01-rc-b3270f"}
+           (apply curr-tries
+                  (concat (for [n (range 10000)]
+                            [(str "l00-rc-b" (util/->lex-hex-string n)) 1])
+                          (for [n (range 10000)]
+                            [(str "l01-rc-b" (util/->lex-hex-string n)) 1]))))))

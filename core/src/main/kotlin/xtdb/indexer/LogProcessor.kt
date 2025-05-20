@@ -7,13 +7,14 @@ import kotlinx.coroutines.runBlocking
 import org.apache.arrow.memory.BufferAllocator
 import org.apache.arrow.vector.ipc.ArrowStreamReader
 import org.slf4j.LoggerFactory
-import xtdb.api.log.Log
+import xtdb.api.log.*
 import xtdb.api.log.Log.Message
-import xtdb.api.log.MessageId
-import xtdb.api.log.Watchers
 import xtdb.api.storage.Storage
 import xtdb.arrow.asChannel
 import xtdb.trie.TrieCatalog
+import xtdb.util.TxIdUtil.offsetToTxId
+import xtdb.util.TxIdUtil.txIdToEpoch
+import xtdb.util.TxIdUtil.txIdToOffset
 import xtdb.util.error
 import xtdb.util.logger
 import java.nio.channels.ClosedByInterruptException
@@ -36,7 +37,18 @@ class LogProcessor(
         private val LOG = LogProcessor::class.logger
     }
 
-    private val watchers = Watchers(liveIndex.latestCompletedTx?.txId ?: -1)
+    private val epoch = log.epoch
+
+    override var latestProcessedMsgId: MessageId =
+        liveIndex.latestCompletedTx?.txId?.let {
+            if (txIdToEpoch(it) == epoch) it else offsetToTxId(epoch, 0) - 1
+        } ?: -1
+        private set
+
+    override val latestSubmittedMsgId: MessageId
+        get() = offsetToTxId(epoch, log.latestSubmittedOffset)
+
+    private val watchers = Watchers(latestProcessedMsgId)
     private val LOGGER = LoggerFactory.getLogger(LogProcessor::class.java)
 
     val ingestionError get() = watchers.exception
@@ -44,8 +56,8 @@ class LogProcessor(
     data class Flusher(
         val flushTimeout: Duration,
         var lastFlushCheck: Instant,
-        var previousBlockTxId: Long,
-        var flushedTxId: Long
+        var previousBlockTxId: MessageId,
+        var flushedTxId: MessageId
     ) {
         constructor(flushTimeout: Duration, liveIndex: LiveIndex) : this(
             flushTimeout, Instant.now(),
@@ -53,7 +65,7 @@ class LogProcessor(
             flushedTxId = -1
         )
 
-        fun checkBlockTimeout(now: Instant, currentBlockTxId: Long, latestCompletedTxId: Long): Message? =
+        fun checkBlockTimeout(now: Instant, currentBlockTxId: MessageId, latestCompletedTxId: MessageId): Message? =
             when {
                 lastFlushCheck + flushTimeout >= now || flushedTxId == latestCompletedTxId -> null
                 currentBlockTxId != previousBlockTxId -> {
@@ -89,25 +101,21 @@ class LogProcessor(
         allocator.close()
     }
 
-    override val latestSubmittedMsgId: MessageId
-        get() = log.latestSubmittedOffset
-
-    override var latestProcessedMsgId: MessageId =
-        liveIndex.latestCompletedTx?.txId ?: -1
-        private set
-
     private val flusher = Flusher(flushTimeout, liveIndex)
 
-    private val latestProcessedOffset = latestProcessedMsgId
+    private val latestProcessedOffset = liveIndex.latestCompletedTx?.txId?.let {
+        if (txIdToEpoch(it) == epoch) txIdToOffset(it) else -1
+    } ?: -1
     private val subscription = log.subscribe(this, latestProcessedOffset)
 
     override fun processRecords(records: List<Log.Record>) = runBlocking {
         flusher.checkBlockTimeout(liveIndex)?.let { flushMsg ->
-            flusher.flushedTxId = log.appendMessage(flushMsg).await()
+            val offset = log.appendMessage(flushMsg).await()
+            flusher.flushedTxId = offsetToTxId(epoch, offset)
         }
 
         records.forEach { record ->
-            val msgId = record.logOffset
+            val msgId = offsetToTxId(epoch, record.logOffset)
 
             try {
                 val res = when (val msg = record.message) {
@@ -121,7 +129,6 @@ class LogProcessor(
                                 ArrowStreamReader(txOpsCh, allocator).use { reader ->
                                     reader.vectorSchemaRoot.use { root ->
                                         reader.loadNextBatch()
-
                                         indexer.indexTx(msgId, record.logTimestamp, root)
                                     }
                                 }
@@ -136,7 +143,7 @@ class LogProcessor(
 
                     is Message.TriesAdded -> {
                         if (msg.storageVersion == Storage.VERSION)
-                            trieCatalog.addTries(msg.tries)
+                            msg.tries.groupBy { it.tableName }.forEach(trieCatalog::addTries)
                         null
                     }
                 }
@@ -151,12 +158,12 @@ class LogProcessor(
                 throw CancellationException(ie)
             } catch (e: Throwable) {
                 watchers.notify(msgId, e)
-                LOG.error(e, "Ingestion stopped: error processing log record at id $msgId.")
+                LOG.error(e, "Ingestion stopped: error processing log record at id $msgId (epoch: $epoch, logOffset: ${record.logOffset})")
                 LOG.error(
                     """
                     XTDB transaction processing has encountered an unrecoverable error and has been stopped to prevent corruption of your data.
                     This node has also been marked unhealthy, so if it is running within a container orchestration system (e.g. Kubernetes) it should be restarted shortly.
-                    
+
                     Please see https://docs.xtdb.com/ops/troubleshooting#ingestion-stopped for more information and next steps.
                 """.trimIndent()
                 )

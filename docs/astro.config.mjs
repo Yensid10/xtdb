@@ -106,6 +106,7 @@ export default defineConfig({
                                 { label: 'Numeric functions', link: '/reference/main/stdlib/numeric' },
                                 { label: 'String functions', link: '/reference/main/stdlib/string' },
                                 { label: 'Temporal functions', link: '/reference/main/stdlib/temporal' },
+                                { label: 'URI functions', link: '/reference/main/stdlib/uri' },
                                 { label: 'Aggregate functions', link: '/reference/main/stdlib/aggregates' },
                                 { label: 'Other functions', link: '/reference/main/stdlib/other' }
                             ]
@@ -150,12 +151,20 @@ export default defineConfig({
                         { label: 'AWS', link: '/ops/aws' },
                         { label: 'Azure', link: '/ops/azure' },
                         { label: 'Google Cloud', link: '/ops/google-cloud' },
+                        { 
+                            label: 'Backup and Restore',
+                            items: [
+                                { label: 'Overview', link: '/ops/backup-and-restore/overview' },
+                                { label: 'Out of Sync Log & Intact Storage', link: '/ops/backup-and-restore/out-of-sync-log' },
+                                
+                            ]
+                        },
                         { label: 'Troubleshooting', link: '/ops/troubleshooting' },
 
                     ]
                 },
                 {
-                    label: 'XTQL (Clojure)',
+                    label: 'XTQL',
                     collapsed: true,
                     items: [
                         'xtql/tutorials/introducing-xtql',
@@ -166,7 +175,7 @@ export default defineConfig({
                             label: 'Reference',
                             collapsed: true,
                             items: [
-                                { label: 'Transactions/DML', link: '/reference/main/xtql/txs' },
+                                { label: 'Transactions', link: '/reference/main/xtql/txs' },
                                 { label: 'Queries', link: '/reference/main/xtql/queries' },
                                 { label: 'Standard library', link: '/reference/main/xtql/stdlib' },
                             ]
@@ -179,8 +188,8 @@ export default defineConfig({
                     items: [
                         { label: 'Mission', link: '/intro/why-xtdb' },
                         { label: 'XTDB at a glance', link: '/intro/what-is-xtdb' },
-                        { label: 'How XTDB works', link: '/intro/data-model' },
-                        // { label: 'Architecture', link: '/intro/architecture' },
+                        { label: 'Key Concepts', link: '/concepts/key-concepts' },
+			            { label: 'How XTDB works', link: '/intro/data-model' },
                         // { label: 'Bitemporality', link: '/intro/bitemporality' }
 
                         { label: 'Community', link: '/intro/community' },

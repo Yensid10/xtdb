@@ -574,13 +574,13 @@
         (cpb/check-pbuf (.toPath (io/as-file (io/resource "xtdb/compactor-test/compactor-metadata-test")))
                         (.resolve node-dir "objects"))
 
-        (let [current-tries (->> (.getByteArray bp (util/->path "tables/public$foo/blocks/b02.binpb"))
-                                 TableBlock/parseFrom
-                                 table-cat/<-table-block
-                                 :current-tries
-                                 (into #{} (map table-test/trie-details->edn)))]
+        (let [tries (->> (.getByteArray bp (util/->path "tables/public$foo/blocks/b02.binpb"))
+                         TableBlock/parseFrom
+                         table-cat/<-table-block
+                         :tries
+                         (into #{} (map table-test/trie-details->edn)))]
           (t/is (= #{"l00-rc-b00" "l01-r20110103-b00" "l01-rc-b00" "l00-rc-b01" "l01-r20160104-b01" "l01-rc-b01"}
-                   (into #{} (map :trie-key) current-tries)))
+                   (into #{} (map :trie-key) tries)))
 
           (t/is (= {"l01-rc-b00" nil,
                     "l01-r20110103-b00" {:min-valid-from #xt/instant "2010-01-01T00:00:00Z",
@@ -598,7 +598,7 @@
                                          :min-system-from #xt/instant "2020-01-02T00:00:00Z",
                                          :max-system-from #xt/instant "2020-01-02T00:00:00Z",
                                          :row-count 1}}
-                   (->> current-tries
+                   (->> tries
                         (filter #(str/starts-with? (:trie-key %) "l01"))
                         (into {} (map (juxt :trie-key
                                             (fn [{:keys [trie-metadata]}]
@@ -641,3 +641,21 @@
 
   (t/is (= [{:xt/id 2, :l []} {:xt/id 1, :l [{:foo 1}]}]
            (xt/q tu/*node* ["SELECT * FROM docs" ]))))
+
+(t/deftest test-same-entity-same-transaction-4303
+  (let [q "SELECT *, _valid_from, _valid_to, _system_from, _system_to FROM docs FOR ALL VALID_TIME"]
+    (doseq [[test-name vf1 vt1 vf2 vt2] [["same valid-time"]
+                                         ["overriden in valid-time" #inst "2023" #inst "2024" #inst "2022" #inst "2025"]
+                                         ["split in valid-time" #inst "2022" #inst "2025" #inst "2023" #inst "2024"]
+                                         ["overlapping valid-time" #inst "2022" #inst "2025" #inst "2023" #inst "2026"]]]
+      (t/testing test-name
+        (with-open [node (xtn/start-node (merge tu/*node-opts* {:log [:in-memory {:instant-src (tu/->mock-clock (tu/->instants :year))}]}))]
+          (xt/execute-tx node [[:put-docs :docs
+                                {:xt/id 1, :version 1 :xt/valid-from vf1 :xt/valid-to vt1}
+                                {:xt/id 1, :version 2 :xt/valid-from vf2 :xt/valid-to vt2}]])
+
+          (let [res-before-compaction (xt/q node q)]
+            (tu/finish-block! node)
+            (c/compact-all! node nil)
+
+            (t/is (= (set res-before-compaction) (set (xt/q node q))))))))))

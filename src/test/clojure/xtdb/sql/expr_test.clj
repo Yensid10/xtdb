@@ -2,7 +2,7 @@
   (:require [clojure.test :as t]
             [xtdb.api :as xt]
             [xtdb.expression]
-            [xtdb.sql.plan :as plan]
+            [xtdb.sql :as sql]
             [xtdb.test-util :as tu]
             [xtdb.time :as time])
   (:import java.time.ZonedDateTime
@@ -12,19 +12,17 @@
 (t/use-fixtures :each tu/with-mock-clock tu/with-node)
 
 (def foo-scope
-  (plan/map->BaseTable (-> '{:table-name foo
-                             :table-alias foo
-                             :unique-table-alias f
-                             :cols #{a b}}
-                           (assoc :!reqd-cols (HashMap.)))))
+  (sql/map->BaseTable (-> '{:table-name foo
+                            :table-alias foo
+                            :unique-table-alias f
+                            :cols #{a b}}
+                          (assoc :!reqd-cols (HashMap.)))))
 
 (defn plan-expr-with-foo [expr]
-  (plan/plan-expr expr {:scope foo-scope}))
+  (sql/plan-expr expr {:scope foo-scope}))
 
 (t/deftest test-trim-expr
-  (t/are [sql expected]
-         (= expected (plan-expr-with-foo sql))
-
+  (t/are [sql expected] (= expected (plan-expr-with-foo sql))
     "TRIM(foo.a)" '(trim f/a " ")
 
     "TRIM(LEADING FROM foo.a)" '(trim-leading f/a " ")
@@ -44,9 +42,7 @@
     "TRIM('$' FROM foo.a)" '(trim f/a "$")))
 
 (t/deftest test-like-expr
-  (t/are [sql expected]
-         (= expected (plan-expr-with-foo sql))
-
+  (t/are [sql expected] (= expected (plan-expr-with-foo sql))
     "foo.a LIKE ''" '(like f/a "")
     "foo.a LIKE foo.b" '(like f/a f/b)
     "foo.a LIKE 'foo%'" '(like f/a "foo%")
@@ -59,9 +55,7 @@
     ))
 
 (t/deftest test-like-regex-expr
-  (t/are [sql expected]
-         (= expected (plan-expr-with-foo sql))
-
+  (t/are [sql expected] (= expected (plan-expr-with-foo sql))
     "foo.a LIKE_REGEX foo.b" '(like-regex f/a f/b "")
     "foo.a LIKE_REGEX foo.b FLAG 'i'" '(like-regex f/a f/b "i")
 
@@ -182,7 +176,7 @@
 
 (t/deftest test-numerical-fn-exprs
   (t/are [expr expected]
-         (= expected (plan-expr-with-foo expr))
+      (= expected (plan-expr-with-foo expr))
     "CARDINALITY(foo.a)" '(cardinality f/a)
     "ABS(foo.a)" '(abs f/a)
     "MOD(foo.a, foo.b)" '(mod f/a f/b)
@@ -202,12 +196,12 @@
 
 (t/deftest test-interval-abs
   (t/are [sql expected]
-         (= expected (plan-expr-with-foo sql)) 
+      (= expected (plan-expr-with-foo sql)) 
     "ABS(INTERVAL '1' YEAR)" '(abs (single-field-interval "1" "YEAR" 2 6))))
 
 (t/deftest test-boolean-predicate-exprs
   (t/are [expr expected]
-         (= expected (plan-expr-with-foo expr))
+      (= expected (plan-expr-with-foo expr))
     "1 > 2" '(> 1 2)
     "1 >= 2" '(>= 1 2)
     "1 < 2" '(< 1 2)
@@ -222,20 +216,28 @@
 
 (t/deftest test-overlay-expr
   (t/are [sql expected]
-         (= expected (plan-expr-with-foo sql))
+      (= expected (plan-expr-with-foo sql))
     "OVERLAY(foo.a PLACING foo.b FROM 1 for 4)" '(overlay f/a f/b 1 4)
     "OVERLAY(foo.a PLACING foo.b FROM 1)" '(overlay f/a f/b 1 (default-overlay-length f/b))))
 
 (t/deftest test-replace
   (t/is (= [{:out "foobaz"}] (xt/q tu/*node* "SELECT REPLACE('foobar', 'bar', 'baz') AS out")))
-
   (t/is (= [{:out "bazfoobaz"}] (xt/q tu/*node* "SELECT REPLACE('barfoobar', 'bar', 'baz') AS out")))
+  (t/is (= [{:out "foo"}] (xt/q tu/*node* "SELECT REPLACE('foo', 'bar', 'baz') AS out")))
 
-  (t/is (= [{:out "foo"}] (xt/q tu/*node* "SELECT REPLACE('foo', 'bar', 'baz') AS out"))))
+  (t/is (= [{:out "foo"}] (xt/q tu/*node* "SELECT REGEXP_REPLACE('foobar', 'bar', '') AS out")))
+  (t/is (= [{:out "foobaz"}] (xt/q tu/*node* "SELECT REGEXP_REPLACE('foobar', 'bar', 'baz') AS out")))
+
+  (t/is (= [{:out "fooBar"}] (xt/q tu/*node* "SELECT REGEXP_REPLACE('fooBar', 'bar', 'baz') AS out")))
+  (t/is (= [{:out "foobaz"}] (xt/q tu/*node* "SELECT REGEXP_REPLACE('fooBar', 'bar', 'baz', 'i') AS out")))
+
+  (t/is (= [{:out "fxxbxr"}] (xt/q tu/*node* "SELECT REGEXP_REPLACE('foobar', '(a|e|i|o|u)', 'x') AS out")))
+  (t/is (= [{:out "fxxbxr"}] (xt/q tu/*node* "SELECT REGEXP_REPLACE('foobar', '(a|e|i|o|u)', 'x') AS out")))
+  (t/is (= [{:out "f o  o b a r"}] (xt/q tu/*node* "SELECT REGEXP_REPLACE('foobar', '(a|e|i|o|u)', ' $1 ') AS out"))))
 
 (t/deftest test-bool-test-expr
   (t/are [sql expected]
-         (= expected (plan-expr-with-foo sql))
+      (= expected (plan-expr-with-foo sql))
 
     "foo.a IS true" '(true? f/a)
     "foo.a IS NOT true" '(not (true? f/a))
@@ -251,7 +253,7 @@
 
 (t/deftest test-interval-exprs
   (t/are [sql expected]
-         (= expected (plan-expr-with-foo sql))
+      (= expected (plan-expr-with-foo sql))
     "INTERVAL '1' YEAR + INTERVAL '3' MONTH + INTERVAL '4' DAY" '(+ (+ (single-field-interval "1" "YEAR" 2 6)
                                                                        (single-field-interval "3" "MONTH" 2 6))
                                                                     (single-field-interval "4" "DAY" 2 6))
@@ -332,7 +334,7 @@
 
 (t/deftest test-array-construction
   (t/are [sql expected]
-         (= expected (plan-expr-with-foo sql))
+      (= expected (plan-expr-with-foo sql))
 
     "ARRAY []" []
 
@@ -360,7 +362,7 @@
 
 (t/deftest test-object-construction
   (t/are [sql expected]
-         (= expected (plan-expr-with-foo sql))
+      (= expected (plan-expr-with-foo sql))
 
     "OBJECT ()" {}
     "OBJECT (foo: 2)" {:foo 2}
@@ -376,7 +378,7 @@
 
 (t/deftest test-object-field-access
   (t/are [sql expected]
-         (= expected (plan-expr-with-foo sql))
+      (= expected (plan-expr-with-foo sql))
 
     "OBJECT(foo: 2).foo" '(. {:foo 2} :foo)
     "{foo: 2}.foo" '(. {:foo 2} :foo)
@@ -389,7 +391,7 @@
 
 (t/deftest test-array-expressions
   (t/are [sql expected]
-         (= expected (plan-expr-with-foo sql))
+      (= expected (plan-expr-with-foo sql))
 
     "[1,2]" [1 2]
     "[1,2] || foo.a" '(concat [1 2] f/a)
@@ -397,7 +399,7 @@
 
 (t/deftest test-array-trim
   (t/are [sql expected]
-         (= expected (plan-expr-with-foo sql))
+      (= expected (plan-expr-with-foo sql))
 
     "TRIM_ARRAY(NULL, 2)" '(trim-array nil 2)
     "TRIM_ARRAY(foo.a, 2)" '(trim-array f/a 2)
@@ -406,7 +408,7 @@
 
 (t/deftest test-cast
   (t/are [sql expected]
-         (= expected (plan-expr-with-foo sql))
+      (= expected (plan-expr-with-foo sql))
 
     "CAST(NULL AS INT)" '(cast nil :i32)
     "CAST(NULL AS INTEGER)" '(cast nil :i32)
@@ -421,7 +423,7 @@
 (t/deftest test-postgres-cast-syntax
   (t/testing "planning"
     (t/are [sql expected]
-           (= expected (plan-expr-with-foo sql))
+        (= expected (plan-expr-with-foo sql))
 
       "NULL::INT" '(cast nil :i32)
       "foo.a::INT" '(cast f/a :i32)
@@ -496,66 +498,66 @@
   ;;
   ;;TODO add interval(9) syntax?
   #_(t/is (= [{:duration #xt/duration "PT13M56.123456789S"}]
-           (xt/q tu/*node* "SELECT CAST(INTERVAL '13:56.123456789' MINUTE TO SECOND AS DURATION(9)) as \"duration\""))))
+             (xt/q tu/*node* "SELECT CAST(INTERVAL '13:56.123456789' MINUTE TO SECOND AS DURATION(9)) as \"duration\""))))
 
 (t/deftest test-cast-duration-to-interval
 
   (t/testing "without interval qualifier"
-    (t/is (= [{:itvl #xt/interval-mdm ["P0D" "PT26H13M56.111111S"]}]
+    (t/is (= [{:itvl #xt/interval "PT26H13M56.111111S"}]
              (xt/q tu/*node* "SELECT CAST(DURATION 'PT26H13M56.111111S' AS INTERVAL) as itvl")))
 
-    (t/is (= [{:itvl #xt/interval-mdm ["P0D" "PT122H"]}]
+    (t/is (= [{:itvl #xt/interval "PT122H"}]
              (xt/q tu/*node* "SELECT CAST((TIMESTAMP '2021-10-26T14:00:00' - TIMESTAMP '2021-10-21T12:00:00') AS INTERVAL) as itvl")))
 
-    (t/is (= [{:itvl #xt/interval-mdm  ["P0D" "PT8882H"]}]
+    (t/is (= [{:itvl #xt/interval "PT8882H"}]
              (xt/q tu/*node* "SELECT CAST((TIMESTAMP '2021-10-26T14:00:00' - TIMESTAMP '2020-10-21T12:00:00') AS INTERVAL) as itvl"))))
 
   (t/testing "with interval qualifier"
-    (t/is (= [{:itvl #xt/interval-mdm ["P1D" "PT0S"]}]
+    (t/is (= [{:itvl #xt/interval "P1D"}]
              (xt/q tu/*node* "SELECT CAST(DURATION 'PT26H13M56.111111S' AS INTERVAL DAY) as itvl")))
 
-    (t/is (= [{:itvl #xt/interval-mdm ["P1D" "PT2H"]}]
+    (t/is (= [{:itvl #xt/interval "P1DT2H"}]
              (xt/q tu/*node* "SELECT CAST(DURATION 'PT26H13M56.111111S' AS INTERVAL DAY TO HOUR) as itvl")))
 
-    (t/is (= [{:itvl #xt/interval-mdm ["P1D" "PT2H13M"]}]
+    (t/is (= [{:itvl #xt/interval "P1DT2H13M"}]
              (xt/q tu/*node* "SELECT CAST(DURATION 'PT26H13M56.111111S' AS INTERVAL DAY TO MINUTE) as itvl")))
 
-    (t/is (= [{:itvl #xt/interval-mdm ["P1D" "PT2H13M56.111111S"]}]
+    (t/is (= [{:itvl #xt/interval "P1DT2H13M56.111111S"}]
              (xt/q tu/*node* "SELECT CAST(DURATION 'PT26H13M56.111111S' AS INTERVAL DAY TO SECOND) as itvl")))
 
-    (t/is (= [{:itvl #xt/interval-mdm ["P1D" "PT2H13M56.111S"]}]
+    (t/is (= [{:itvl #xt/interval "P1DT2H13M56.111S"}]
              (xt/q tu/*node* "SELECT CAST(DURATION 'PT26H13M56.111111S' AS INTERVAL DAY TO SECOND(3)) as itvl")))))
 
 (t/deftest test-cast-interval-to-interval
-  (t/is (= [{:itvl #xt/interval-ym "P22M"}]
+  (t/is (= [{:itvl #xt/interval "P22M"}]
            (xt/q tu/*node* "SELECT CAST(INTERVAL '1-10' YEAR TO MONTH AS INTERVAL) as itvl")))
 
-  (t/is (= [{:itvl #xt/interval-ym "P12M"}]
+  (t/is (= [{:itvl #xt/interval "P12M"}]
            (xt/q tu/*node* "SELECT CAST(INTERVAL '1-10' YEAR TO MONTH AS INTERVAL YEAR) as itvl")))
 
-  (t/is (= [{:itvl #xt/interval-mdm ["P1D" "PT0S"]}]
+  (t/is (= [{:itvl #xt/interval "P1D"}]
            (xt/q tu/*node* "SELECT CAST(INTERVAL '1 11:11:11.111' DAY TO SECOND AS INTERVAL DAY) as itvl")))
 
-  (t/is (= [{:itvl #xt/interval-mdm ["P1D" "PT11H"]}]
+  (t/is (= [{:itvl #xt/interval "P1DT11H"}]
            (xt/q tu/*node* "SELECT CAST(INTERVAL '1 11:11:11.111' DAY TO SECOND AS INTERVAL DAY TO HOUR) as itvl")))
 
-  (t/is (= [{:itvl #xt/interval-mdm ["P1D" "PT11H11M"]}]
+  (t/is (= [{:itvl #xt/interval "P1DT11H11M"}]
            (xt/q tu/*node* "SELECT CAST(INTERVAL '1 11:11:11.111' DAY TO SECOND AS INTERVAL DAY TO MINUTE) as itvl")))
 
-  (t/is (= [{:itvl #xt/interval-mdm ["P1D" "PT11H11M11.111S"]}]
+  (t/is (= [{:itvl #xt/interval "P1DT11H11M11.111S"}]
            (xt/q tu/*node* "SELECT CAST(INTERVAL '1 11:11:11.111' DAY TO SECOND AS INTERVAL DAY TO SECOND) as itvl")))
 
-  (t/is (= [{:itvl #xt/interval-mdm ["P1D" "PT11H11M11S"]}]
+  (t/is (= [{:itvl #xt/interval "P1DT11H11M11S"}]
            (xt/q tu/*node* "SELECT CAST(INTERVAL '1 11:11:11.111' DAY TO SECOND AS INTERVAL DAY TO SECOND(0)) as itvl")))
 
-  (t/is (= [{:itvl #xt/interval-mdm ["P0D" "PT35H"]}]
+  (t/is (= [{:itvl #xt/interval "PT35H"}]
            (xt/q tu/*node* "SELECT CAST(INTERVAL '1 11:11:11.111' DAY TO SECOND AS INTERVAL HOUR) as itvl"))))
 
 (t/deftest test-cast-int-to-interval
-  (t/is (= [{:itvl #xt/interval-mdm ["P3D" "PT0S"]}]
+  (t/is (= [{:itvl #xt/interval "P3D"}]
            (xt/q tu/*node* "SELECT CAST(3 AS INTERVAL DAY) as itvl")))
 
-  (t/is (= [{:itvl #xt/interval-ym "P24M"}]
+  (t/is (= [{:itvl #xt/interval "P24M"}]
            (xt/q tu/*node* "SELECT CAST(2 AS INTERVAL YEAR) as itvl")))
 
   (t/is (thrown-with-msg?
@@ -564,13 +566,13 @@
          (xt/q tu/*node* "SELECT CAST(2 AS INTERVAL YEAR TO MONTH) as itvl"))))
 
 (t/deftest test-cast-string-to-interval-with-qualifier
-  (t/is (= [{:itvl #xt/interval-mdm ["P3D" "PT11H10M"]}]
+  (t/is (= [{:itvl #xt/interval "P3DT11H10M"}]
            (xt/q tu/*node* "SELECT CAST('3 11:10' AS INTERVAL DAY TO MINUTE) as itvl")))
 
-  (t/is (= [{:itvl #xt/interval-ym "P24M"}]
+  (t/is (= [{:itvl #xt/interval "P2Y"}]
            (xt/q tu/*node* "SELECT CAST('2' AS INTERVAL YEAR) as itvl")))
 
-  (t/is (= [{:itvl #xt/interval-ym "P22M"}]
+  (t/is (= [{:itvl #xt/interval "P22M"}]
            (xt/q tu/*node* "SELECT CAST('1-10' AS INTERVAL YEAR TO MONTH) as itvl")))
 
   (t/is (thrown-with-msg?
@@ -579,55 +581,55 @@
          (xt/q tu/*node* "SELECT CAST('11:10' AS INTERVAL MINUTE TO HOUR) as itvl")))
 
   (t/testing "ISO with seconds precision"
-    (t/is (= [{:itvl #xt/interval-mdm ["P0D" "PT10M10.123456S"]}]
+    (t/is (= [{:itvl #xt/interval "PT10M10.123456S"}]
              (xt/q tu/*node* "SELECT INTERVAL '10:10.123456789' MINUTE TO SECOND itvl")))
 
-    (t/is (= [{:itvl #xt/interval-mdm ["P0D" "PT10M10.1234S"]}]
+    (t/is (= [{:itvl #xt/interval "PT10M10.1234S"}]
              (xt/q tu/*node* "SELECT INTERVAL '10:10.1234' MINUTE TO SECOND itvl")))
 
-    (t/is (= [{:itvl #xt/interval-mdm ["P0D" "PT10M10.1234S"]}]
+    (t/is (= [{:itvl #xt/interval "PT10M10.1234S"}]
              (xt/q tu/*node* "SELECT INTERVAL '10:10.1234' MINUTE TO SECOND(5) itvl")))
 
-    (t/is (= [{:itvl #xt/interval-mdm ["P0D" "PT10M10.123S"]}]
+    (t/is (= [{:itvl #xt/interval "PT10M10.123S"}]
              (xt/q tu/*node* "SELECT INTERVAL '10:10.123456789' MINUTE TO SECOND(3) itvl")))
 
-    (t/is (= [{:itvl #xt/interval-mdm ["P0D" "PT10M10.123456S"]}]
+    (t/is (= [{:itvl #xt/interval "PT10M10.123456S"}]
              (xt/q tu/*node* "SELECT INTERVAL '10:10.123456789' MINUTE TO SECOND(6) itvl")))
 
-    (t/is (= [{:itvl #xt/interval-mdn ["P0D" "PT10M10.123456789S"]}]
+    (t/is (= [{:itvl #xt/interval "PT10M10.123456789S"}]
              (xt/q tu/*node* "SELECT INTERVAL '10:10.123456789' MINUTE TO SECOND(9) itvl")))))
 
 (t/deftest test-cast-string-to-interval-without-qualifier
   ;;TODO interval(9) syntax
-  (t/is (= [{:itvl #xt/interval-mdm ["P3D" "PT11H10M"]}]
+  (t/is (= [{:itvl #xt/interval "P3DT11H10M"}]
            (xt/q tu/*node* "SELECT CAST('P3DT11H10M' AS INTERVAL) as itvl")))
 
-  (t/is (= [{:itvl #xt/interval-mdm ["P24M" "PT0S"]}]
+  (t/is (= [{:itvl #xt/interval "P2Y"}]
            (xt/q tu/*node* "SELECT CAST('P2Y' AS INTERVAL) as itvl")))
 
-  (t/is (= [{:itvl #xt/interval-mdm ["P22M" "PT0S"]}]
+  (t/is (= [{:itvl #xt/interval "P22M"}]
            (xt/q tu/*node* "SELECT CAST('P1Y10M' AS INTERVAL) as itvl")))
 
-  (t/is (= [{:itvl #xt/interval-mdm ["P1M1D" "PT1H1M1.11111S"]}]
+  (t/is (= [{:itvl #xt/interval "P1M1DT1H1M1.11111S"}]
            (xt/q tu/*node* "SELECT CAST('P1M1DT1H1M1.11111S' AS INTERVAL) as itvl")))
 
-  (t/is (= [{:itvl #xt/interval-mdm ["P1M1D" "PT1H1M1.111111S"]}]
+  (t/is (= [{:itvl #xt/interval "P1M1DT1H1M1.111111S"}]
            (xt/q tu/*node* "SELECT CAST('P1M1DT1H1M1.11111111S' AS INTERVAL) as itvl")))
 
-  (t/is (= [{:itvl #xt/interval-mdm ["P0D" "PT-1H-1M"]}]
+  (t/is (= [{:itvl #xt/interval "PT-1H-1M"}]
            (xt/q tu/*node* "SELECT CAST('PT-1H-1M' AS INTERVAL) as itvl"))))
 
 (t/deftest test-cast-interval-to-string
-  (t/is (= [{:string "P2YT0S"}]
+  (t/is (= [{:string "P2Y"}]
            (xt/q tu/*node* "SELECT CAST(INTERVAL '2' YEAR AS VARCHAR) as string")))
 
-  (t/is (= [{:string "P22MT0S"}]
+  (t/is (= [{:string "P22M"}]
            (xt/q tu/*node* "SELECT CAST(INTERVAL '1-10' YEAR TO MONTH AS VARCHAR) as string")))
 
-  (t/is (= [{:string "P-22MT0S"}]
+  (t/is (= [{:string "P-22M"}]
            (xt/q tu/*node* "SELECT CAST(INTERVAL '-1-10' YEAR TO MONTH AS VARCHAR) as string")))
 
-  (t/is (= [{:string "P1DT0S"}]
+  (t/is (= [{:string "P1D"}]
            (xt/q tu/*node* "SELECT CAST(INTERVAL '1' DAY AS VARCHAR) as string")))
 
   (t/is (= [{:string "P1DT10H10M10S"}]
@@ -636,8 +638,8 @@
 
 (t/deftest test-timestamp-literal
   (t/are
-   [sql expected]
-   (= expected (plan-expr-with-foo sql))
+      [sql expected]
+      (= expected (plan-expr-with-foo sql))
     "TIMESTAMP '3000-03-15 20:40:31'" #xt/date-time "3000-03-15T20:40:31"
     "TIMESTAMP '3000-03-15 20:40:31.11'" #xt/date-time "3000-03-15T20:40:31.11"
     "TIMESTAMP '3000-03-15 20:40:31.2222'" #xt/date-time "3000-03-15T20:40:31.2222"
@@ -659,8 +661,8 @@
 
 (t/deftest test-time-literal
   (t/are
-   [sql expected]
-   (= expected (plan-expr-with-foo sql))
+      [sql expected]
+      (= expected (plan-expr-with-foo sql))
     "TIME '20:40:31'" #xt/time "20:40:31"
     "TIME '20:40:31.467'" #xt/time "20:40:31.467"
     "TIME '20:40:31.932254'" #xt/time "20:40:31.932254"
@@ -670,34 +672,30 @@
 
 (t/deftest date-literal
   (t/are
-   [sql expected]
-   (= expected (plan-expr-with-foo sql))
+      [sql expected]
+      (= expected (plan-expr-with-foo sql))
     "DATE '3000-03-15'" #xt/date "3000-03-15"))
 
 (t/deftest interval-literal
   (t/are [sql expected] (= expected (plan-expr-with-foo sql))
-    "INTERVAL 'P1Y'" #xt/interval-mdm ["P1Y" "PT0S"]
-    "INTERVAL 'P1Y-2M3D'" #xt/interval-mdm ["P1Y-2M3D" "PT0S"]
-    "INTERVAL 'PT5H6M12.912S'" #xt/interval-mdm ["P0D" "PT5H6M12.912S"]
-    "INTERVAL 'PT5H-6M-12.912S'" #xt/interval-mdm ["P0D" "PT4H53M47.088S"]
-    "INTERVAL 'P1Y3DT12H52S'" #xt/interval-mdm ["P1Y3D" "PT12H52S"]
-    "INTERVAL 'P1Y10M3DT12H52S'" #xt/interval-mdm ["P1Y10M3D" "PT12H52S"])
-
-  (t/is (thrown-with-msg?
-         RuntimeException #"Month Day Micro Interval only supports up to microsecond precision \(6\)"
-         (plan-expr-with-foo "INTERVAL 'P1DT1.123456789S'"))))
+    "INTERVAL 'P1Y'" #xt/interval "P1Y"
+    "INTERVAL 'P1Y-2M3D'" #xt/interval "P1Y-2M3D"
+    "INTERVAL 'PT5H6M12.912S'" #xt/interval "PT5H6M12.912S"
+    "INTERVAL 'PT5H-6M-12.912S'" #xt/interval "PT4H53M47.088S"
+    "INTERVAL 'P1Y3DT12H52S'" #xt/interval "P1Y3DT12H52S"
+    "INTERVAL 'P1Y10M3DT12H52S'" #xt/interval "P1Y10M3DT12H52S"))
 
 (t/deftest interval-literal-query
-  (t/is (= [{:itvl #xt/interval-mdm ["P12M" "PT0S"]}]
+  (t/is (= [{:itvl #xt/interval "P1Y"}]
            (xt/q tu/*node* "SELECT INTERVAL 'P1Y' as itvl")))
 
-  (t/is (= [{:itvl #xt/interval-mdm ["P10M3D" "PT0S"]}]
+  (t/is (= [{:itvl #xt/interval "P10M3D"}]
            (xt/q tu/*node* "SELECT INTERVAL 'P1Y-2M3D' as itvl")))
 
-  (t/is (= [{:itvl #xt/interval-mdm ["P0D" "PT5H6M12.912S"]}]
+  (t/is (= [{:itvl #xt/interval "PT5H6M12.912S"}]
            (xt/q tu/*node* "SELECT INTERVAL 'PT5H6M12.912S' as itvl")))
 
-  (t/is (= [{:itvl #xt/interval-mdm ["P22M3D" "PT4H53M47.088S"]}]
+  (t/is (= [{:itvl #xt/interval "P22M3DT4H53M47.088S"}]
            (xt/q tu/*node* "SELECT INTERVAL 'P1Y10M3DT5H-6M-12.912S' as itvl"))))
 
 (t/deftest duration-literal
@@ -729,8 +727,8 @@
 (t/deftest test-date-trunc-plan
   (t/testing "TIMESTAMP behaviour"
     (t/are
-     [sql expected]
-     (= expected (plan-expr-with-foo sql))
+        [sql expected]
+        (= expected (plan-expr-with-foo sql))
       "DATE_TRUNC(MICROSECOND, TIMESTAMP '2021-10-21T12:34:56')" '(date_trunc "MICROSECOND" #xt/date-time "2021-10-21T12:34:56")
       "DATE_TRUNC(MILLISECOND, TIMESTAMP '2021-10-21T12:34:56')" '(date_trunc "MILLISECOND" #xt/date-time "2021-10-21T12:34:56")
       "date_trunc(second, timestamp '2021-10-21T12:34:56')" '(date_trunc "SECOND" #xt/date-time "2021-10-21T12:34:56")
@@ -747,8 +745,8 @@
 
   (t/testing "INTERVAL behaviour"
     (t/are
-     [sql expected]
-     (= expected (plan-expr-with-foo sql))
+        [sql expected]
+        (= expected (plan-expr-with-foo sql))
       "DATE_TRUNC(DAY, INTERVAL '5' DAY)" '(date_trunc "DAY" (single-field-interval "5" "DAY" 2 6))
       "date_trunc(hour, interval '3 02:47:33' day to second)" '(date_trunc "HOUR" (multi-field-interval "3 02:47:33" "DAY" 2 "SECOND" 6)))))
 
@@ -777,7 +775,7 @@
     (t/is (= [{:v 2000000}]
              (xt/q tu/*node* "SELECT current_setting('server_version_num') AS v"))))
   (t/is (thrown-with-msg?
-         UnsupportedOperationException
+         IllegalArgumentException
          #"Setting not supported"
          (xt/q tu/*node* "SELECT current_setting('block_size') AS v"))))
 
@@ -799,21 +797,21 @@
            (xt/q tu/*node* "select date_trunc(day, TIMESTAMP '2001-02-16 15:38:11-05:00', 'Australia/Sydney') as \"timestamp\"")))
 
   (t/is (thrown-with-msg?
-         ZoneRulesException
+         IllegalArgumentException
          #"Unknown time-zone ID: NotRealRegion"
          (xt/q tu/*node* "select date_trunc(hour, TIMESTAMP '2000-01-02 00:43:11+00:00', 'NotRealRegion') as \"timestamp\""))))
 
 (t/deftest test-date-trunc-with-interval-query
-  (t/is (= [{:interval #xt/interval-mdm ["P36M" "PT0S"]}]
+  (t/is (= [{:interval #xt/interval "P3Y"}]
            (xt/q tu/*node* "SELECT DATE_TRUNC(YEAR, INTERVAL '3' YEAR + INTERVAL 'P3M') as \"interval\"")))
 
-  (t/is (= [{:interval #xt/interval-mdm ["P3M4D" "PT2S"]}]
+  (t/is (= [{:interval #xt/interval "P3M4DT2S"}]
            (xt/q tu/*node* "SELECT DATE_TRUNC(SECOND, INTERVAL '3' MONTH + INTERVAL 'P4DT2S') as `interval`")))
 
-  (t/is (= [{:interval #xt/interval-mdm ["P3M4D" "PT0S"]}]
+  (t/is (= [{:interval #xt/interval "P3M4D"}]
            (xt/q tu/*node* "SELECT DATE_TRUNC(DAY, INTERVAL 'P3M' + INTERVAL '4' DAY + INTERVAL '2' SECOND) as \"interval\"")))
 
-  (t/is (= [{:interval #xt/interval-mdm ["P3M" "PT0S"]}]
+  (t/is (= [{:interval #xt/interval "P3M"}]
            (xt/q tu/*node* "SELECT DATE_TRUNC(MONTH, INTERVAL '3' MONTH + INTERVAL 'P4D' + INTERVAL '2' SECOND) as \"interval\""))))
 
 (t/deftest test-date-bin
@@ -861,23 +859,23 @@ SELECT DATE_BIN(INTERVAL 'P1D', TIMESTAMP '2020-01-01T00:00:00Z'),
 
 
   (let [bins [#:xt{:from #xt/zoned-date-time "2023-12-19T00:00Z[UTC]",
-                  :to #xt/zoned-date-time "2024-01-18T00:00Z[UTC]",
-                  :weight 0.1118421052631579}
-             #:xt{:from #xt/zoned-date-time "2024-01-18T00:00Z[UTC]",
-                  :to #xt/zoned-date-time "2024-02-17T00:00Z[UTC]",
-                  :weight 0.19736842105263158}
-             #:xt{:from #xt/zoned-date-time "2024-02-17T00:00Z[UTC]",
-                  :to #xt/zoned-date-time "2024-03-18T00:00Z[UTC]",
-                  :weight 0.19736842105263158}
-             #:xt{:from #xt/zoned-date-time "2024-03-18T00:00Z[UTC]",
-                  :to #xt/zoned-date-time "2024-04-17T00:00Z[UTC]",
-                  :weight 0.19736842105263158}
-             #:xt{:from #xt/zoned-date-time "2024-04-17T00:00Z[UTC]",
-                  :to #xt/zoned-date-time "2024-05-17T00:00Z[UTC]",
-                  :weight 0.19736842105263158}
-             #:xt{:from #xt/zoned-date-time "2024-05-17T00:00Z[UTC]",
-                  :to #xt/zoned-date-time "2024-06-16T00:00Z[UTC]",
-                  :weight 0.09868421052631579}]]
+                   :to #xt/zoned-date-time "2024-01-18T00:00Z[UTC]",
+                   :weight 0.1118421052631579}
+              #:xt{:from #xt/zoned-date-time "2024-01-18T00:00Z[UTC]",
+                   :to #xt/zoned-date-time "2024-02-17T00:00Z[UTC]",
+                   :weight 0.19736842105263158}
+              #:xt{:from #xt/zoned-date-time "2024-02-17T00:00Z[UTC]",
+                   :to #xt/zoned-date-time "2024-03-18T00:00Z[UTC]",
+                   :weight 0.19736842105263158}
+              #:xt{:from #xt/zoned-date-time "2024-03-18T00:00Z[UTC]",
+                   :to #xt/zoned-date-time "2024-04-17T00:00Z[UTC]",
+                   :weight 0.19736842105263158}
+              #:xt{:from #xt/zoned-date-time "2024-04-17T00:00Z[UTC]",
+                   :to #xt/zoned-date-time "2024-05-17T00:00Z[UTC]",
+                   :weight 0.19736842105263158}
+              #:xt{:from #xt/zoned-date-time "2024-05-17T00:00Z[UTC]",
+                   :to #xt/zoned-date-time "2024-06-16T00:00Z[UTC]",
+                   :weight 0.09868421052631579}]]
     (t/is (= bins
              (xt/q tu/*node* "SELECT (bins.p)._from, (bins.p)._to, (bins.p)._weight
                               FROM UNNEST(RANGE_BINS(INTERVAL 'P30D', PERIOD(TIMESTAMP '2024-01-01T00:00:00Z', TIMESTAMP '2024-06-01T00:00:00Z'))) AS bins(p)"))
@@ -890,8 +888,8 @@ SELECT DATE_BIN(INTERVAL 'P1D', TIMESTAMP '2020-01-01T00:00:00Z'),
 (t/deftest test-extract-plan
   (t/testing "TIMESTAMP behaviour"
     (t/are
-     [sql expected]
-     (= expected (plan-expr-with-foo sql))
+        [sql expected]
+        (= expected (plan-expr-with-foo sql))
       "extract(second from timestamp '2021-10-21T12:34:56')" '(extract "SECOND" #xt/date-time "2021-10-21T12:34:56")
       "EXTRACT(MINUTE FROM TIMESTAMP '2021-10-21T12:34:56')" '(extract "MINUTE" #xt/date-time "2021-10-21T12:34:56")
       "EXTRACT(HOUR FROM TIMESTAMP '2021-10-21T12:34:56')" '(extract "HOUR" #xt/date-time "2021-10-21T12:34:56")
@@ -903,15 +901,15 @@ SELECT DATE_BIN(INTERVAL 'P1D', TIMESTAMP '2020-01-01T00:00:00Z'),
 
   (t/testing "INTERVAL behaviour"
     (t/are
-     [sql expected]
-     (= expected (plan-expr-with-foo sql))
+        [sql expected]
+        (= expected (plan-expr-with-foo sql))
       "EXTRACT(second from interval '3 02:47:33' day to second)" '(extract "SECOND" (multi-field-interval "3 02:47:33" "DAY" 2 "SECOND" 6))
       "EXTRACT(MINUTE FROM INTERVAL '5' DAY)" '(extract "MINUTE" (single-field-interval "5" "DAY" 2 6))))
 
   (t/testing "TIME behaviour"
     (t/are
-     [sql expected]
-     (= expected (plan-expr-with-foo sql))
+        [sql expected]
+        (= expected (plan-expr-with-foo sql))
       "EXTRACT(second from time '11:11:11')" '(extract "SECOND" #xt/time "11:11:11")
       "EXTRACT(MINUTE FROM TIME '11:11:11')" '(extract "MINUTE" #xt/time "11:11:11"))))
 
@@ -925,7 +923,7 @@ SELECT DATE_BIN(INTERVAL 'P1D', TIMESTAMP '2020-01-01T00:00:00Z'),
              (xt/q tu/*node* "SELECT EXTRACT(YEAR FROM TIMESTAMP '2021-10-21T12:34:56') as x")))
 
     (t/is (thrown-with-msg?
-           UnsupportedOperationException
+           IllegalArgumentException
            #"Extract \"TIMEZONE_HOUR\" not supported for type timestamp without timezone"
            (xt/q tu/*node* "SELECT EXTRACT(TIMEZONE_HOUR FROM TIMESTAMP '2021-10-21T12:34:56') as x"))))
 
@@ -941,7 +939,7 @@ SELECT DATE_BIN(INTERVAL 'P1D', TIMESTAMP '2020-01-01T00:00:00Z'),
              (xt/q tu/*node* "SELECT EXTRACT(MONTH FROM DATE '2001-03-11') as x")))
 
     (t/is (thrown-with-msg?
-           UnsupportedOperationException
+           IllegalArgumentException
            #"Extract \"TIMEZONE_HOUR\" not supported for type date"
            (xt/q tu/*node* "SELECT EXTRACT(TIMEZONE_HOUR FROM DATE '2001-03-11') as x"))))
 
@@ -953,7 +951,7 @@ SELECT DATE_BIN(INTERVAL 'P1D', TIMESTAMP '2020-01-01T00:00:00Z'),
              (xt/q tu/*node* "SELECT EXTRACT(HOUR FROM TIME '12:34:56') as x")))
 
     (t/is (thrown-with-msg?
-           UnsupportedOperationException
+           IllegalArgumentException
            #"Extract \"TIMEZONE_HOUR\" not supported for type timestamp without timezone"
            (xt/q tu/*node* "SELECT EXTRACT(TIMEZONE_HOUR FROM TIMESTAMP '2021-10-21T12:34:56') as x"))))
 
@@ -965,39 +963,39 @@ SELECT DATE_BIN(INTERVAL 'P1D', TIMESTAMP '2020-01-01T00:00:00Z'),
              (xt/q tu/*node* "SELECT EXTRACT(MINUTE FROM INTERVAL '3 02:47:33' DAY TO SECOND) as x")))
 
     (t/is (thrown-with-msg?
-           UnsupportedOperationException
+           IllegalArgumentException
            #"Extract \"TIMEZONE_HOUR\" not supported for type interval"
            (xt/q tu/*node* "SELECT EXTRACT(TIMEZONE_HOUR FROM INTERVAL '3 02:47:33' DAY TO SECOND) as x")))))
 
 (t/deftest test-age-function
   (t/testing "testing AGE with timestamps"
-    (t/is (= [{:itvl #xt/interval-mdm ["P0D" "PT2H"]}]
+    (t/is (= [{:itvl #xt/interval "PT2H"}]
              (xt/q tu/*node* "SELECT AGE(TIMESTAMP '2022-05-02T01:00:00', TIMESTAMP '2022-05-01T23:00:00') as itvl")))
-    (t/is (= [{:itvl #xt/interval-mdm ["P6M" "PT0S"]}]
+    (t/is (= [{:itvl #xt/interval "P6M"}]
              (xt/q tu/*node* "SELECT AGE(TIMESTAMP '2022-11-01T00:00:00', TIMESTAMP '2022-05-01T00:00:00') as itvl")))
-    (t/is (= [{:itvl #xt/interval-mdm ["P0D" "PT1H"]}]
+    (t/is (= [{:itvl #xt/interval "PT1H"}]
              (xt/q tu/*node* "SELECT AGE(TIMESTAMP '2023-01-01T01:00:00', TIMESTAMP '2023-01-01T00:00:00') as itvl"))))
 
   (t/testing "testing AGE with timestamp with timezone"
-    (t/is (= [{:itvl #xt/interval-mdm ["P0D" "PT1H"]}]
+    (t/is (= [{:itvl #xt/interval "PT1H"}]
              (xt/q tu/*node* "SELECT AGE(TIMESTAMP '2023-06-01T11:00:00+01:00[Europe/London]', TIMESTAMP '2023-06-01T11:00:00+02:00[Europe/Berlin]') as itvl")))
-    (t/is (= [{:itvl #xt/interval-mdm ["P0D" "PT2H"]}]
+    (t/is (= [{:itvl #xt/interval "PT2H"}]
              (xt/q tu/*node* "SELECT AGE(TIMESTAMP '2023-06-01T09:00:00-05:00[America/Chicago]', TIMESTAMP '2023-06-01T12:00:00') as itvl"))))
 
   (t/testing "testing AGE with date"
-    (t/is (= [{:itvl #xt/interval-mdm ["P1D" "PT0S"]}]
+    (t/is (= [{:itvl #xt/interval "P1D"}]
              (xt/q tu/*node* "SELECT AGE(DATE '2023-01-02', DATE '2023-01-01') as itvl")))
-    (t/is (= [{:itvl #xt/interval-mdm ["P-12M" "PT0S"]}]
+    (t/is (= [{:itvl #xt/interval "P-12M"}]
              (xt/q tu/*node* "SELECT AGE(DATE '2023-01-01', DATE '2024-01-01') as itvl"))))
 
   (t/testing "test with mixed types"
-    (t/is (= [{:itvl #xt/interval-mdm ["P1D" "PT0S"]}]
+    (t/is (= [{:itvl #xt/interval "P1D"}]
              (xt/q tu/*node* "SELECT AGE(DATE '2023-01-02', TIMESTAMP '2023-01-01T00:00:00') as itvl")))
-    (t/is (= [{:itvl #xt/interval-mdm ["P-6M" "PT0S"]}]
+    (t/is (= [{:itvl #xt/interval "P-6M"}]
              (xt/q tu/*node* "SELECT AGE(TIMESTAMP '2022-05-01T00:00:00', TIMESTAMP '2022-11-01T00:00:00+00:00[Europe/London]') as itvl")))
-    (t/is (= [{:itvl #xt/interval-mdm ["P0D" "PT2H0.001S"]}]
+    (t/is (= [{:itvl #xt/interval "PT2H0.001S"}]
              (xt/q tu/*node* "SELECT AGE(TIMESTAMP '2023-07-01T12:00:30.501', TIMESTAMP '2023-07-01T12:00:30.500+02:00[Europe/Berlin]') as itvl")))
-    (t/is (= [{:itvl #xt/interval-mdm ["P0D" "PT-2H-0.001S"]}]
+    (t/is (= [{:itvl #xt/interval "PT-2H-0.001S"}]
              (xt/q tu/*node* "SELECT AGE(TIMESTAMP '2023-07-01T12:00:30.499+02:00[Europe/Berlin]', TIMESTAMP '2023-07-01T12:00:30.500') as itvl")))))
 
 (t/deftest test-period-predicates
@@ -1185,7 +1183,7 @@ SELECT DATE_BIN(INTERVAL 'P1D', TIMESTAMP '2020-01-01T00:00:00Z'),
       [{}] "SELECT NULLIF(NULL, docs.x) FROM docs")))
 
 (t/deftest test-min-long-value-275
-  (t/is (= Long/MIN_VALUE (plan/plan-expr "-9223372036854775808"))))
+  (t/is (= Long/MIN_VALUE (sql/plan-expr "-9223372036854775808"))))
 
 (t/deftest test-postgres-session-information-functions
   ;; These currently return hard-coded values.
@@ -1210,7 +1208,7 @@ SELECT DATE_BIN(INTERVAL 'P1D', TIMESTAMP '2020-01-01T00:00:00Z'),
 
 (t/deftest test-postgres-access-control-functions
   ;; These current functions should always should return true
-  (t/are [sql expected] (= expected (plan/plan-expr sql))
+  (t/are [sql expected] (= expected (sql/plan-expr sql))
     "has_any_column_privilege('xtdb','docs', 'select')" true
     "has_any_column_privilege('docs', 'select')" true
     "pg_catalog.has_any_column_privilege('docs', 'select')" true
@@ -1234,8 +1232,8 @@ SELECT DATE_BIN(INTERVAL 'P1D', TIMESTAMP '2020-01-01T00:00:00Z'),
 
 ;; TODO: Add this?
 #_(t/deftest test-random-fn
-  (t/is (= true (-> (xt/q tu/*node* "SELECT 0.0 <= random() AS greater") first :greater)))
-  (t/is (= true (-> (xt/q tu/*node* "SELECT random() < 1.0 AS smaller ") first :smaller))))
+    (t/is (= true (-> (xt/q tu/*node* "SELECT 0.0 <= random() AS greater") first :greater)))
+    (t/is (= true (-> (xt/q tu/*node* "SELECT random() < 1.0 AS smaller ") first :smaller))))
 
 (t/deftest test-arithmetic-precedence-slt
   (t/is (= [{:col2 -102}]
@@ -1406,33 +1404,33 @@ SELECT DATE_BIN(INTERVAL 'P1D', TIMESTAMP '2020-01-01T00:00:00Z'),
                             WHERE OVERLAPS(foo._valid_time, bar._valid_time, baz._valid_time)"))))
 
 (t/deftest test-dollar-quoted-strings
-  (t/is (= "" (plan/plan-expr "$$$$")))
-  (t/is (= "" (plan/plan-expr "$tag$$tag$")))
+  (t/is (= "" (sql/plan-expr "$$$$")))
+  (t/is (= "" (sql/plan-expr "$tag$$tag$")))
 
-  (t/is (= "foo" (plan/plan-expr "$$foo$$")))
-  (t/is (= "inner" (plan/plan-expr "$tagged$inner$tagged$")))
-  (t/is (= "with$ dollars $ " (plan/plan-expr "$$with$ dollars $ $$")))
-  (t/is (= "foo $$" (plan/plan-expr "$in$foo $$$in$"))
+  (t/is (= "foo" (sql/plan-expr "$$foo$$")))
+  (t/is (= "inner" (sql/plan-expr "$tagged$inner$tagged$")))
+  (t/is (= "with$ dollars $ " (sql/plan-expr "$$with$ dollars $ $$")))
+  (t/is (= "foo $$" (sql/plan-expr "$in$foo $$$in$"))
         "inner $$")
 
-  (t/is (= "foo\nbar" (plan/plan-expr "$$foo\nbar$$")))
+  (t/is (= "foo\nbar" (sql/plan-expr "$$foo\nbar$$")))
 
   (t/testing "no matching end tag"
     (t/is (thrown-with-msg? IllegalArgumentException
                             #"no viable alternative"
-                            (plan/plan-expr "$$foo")))
+                            (sql/plan-expr "$$foo")))
 
     (t/is (thrown-with-msg? IllegalArgumentException
                             #"no viable alternative"
-                            (plan/plan-expr "$tag$foo")))
+                            (sql/plan-expr "$tag$foo")))
 
     (t/is (thrown-with-msg? IllegalArgumentException
                             #"no viable alternative"
-                            (plan/plan-expr "$tag$foo$tagg$")))))
+                            (sql/plan-expr "$tag$foo$tagg$")))))
 
 (t/deftest test-where-commas
   (letfn [(plan-expr [expr]
-            (plan/plan-expr expr {:ast-type :where, :scope foo-scope}))]
+            (sql/plan-expr expr {:ast-type :where, :scope foo-scope}))]
     (t/is (= '(and) (plan-expr "WHERE")))
 
     (t/is (= '(and) (plan-expr "WHERE , ,")))
@@ -1478,3 +1476,26 @@ SELECT DATE_BIN(INTERVAL 'P1D', TIMESTAMP '2020-01-01T00:00:00Z'),
                  {:current-time #inst "2024-01-01"
                   :default-tz #xt/zone "UTC"}))
         "explicitly specified"))
+
+(t/deftest test-uri-fns
+  (t/testing "URI parsing"
+    (t/is (= [{:uri #xt/uri "https://example.com/path/to/resource?query=string#fragment"}]
+             (xt/q tu/*node* "SELECT URI 'https://example.com/path/to/resource?query=string#fragment' AS uri")))
+
+    (t/is (= [{:uri #xt/uri "https://example.com/path/to/resource?query=string#fragment"}]
+             (xt/q tu/*node* "SELECT 'https://example.com/path/to/resource?query=string#fragment'::URI AS uri"))))
+
+  (t/testing "URI part extraction"
+    (xt/execute-tx tu/*node* [[:put-docs :docs {:xt/id 1, :uri #xt/uri "https://example.com/path/to/resource?query=string#fragment"}]])
+    (t/is (= [{:scheme "https", :host "example.com", :port -1,
+               :path "/path/to/resource", :query "query=string", :fragment "fragment"}]
+             (xt/q tu/*node* "SELECT URI_SCHEME(uri) AS scheme, URI_HOST(uri) AS host, COALESCE(URI_PORT(uri), -1) AS port,
+                                     URI_PATH(uri) AS path, URI_QUERY(uri) AS query, URI_FRAGMENT(uri) AS fragment
+                              FROM docs")))))
+
+(t/deftest period-nulls-4315
+  (t/is (= [{:p #xt/tstz-range [nil #xt/zdt "2020-01-01T00:00Z"]}]
+           (xt/q tu/*node* "SELECT PERIOD(NULL, TIMESTAMP '2020-01-01Z') p")))
+
+  (t/is (= [{:p #xt/tstz-range [nil nil]}]
+           (xt/q tu/*node* "SELECT PERIOD(NULL, NULL) p"))))

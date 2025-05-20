@@ -1,19 +1,20 @@
 (ns xtdb.trie-catalog
-  (:require [integrant.core :as ig]
+  (:require [clojure.tools.logging :as log]
+            [integrant.core :as ig]
             [xtdb.table-catalog :as table-cat]
             [xtdb.time :as time]
             [xtdb.trie :as trie]
             [xtdb.util :as util])
   (:import [java.nio ByteBuffer]
            [java.time LocalDate ZoneOffset]
-           [java.util ArrayList Map]
+           [java.util Map]
            [java.util.concurrent ConcurrentHashMap]
            org.roaringbitmap.buffer.ImmutableRoaringBitmap
            (xtdb BufferPool)
            xtdb.catalog.BlockCatalog
            (xtdb.log.proto TemporalMetadata TrieDetails TrieMetadata)
            xtdb.operator.scan.Metadata
-           (xtdb.util Temporal TemporalBounds TemporalDimension)))
+           (xtdb.util TemporalBounds)))
 
 ;; table-tries data structure
 ;; values :: {:keys [level recency part block-idx state]}
@@ -62,15 +63,19 @@
 (def ^:dynamic ^{:tag 'long} *file-size-target* (* 100 1024 1024))
 
 (defn- map-while
-  "map f until it returns nil, then append the rest of the collection unaltered."
+  "map f until it returns nil, then append the rest of the collection unaltered.
+
+   eagerly realises coll until the function returns nil, to avoid stack-overflow later.
+   see #4377"
   [f coll]
 
-  (lazy-seq
-   (when-let [[x & xs] (seq coll)]
-     (let [v (f x)]
-       (if v
-         (cons v (map-while f xs))
-         (cons x xs))))))
+  (loop [res (transient [])
+         coll coll]
+    (if-let [[x & xs] (seq coll)]
+      (if-let [v (f x)]
+        (recur (conj! res v) xs)
+        (concat (persistent! res) coll))
+      (concat (persistent! res) coll))))
 
 (defn- stale-block-idx? [tries ^long block-idx]
   (when-let [{^long other-block-idx :block-idx} (first tries)]
@@ -149,8 +154,8 @@
         ;; L1H files are nascent until we see the corresponding L1C file
         (-> table-cat
             (update-in [:tries [1 recency part]] conj-trie trie
-                       (let [{^long l1c-block-idx :block-idx} (get-in table-cat [:tries [1 nil part]])]
-                         (if (and l1c-block-idx (>= l1c-block-idx block-idx))
+                       (let [[{^long l1c-block-idx :block-idx, :as l1c}] (get-in table-cat [:tries [1 nil part]])]
+                         (if (and l1c (>= l1c-block-idx block-idx))
                            :live :nascent)))
             (update-in [:l1h-recencies block-idx] (fnil conj #{}) recency))
 
@@ -240,20 +245,18 @@
 
 (defrecord TrieCatalog [^Map !table-cats, ^long file-size-target]
   xtdb.trie.TrieCatalog
-  (addTries [this added-tries]
-    (doseq [[table-name added-tries] (->> added-tries
-                                          (group-by #(.getTableName ^TrieDetails %)))]
-      (.compute !table-cats table-name
-                (fn [_table-name tries]
-                  (reduce (fn [table-cat ^TrieDetails added-trie]
-                            (if-let [parsed-key (trie/parse-trie-key (.getTrieKey added-trie))]
-                              (apply-trie-notification this table-cat
-                                                       (-> parsed-key
-                                                           (assoc :data-file-size (.getDataFileSize added-trie)
-                                                                  :trie-metadata (.getTrieMetadata added-trie))))
-                              table-cat))
-                          (or tries {})
-                          added-tries)))))
+  (addTries [this table-name added-tries]
+    (.compute !table-cats table-name
+              (fn [_table-name tries]
+                (reduce (fn [table-cat ^TrieDetails added-trie]
+                          (if-let [parsed-key (trie/parse-trie-key (.getTrieKey added-trie))]
+                            (apply-trie-notification this table-cat
+                                                     (-> parsed-key
+                                                         (assoc :data-file-size (.getDataFileSize added-trie)
+                                                                :trie-metadata (.getTrieMetadata added-trie))))
+                            table-cat))
+                        (or tries {})
+                        added-tries))))
 
   (getTableNames [_] (set (keys !table-cats)))
 
@@ -267,11 +270,15 @@
         opts))
 
 (defmethod ig/init-key :xtdb/trie-catalog [_ {:keys [^BufferPool buffer-pool, ^BlockCatalog block-cat]}]
-  (let [[_ table->table-block] (table-cat/load-tables-to-metadata buffer-pool block-cat)]
-    (doto (TrieCatalog. (ConcurrentHashMap.) *file-size-target*)
-      (.addTries (for [[_ {:keys [current-tries]}] table->table-block
-                       current-trie current-tries]
-                   current-trie)))))
+  (log/debug "starting trie catalog...")
+  (let [[_ table->table-block] (table-cat/load-tables-to-metadata buffer-pool block-cat)
+        cat (TrieCatalog. (ConcurrentHashMap.) *file-size-target*)]
+    (doseq [[table-name {:keys [tries]}] table->table-block]
+      (.addTries cat table-name tries))
+
+    (log/debug "trie catalog started")
+
+    cat))
 
 (defn trie-catalog ^xtdb.trie.TrieCatalog [node]
   (util/component node :xtdb/trie-catalog))

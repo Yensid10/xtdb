@@ -47,25 +47,26 @@
 
 (s/def ::temporal-filter-value
   (s/or :now #{:now '(current-timestamp)}
-        :literal (some-fn util-date? temporal?)
-        :param simple-symbol?))
+        :literal (some-fn util-date? temporal? nil?)
+        :param simple-symbol?
+        :expr ::expression))
 
 (defmethod temporal-filter-spec :at [_]
   (s/tuple #{:at} ::temporal-filter-value))
 
 (defmethod temporal-filter-spec :in [_]
-  (s/tuple #{:in} (s/nilable ::temporal-filter-value) (s/nilable ::temporal-filter-value)))
+  (s/tuple #{:in} ::temporal-filter-value ::temporal-filter-value))
 
 (defmethod temporal-filter-spec :from [_]
-  (s/and (s/tuple #{:from} (s/nilable ::temporal-filter-value))
+  (s/and (s/tuple #{:from} ::temporal-filter-value)
          (s/conformer (fn [x] [:in (second x) nil]) identity)))
 
 (defmethod temporal-filter-spec :to [_]
-  (s/and (s/tuple #{:to} (s/nilable ::temporal-filter-value))
+  (s/and (s/tuple #{:to} ::temporal-filter-value)
          (s/conformer (fn [x] [:in nil (second x)]) identity)))
 
 (defmethod temporal-filter-spec :between [_]
-  (s/tuple #{:between} (s/nilable ::temporal-filter-value) (s/nilable ::temporal-filter-value)))
+  (s/tuple #{:between} ::temporal-filter-value ::temporal-filter-value))
 
 (s/def ::temporal-filter
   (s/multi-spec temporal-filter-spec (fn retag [_] (throw (UnsupportedOperationException.)))))
@@ -165,6 +166,15 @@
 ;; to deduct this, fail, and keep Apply is also an option, say by
 ;; returning nil instead of throwing an exception like now.
 
+(defn- join-cond->common-cols [join-cond]
+  (->> join-cond
+       (into #{} (keep (fn [join-cond]
+                         (when (and (map? join-cond)
+                                    (= 1 (count join-cond)))
+                           (let [[k v] (first join-cond)]
+                             (when (and (symbol? k) (= k v))
+                               k))))))))
+
 (defn relation-columns [relation-in]
   (r/zmatch relation-in
     [:table explicit-column-names _]
@@ -178,8 +188,10 @@
     [:scan _scan-opts columns]
     (mapv ->projected-column columns)
 
-    [:join _ lhs rhs]
-    (vec (mapcat relation-columns [lhs rhs]))
+    [:join join-cond lhs rhs]
+    (into (vec (relation-columns lhs))
+          (remove (join-cond->common-cols join-cond))
+          (vec (relation-columns rhs)))
 
     [:mega-join _ rels]
     (vec (mapcat relation-columns rels))
@@ -187,11 +199,15 @@
     [:cross-join lhs rhs]
     (vec (mapcat relation-columns [lhs rhs]))
 
-    [:left-outer-join _ lhs rhs]
-    (vec (mapcat relation-columns [lhs rhs]))
+    [:left-outer-join join-cond lhs rhs]
+    (into (vec (relation-columns lhs))
+          (remove (join-cond->common-cols join-cond))
+          (vec (relation-columns rhs)))
 
-    [:full-outer-join _ lhs rhs]
-    (vec (mapcat relation-columns [lhs rhs]))
+    [:full-outer-join join-cond lhs rhs]
+    (into (vec (relation-columns lhs))
+          (remove (join-cond->common-cols join-cond))
+          (vec (relation-columns rhs)))
 
     [:semi-join _ lhs _]
     (relation-columns lhs)
@@ -826,6 +842,21 @@
     ;;=>
     (when (not-empty (expr-correlated-symbols predicate))
       [:select predicate [:left-outer-join join-map lhs rhs]])
+
+    [:rename prefix-or-columns
+     [:select predicate
+      relation]]
+    ;;=>
+    (when (not-empty (expr-correlated-symbols predicate))
+      (when-let [columns (cond
+                           (map? prefix-or-columns) (set/map-invert prefix-or-columns)
+                           (symbol? prefix-or-columns) (let [prefix (str prefix-or-columns)]
+                                                         (->> (for [c (relation-columns relation)]
+                                                                [c (symbol prefix (name c))])
+                                                              (into {}))))]
+        [:select (w/postwalk-replace columns predicate)
+         [:rename prefix-or-columns
+          relation]]))
 
     [:group-by group-by-columns
      [:select predicate
